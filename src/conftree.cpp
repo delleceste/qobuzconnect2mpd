@@ -113,14 +113,14 @@ void ConfSimple::parseinput(std::istream& input)
     for (;;) {
         cline.clear();
         std::getline(input, cline);
-        CONFDEB("Parse:line: ["  << cline << "] status "  << status << "\n");
+        // CONFDEB("Parse:line: ["  << cline << "] status "  << status << "\n");
         if (!input.good()) {
             if (input.bad()) {
                 CONFDEB("Parse: input.bad()\n");
                 status = STATUS_ERROR;
                 return;
             }
-            CONFDEB("Parse: eof\n");
+            // CONFDEB("Parse: eof\n");
             // Must be eof ? But maybe we have a partial line which
             // must be processed. This happens if the last line before
             // eof ends with a backslash, or there is no final \n
