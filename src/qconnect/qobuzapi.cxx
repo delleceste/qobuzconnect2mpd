@@ -133,10 +133,6 @@ std::string QobuzApi::buildFileUrlSignature(uint32_t track_id,
 
 bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
                               TrackStreamInfo& out) {
-    // If we have a JWT, use it directly (no signature needed)
-    if (!m_jwt.empty()) {
-        return tryGetStreamUrl(track_id, format_id, out);
-    }
     // If no confirmed secret yet but we have candidates from fetchAppCredentials,
     // try each one; lock in the first that returns a valid URL.
     if (m_app_secret.empty() && !m_secret_candidates.empty()) {
@@ -158,25 +154,16 @@ bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
 
 bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
                                 TrackStreamInfo& out) {
-    std::string path;
-    if (!m_jwt.empty()) {
-        // JWT-based auth: no signature needed, just auth header
-        path = "/track/getFileUrl"
-               "?track_id="  + std::to_string(track_id)
-             + "&format_id=" + std::to_string(format_id)
-             + "&intent=stream";
-    } else {
-        // Signature-based auth: classic app_secret signing
-        uint64_t ts  = unixTimestamp();
-        std::string sig = buildFileUrlSignature(track_id, format_id, ts);
-        path = "/track/getFileUrl"
-               "?track_id="  + std::to_string(track_id)
-             + "&format_id=" + std::to_string(format_id)
-             + "&intent=stream"
-             + "&request_ts="  + std::to_string(ts)
-             + "&request_sig=" + sig
-             + "&app_id="    + m_app_id;
-    }
+    uint64_t ts  = unixTimestamp();
+    std::string sig = buildFileUrlSignature(track_id, format_id, ts);
+
+    std::string path = "/track/getFileUrl"
+                       "?track_id="  + std::to_string(track_id)
+                     + "&format_id=" + std::to_string(format_id)
+                     + "&intent=stream"
+                     + "&request_ts="  + std::to_string(ts)
+                     + "&request_sig=" + sig
+                     + "&app_id="    + m_app_id;
 
     std::string resp = httpGet(path);
     if (resp.empty()) return false;
@@ -399,12 +386,11 @@ std::string QobuzApi::httpGet(const std::string& path,
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
-    // Build auth header: prefer JWT, fallback to user token
+    // Build auth header: use user_auth_token from login()
+    // (JWT from the Qobuz app is for the WebSocket, not the REST API)
     struct curl_slist* hdrs = nullptr;
     std::string authHdr;
-    if (!m_jwt.empty()) {
-        authHdr = "X-User-Auth-Token: " + m_jwt;
-    } else if (!m_user_token.empty()) {
+    if (!m_user_token.empty()) {
         authHdr = "X-User-Auth-Token: " + m_user_token;
     }
     if (!authHdr.empty()) {
