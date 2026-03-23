@@ -1,0 +1,2 @@
+# option('qconnect2mpd', type : 'boolean', value : true,  description: 'Build qconnect2mpd: Qobuz Connect receiver daemon')
+
