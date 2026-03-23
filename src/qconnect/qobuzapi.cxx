@@ -408,6 +408,8 @@ std::string QobuzApi::httpGet(const std::string& path,
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
         if (http_code != 200) {
             LOGERR("QobuzApi: HTTP " << http_code << " for " << path << "\n");
+            if (!result.empty())
+                LOGERR("QobuzApi: response body: " << result.substr(0, 500) << "\n");
             result.clear();
         }
     }
