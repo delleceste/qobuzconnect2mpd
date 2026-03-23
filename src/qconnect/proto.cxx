@@ -99,6 +99,15 @@ void writeMessageField(Bytes& b, int fn, const Bytes& submsg) {
     b.insert(b.end(), submsg.begin(), submsg.end());
 }
 
+// Write a fixed64 field (wire type 1, 8 bytes little-endian)
+void writeFixed64Field(Bytes& b, int fn, uint64_t v) {
+    writeTag(b, fn, WT_64BIT);
+    for (int i = 0; i < 8; ++i) {
+        b.push_back(static_cast<uint8_t>(v & 0xff));
+        v >>= 8;
+    }
+}
+
 // ---- Decoder helpers --------------------------------------------------------
 
 // Read varint from data[pos..], advance pos.  Returns false on truncation.
@@ -546,12 +555,12 @@ bool decodeQConnectBatch(const uint8_t* d, size_t len,
 
 bool decodePayload(const uint8_t* d, size_t len,
                     std::vector<Message>& msgs) {
-    // Payload { src=4, dests=5, proto=3, payload=6 }
+    // Payload { msg_id=1, msg_date=2, proto=3, src=4, dests=5, payload=7 }
     size_t pos = 0;
     while (pos < len) {
         int fn; uint8_t wt;
         if (!readTag(d, len, pos, fn, wt)) return false;
-        if (fn == 6 && wt == WT_LEN) {
+        if (fn == 7 && wt == WT_LEN) {
             const uint8_t* fd; size_t fl;
             if (!readLenField(d, len, pos, fd, fl)) return false;
             decodeQConnectBatch(fd, fl, msgs);
@@ -623,16 +632,19 @@ Bytes wrapInPayload(uint64_t time_ms, int32_t batch_id,
     writeInt32Field(qcm, 1, inner_msg_field_number); // QConnectMessage.message_type
     writeMessageField(qcm, inner_msg_field_number, inner_msg);
 
-    // QConnectBatch { messages_time=1, messages_id=2, messages=3 }
+    // QConnectBatch { messages_time=1 (fixed64), messages_id=2, messages=3 }
     Bytes batch;
-    writeUint64Field(batch, 1, time_ms);
+    writeFixed64Field(batch, 1, time_ms);
     writeInt32Field(batch, 2, batch_id);
     writeMessageField(batch, 3, qcm);
 
-    // Payload { proto=3, payload=6 }
+    // Payload { msg_id=1, msg_date=2, proto=3, payload=7 }
+    static uint32_t s_payload_msg_id = 0;
     Bytes payload;
+    writeUint32Field(payload, 1, ++s_payload_msg_id);
+    writeUint64Field(payload, 2, time_ms);
     writeInt32Field(payload, 3, static_cast<int32_t>(QCloudProto::QCONNECT));
-    writeBytesField(payload, 6, batch);
+    writeBytesField(payload, 7, batch);
 
     return payload;
 }
@@ -660,10 +672,12 @@ Bytes buildAuthenticate(uint64_t msg_id, uint64_t msg_date_ms,
     return buildEnvelope(EnvType::AUTHENTICATE, auth);
 }
 
-Bytes buildSubscribe(QCloudProto proto) {
+Bytes buildSubscribe(uint64_t msg_id, uint64_t msg_date_ms, QCloudProto proto) {
     Bytes sub;
+    writeUint32Field(sub, 1, static_cast<uint32_t>(msg_id));
+    writeUint64Field(sub, 2, msg_date_ms);
     writeInt32Field(sub, 3, static_cast<int32_t>(proto));
-    // channel_ids = 2: empty means subscribe to all
+    // channels = 4: empty means subscribe to all
     return buildEnvelope(EnvType::SUBSCRIBE, sub);
 }
 

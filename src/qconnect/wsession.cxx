@@ -98,7 +98,7 @@ bool WSession::connect(const ConnectCredentials& creds) {
     }
 
     // Subscribe to the QConnect channel
-    Bytes sub = buildSubscribe(QCloudProto::QCONNECT);
+    Bytes sub = buildSubscribe(m_msg_id++, nowMs(), QCloudProto::QCONNECT);
     if (!sendRaw(sub)) {
         LOGERR("WSession: failed to send Subscribe\n");
         curl_easy_cleanup(m_curl); m_curl = nullptr;

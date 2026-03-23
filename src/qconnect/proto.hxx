@@ -295,7 +295,8 @@ Bytes buildAuthenticate(uint64_t msg_id, uint64_t msg_date_ms,
                         const std::string& jwt);
 
 // Subscribe to QConnect channel (sent after authentication):
-Bytes buildSubscribe(QCloudProto proto = QCloudProto::QCONNECT);
+Bytes buildSubscribe(uint64_t msg_id, uint64_t msg_date_ms,
+                     QCloudProto proto = QCloudProto::QCONNECT);
 
 // QConnect batch messages (all wrapped in PAYLOAD envelope):
 // Send immediately after SUBSCRIBE to register the device with the cloud.
