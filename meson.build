@@ -1,5 +1,5 @@
 project(
-  'qconnect2mpd',
+  'qobuzconnect2mpd',
   'cpp',
   license: 'LGPL 2.1+',
   version: '1.0.0',
@@ -110,7 +110,7 @@ qc_sources = files(
 )
 
 executable(
-  'qconnect2mpd',
+  'qobuzconnect2mpd',
   qc_sources,
   include_directories: include_directories('src', 'src/qconnect'),
   dependencies: qc_deps,
