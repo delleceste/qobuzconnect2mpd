@@ -40,7 +40,6 @@
 #include <cstring>
 #include <iomanip>
 #include <openssl/evp.h>
-#include <openssl/md5.h>
 #include <regex>
 #include <sstream>
 
@@ -123,12 +122,16 @@ std::string QobuzApi::buildFileUrlSignature(uint32_t track_id,
                       + std::to_string(ts)
                       + m_app_secret;
 
-    LOGDEB("QobuzApi: sig plain: [" << plain << "]\n");
+    LOGDEB("QobuzApi: sig plain: [" << plain << "] len=" << plain.size() << "\n");
 
-    uint8_t digest[MD5_DIGEST_LENGTH];
-    MD5(reinterpret_cast<const unsigned char*>(plain.data()),
-        plain.size(), digest);
-    return hexString(digest, MD5_DIGEST_LENGTH);
+    uint8_t digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_md5(), nullptr);
+    EVP_DigestUpdate(ctx, plain.data(), plain.size());
+    EVP_DigestFinal_ex(ctx, digest, &digest_len);
+    EVP_MD_CTX_free(ctx);
+    return hexString(digest, digest_len);
 }
 
 bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
