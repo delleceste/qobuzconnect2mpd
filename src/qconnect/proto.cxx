@@ -546,12 +546,12 @@ bool decodeQConnectBatch(const uint8_t* d, size_t len,
 
 bool decodePayload(const uint8_t* d, size_t len,
                     std::vector<Message>& msgs) {
-    // Payload { source_channel=1, dest_channel=2, proto=3, payload_data=4 }
+    // Payload { src=4, dests=5, proto=3, payload=6 }
     size_t pos = 0;
     while (pos < len) {
         int fn; uint8_t wt;
         if (!readTag(d, len, pos, fn, wt)) return false;
-        if (fn == 4 && wt == WT_LEN) {
+        if (fn == 6 && wt == WT_LEN) {
             const uint8_t* fd; size_t fl;
             if (!readLenField(d, len, pos, fd, fl)) return false;
             decodeQConnectBatch(fd, fl, msgs);
@@ -629,10 +629,10 @@ Bytes wrapInPayload(uint64_t time_ms, int32_t batch_id,
     writeInt32Field(batch, 2, batch_id);
     writeMessageField(batch, 3, qcm);
 
-    // Payload { payload_data=4, proto=3 }
+    // Payload { proto=3, payload=6 }
     Bytes payload;
     writeInt32Field(payload, 3, static_cast<int32_t>(QCloudProto::QCONNECT));
-    writeBytesField(payload, 4, batch);
+    writeBytesField(payload, 6, batch);
 
     return payload;
 }
@@ -662,7 +662,7 @@ Bytes buildAuthenticate(uint64_t msg_id, uint64_t msg_date_ms,
 
 Bytes buildSubscribe(QCloudProto proto) {
     Bytes sub;
-    writeInt32Field(sub, 1, static_cast<int32_t>(proto));
+    writeInt32Field(sub, 3, static_cast<int32_t>(proto));
     // channel_ids = 2: empty means subscribe to all
     return buildEnvelope(EnvType::SUBSCRIBE, sub);
 }
