@@ -36,8 +36,9 @@ HttpHandler::HttpHandler(const std::string& uuid,
                           const std::string& friendlyname,
                           int                port,
                           int                max_quality,
+                          const std::string& app_id,
                           ConnectCallback    on_connect)
-    : m_uuid(uuid), m_name(friendlyname), m_port(port),
+    : m_uuid(uuid), m_name(friendlyname), m_app_id(app_id), m_port(port),
       m_max_quality(max_quality), m_on_connect(std::move(on_connect))
 {}
 
@@ -153,7 +154,7 @@ MHD_Result HttpHandler::handleRequest(struct MHD_Connection* conn,
         LOGDEB("HttpHandler: GET get-connect-info\n");
         Json::Value j;
         j["current_session_id"] = m_session_id;
-        j["app_id"]             = "";
+        j["app_id"]             = m_app_id;
         Json::StreamWriterBuilder wr;
         wr["indentation"] = "";
         return sendResponse(conn, MHD_HTTP_OK, Json::writeString(wr, j));

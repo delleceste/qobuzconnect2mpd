@@ -50,14 +50,16 @@ using ConnectCallback = std::function<void(ConnectCredentials)>;
 
 class HttpHandler {
 public:
-    // uuid:        device UUID (lowercase, no braces)
+    // uuid:        device UUID (lowercase, with hyphens)
     // friendlyname device name shown in Qobuz app
     // port:        TCP port to listen on
     // max_quality: max format id (5/6/7/27 -> "MP3"/"LOSSLESS"/"HIRES_L2"/"HIRES_L3")
+    // app_id:      Qobuz API app_id returned by get-connect-info
     HttpHandler(const std::string& uuid,
                 const std::string& friendlyname,
                 int                port,
                 int                max_quality,
+                const std::string& app_id,
                 ConnectCallback    on_connect);
     ~HttpHandler();
 
@@ -91,6 +93,7 @@ private:
 
     std::string      m_uuid;
     std::string      m_name;
+    std::string      m_app_id;
     int              m_port;
     int              m_max_quality;
     ConnectCallback  m_on_connect;

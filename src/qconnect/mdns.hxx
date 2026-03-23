@@ -79,11 +79,11 @@ private:
                                bool goodbye) const;
 
     std::string m_uuid;       // lowercase UUID without braces
-    std::string m_name;       // friendly name
+    std::string m_name;       // friendly name (used as mDNS instance label)
     int         m_port;
     std::string m_iface;      // interface name (may be empty)
     std::string m_hostname;   // <sanitised-name>.local
-    std::string m_instance;   // <uuid>._qobuz-connect._tcp.local.
+    std::string m_instance;   // <friendly-name>._qobuz-connect._tcp.local.
 
     int              m_sock{-1};
     std::thread      m_thread;

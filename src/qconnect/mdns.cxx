@@ -29,7 +29,6 @@
 #include <cstring>
 #include <sstream>
 #include <string>
-#include <vector>
 
 #include "qclog.hxx"
 
@@ -159,8 +158,10 @@ MdnsAnnouncer::MdnsAnnouncer(const std::string& uuid,
                                const std::string& iface)
     : m_uuid(uuid), m_name(name), m_port(port), m_iface(iface)
 {
-    // Build the instance name: "<uuid>._qobuz-connect._tcp.local."
-    m_instance = m_uuid + "._qobuz-connect._tcp.local.";
+    // Build the instance name: "<friendly-name>._qobuz-connect._tcp.local."
+    // The Qobuz app uses the instance label as the device display name;
+    // it must be the human-readable friendly name, not the UUID.
+    m_instance = m_name + "._qobuz-connect._tcp.local.";
 
     // Sanitise the name for use as a local hostname (lowercase, spaces->hyphens)
     std::string host = name;
@@ -295,13 +296,13 @@ std::string MdnsAnnouncer::buildResponse(const std::string& ifaddr,
                                  ttl_srv, srvRdata);
 
     // 3. TXT: <instance> -> key=value pairs
+    // Keys/values must match what the Qobuz app expects (verified against qonductor).
     std::vector<std::string> txtPairs = {
-        "uuid="        + m_uuid,
-        "type=1",                          // DeviceType::SPEAKER = 1
-        "sdk_version=0.9.5",
-        "path=/devices/" + m_uuid,
-        "addr=" + ifaddr,
-        "port=" + std::to_string(m_port),
+        "path=/devices/"  + m_uuid,
+        "type=SPEAKER",                    // device type string, not integer
+        "Name="           + m_name,        // display name
+        "device_uuid="    + m_uuid,        // UUID with hyphens
+        "sdk_version=0.9.6",               // must be >= 0.9.5
     };
     std::string txtRR = buildRR(encodeName(instance), TYPE_TXT, CLASS_IN_FLUSH,
                                  ttl_txt, buildTxtRdata(txtPairs));

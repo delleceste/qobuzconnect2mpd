@@ -67,6 +67,9 @@ public:
     // This token can be used as ws_jwt to authenticate the WebSocket session.
     const std::string& userToken() const { return m_user_token; }
 
+    // Return the app_id (set via constructor or fetched from bundle.js).
+    const std::string& appId() const { return m_app_id; }
+
     // Fetch app_id and secret candidates dynamically from the Qobuz web player
     // bundle.js.  Called automatically by QcManager when qobuzappid is not
     // configured.  On success sets m_app_id and populates m_secret_candidates;

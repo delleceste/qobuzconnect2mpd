@@ -132,6 +132,7 @@ bool QcManager::start() {
     m_http = std::make_unique<HttpHandler>(
         m_cfg.uuid, m_cfg.friendly_name,
         m_cfg.http_port, m_cfg.format_id,
+        m_api->appId(),
         [this](ConnectCredentials c) { onConnect(std::move(c)); });
     if (!m_http->start()) return false;
 
