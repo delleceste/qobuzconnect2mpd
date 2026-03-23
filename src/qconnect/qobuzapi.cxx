@@ -274,13 +274,18 @@ static std::string base64urlDecode(const std::string& in) {
     size_t pad = (4 - s.size() % 4) % 4;
     s.append(pad, '=');
 
+    // Count total '=' padding (original + added) to compute actual data length
+    size_t total_pad = 0;
+    for (size_t i = s.size(); i > 0 && s[i - 1] == '='; --i)
+        ++total_pad;
+
     std::vector<unsigned char> buf(s.size());
     int outlen = EVP_DecodeBlock(
         buf.data(),
         reinterpret_cast<const unsigned char*>(s.data()),
         static_cast<int>(s.size()));
     if (outlen < 0) return {};
-    outlen -= static_cast<int>(pad); // EVP_DecodeBlock counts padding as output
+    outlen -= static_cast<int>(total_pad);
     if (outlen < 0) return {};
     return std::string(reinterpret_cast<char*>(buf.data()), outlen);
 }
