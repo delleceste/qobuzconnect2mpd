@@ -137,26 +137,42 @@ std::string QobuzApi::buildFileUrlSignature(uint32_t track_id,
 bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
                               TrackStreamInfo& out) {
     // If no confirmed secret yet but we have candidates from fetchAppCredentials,
-    // try each one; lock in the first that returns a valid URL.
+    // try each one; lock in the first that returns a valid or accepted response.
     if (m_app_secret.empty() && !m_secret_candidates.empty()) {
         for (const auto& cand : m_secret_candidates) {
             m_app_secret = cand;
-            if (tryGetStreamUrl(track_id, format_id, out)) {
+            long code = 0;
+            if (tryGetStreamUrl(track_id, format_id, out, &code)) {
                 LOGINF("QobuzApi: active secret confirmed\n");
                 m_secret_candidates.clear();
                 return true;
             }
+            // 404 = signature accepted but track not found at this quality
+            // → secret is valid, lock it in
+            if (code == 404) {
+                LOGINF("QobuzApi: active secret confirmed (track not at fmt "
+                       << format_id << ")\n");
+                m_secret_candidates.clear();
+                break;
+            }
         }
-        m_app_secret.clear();
-        LOGERR("QobuzApi: none of the " << m_secret_candidates.size()
-               << " secret candidates produced a valid URL\n");
-        return false;
+        if (m_app_secret.empty()) {
+            LOGERR("QobuzApi: none of the secret candidates produced a valid sig\n");
+            return false;
+        }
     }
-    return tryGetStreamUrl(track_id, format_id, out);
+    // Try requested format, then fall back to lower qualities
+    static const int fallback_fmts[] = {27, 7, 6, 5};
+    for (int fmt : fallback_fmts) {
+        if (fmt > format_id) continue;
+        if (tryGetStreamUrl(track_id, fmt, out))
+            return true;
+    }
+    return false;
 }
 
 bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
-                                TrackStreamInfo& out) {
+                                TrackStreamInfo& out, long* http_code) {
     uint64_t ts  = unixTimestamp();
     std::string sig = buildFileUrlSignature(track_id, format_id, ts);
 
@@ -168,7 +184,7 @@ bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
                      + "&request_sig=" + sig
                      + "&app_id="    + m_app_id;
 
-    std::string resp = httpGet(path);
+    std::string resp = httpGet(path, http_code);
     if (resp.empty()) return false;
 
     Json::Value root;
@@ -379,8 +395,7 @@ bool QobuzApi::fetchAppCredentials() {
     return true;
 }
 
-std::string QobuzApi::httpGet(const std::string& path,
-                               const std::string& /*extra_headers*/) {
+std::string QobuzApi::httpGet(const std::string& path, long* http_code_out) {
     std::string url = m_base_url + path;
     LOGDEB("QobuzApi: GET " << url << "\n");
 
@@ -415,6 +430,7 @@ std::string QobuzApi::httpGet(const std::string& path,
     } else {
         long http_code = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        if (http_code_out) *http_code_out = http_code;
         if (http_code != 200) {
             LOGERR("QobuzApi: HTTP " << http_code << " for " << path << "\n");
             if (!result.empty())
