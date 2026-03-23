@@ -298,6 +298,11 @@ Bytes buildAuthenticate(uint64_t msg_id, uint64_t msg_date_ms,
 Bytes buildSubscribe(QCloudProto proto = QCloudProto::QCONNECT);
 
 // QConnect batch messages (all wrapped in PAYLOAD envelope):
+// Send immediately after SUBSCRIBE to register the device with the cloud.
+// The server responds with SessionState (81) and AddRenderer (83).
+Bytes buildCtrlJoinSession(uint64_t time_ms, int32_t batch_id,
+                             const DeviceInfo& dev);
+
 Bytes buildJoinSession(uint64_t time_ms, int32_t batch_id,
                        const Bytes& session_uuid,
                        const DeviceInfo& dev, bool is_active,

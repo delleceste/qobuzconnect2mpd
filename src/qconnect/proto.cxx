@@ -617,8 +617,10 @@ Bytes encodeDeviceInfo(const DeviceInfo& d) {
 Bytes wrapInPayload(uint64_t time_ms, int32_t batch_id,
                      int inner_msg_field_number,
                      const Bytes& inner_msg) {
-    // QConnectMessage: oneof, inner field tag = inner_msg_field_number
+    // QConnectMessage { message_type=1 (varint), content at field=message_type }
+    // The message_type field 1 must be present; qonductor always sets it.
     Bytes qcm;
+    writeInt32Field(qcm, 1, inner_msg_field_number); // QConnectMessage.message_type
     writeMessageField(qcm, inner_msg_field_number, inner_msg);
 
     // QConnectBatch { messages_time=1, messages_id=2, messages=3 }
@@ -680,6 +682,20 @@ Bytes buildJoinSession(uint64_t time_ms, int32_t batch_id,
 
     Bytes payload = wrapInPayload(time_ms, batch_id,
                                    static_cast<int>(MsgType::RNDR_JOIN_SESSION), msg);
+    return buildEnvelope(EnvType::PAYLOAD, payload);
+}
+
+// CtrlSrvrJoinSession (61): sent immediately after SUBSCRIBE to register
+// the device with the cloud session manager.  session_uuid is omitted on
+// the first call (we don't have one yet); the server will assign one and
+// deliver it via SessionState (81).
+Bytes buildCtrlJoinSession(uint64_t time_ms, int32_t batch_id,
+                             const DeviceInfo& dev) {
+    // CtrlSrvrJoinSession { session_uuid=1 (omit), device_info=2 }
+    Bytes msg;
+    writeMessageField(msg, 2, encodeDeviceInfo(dev));
+    Bytes payload = wrapInPayload(time_ms, batch_id,
+                                   static_cast<int>(MsgType::CTRL_JOIN_SESSION), msg);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
 

@@ -105,6 +105,17 @@ bool WSession::connect(const ConnectCredentials& creds) {
         return false;
     }
 
+    // Announce ourselves (CtrlSrvrJoinSession=61). Must be sent right after
+    // Subscribe — the server will not send AddRenderer (83) until it knows
+    // the device exists. session_uuid is omitted; server assigns one via
+    // SessionState (81).
+    Bytes join = buildCtrlJoinSession(nowMs(), m_msg_id++, m_devinfo);
+    if (!sendRaw(join)) {
+        LOGERR("WSession: failed to send CtrlJoinSession\n");
+        curl_easy_cleanup(m_curl); m_curl = nullptr;
+        return false;
+    }
+
     m_connected = true;
     m_stop      = false;
     m_thread    = std::thread(&WSession::eventLoop, this);
@@ -293,15 +304,11 @@ void WSession::dispatchMessage(const Message& msg) {
         break;
 
     case MsgType::SRVRC_ADD_RENDERER:
-        LOGDEB("WSession: AddRenderer id=" << msg.add_renderer.renderer_id << "\n");
-        // Declare us as the active renderer
-        setActiveRenderer(msg.add_renderer.renderer_id);
-        // Send initial join
-        {
-            QueueRendererState init{};
-            int bid = nextBatchId(m_batch_id);
-            sendRaw(buildJoinSession(nowMs(), bid, m_session_uuid,
-                                     m_devinfo, false, init));
+        LOGDEB("WSession: AddRenderer id=" << msg.add_renderer.renderer_id
+               << " uuid=" << msg.add_renderer.renderer.uuid.size() << "B\n");
+        // Only act on AddRenderer for our own device (match by UUID)
+        if (msg.add_renderer.renderer.uuid == m_devinfo.uuid) {
+            setActiveRenderer(msg.add_renderer.renderer_id);
         }
         break;
 
