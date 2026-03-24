@@ -260,20 +260,22 @@ void QcManager::onWsDisconnected() {
 void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
                            const QueueTrackRef& current_item) {
     if (!m_mpd) return;
-    switch (ps) {
-    case PlayingState::PLAYING: {
-        // If the app tells us which track to play, find its MPD position
-        int target_pos = -1;
-        if (current_item.queue_item_id != 0)
-            target_pos = mpdPosForQueueItem(current_item.queue_item_id);
+
+    // Handle track change independently of play state
+    // (server sends state=UNKNOWN + qitem=N to mean "switch track, keep state")
+    if (current_item.queue_item_id != 0) {
+        int target_pos = mpdPosForQueueItem(current_item.queue_item_id);
         if (target_pos >= 0)
             m_mpd->play(target_pos);
-        else
-            m_mpd->play();
-        if (position_ms > 0)
-            m_mpd->seek(position_ms);
-        break;
     }
+
+    // Handle play state change
+    switch (ps) {
+    case PlayingState::PLAYING:
+        // If no track change above, just resume
+        if (current_item.queue_item_id == 0)
+            m_mpd->play();
+        break;
     case PlayingState::PAUSED:
         m_mpd->pause(true);
         break;
@@ -281,8 +283,13 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
         m_mpd->stop();
         break;
     default:
+        // UNKNOWN = no state change requested
         break;
     }
+
+    // Handle seek independently of play state
+    if (position_ms > 0)
+        m_mpd->seek(position_ms);
 }
 
 void QcManager::onSetVolume(uint32_t volume, int32_t delta) {
@@ -302,6 +309,10 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
                               uint32_t start_idx) {
     LOGINF("QcManager: loading " << tracks.size()
            << " tracks from Qobuz, starting at " << start_idx << "\n");
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        LOGDEB("QcManager:   track[" << i << "] qitem=" << tracks[i].queue_item_id
+               << " trackid=" << tracks[i].track_id << "\n");
+    }
 
     std::vector<uint64_t> item_ids;
     auto urls = resolveStreamUrls(tracks, item_ids);
@@ -402,7 +413,10 @@ void QcManager::onMpdState(const MpdState& st) {
 
     // Map MPD queue position to Qobuz queue_item_id
     if (st.queue_pos >= 0) {
-        uint32_t qid = queueItemIdAt(st.queue_pos);
+        uint64_t qid = queueItemIdAt(st.queue_pos);
+        LOGDEB("QcManager: mpdState queue_pos=" << st.queue_pos
+               << " -> qitem=" << qid
+               << " (map size=" << m_queue_item_ids.size() << ")\n");
         if (qid != 0)
             qrs.state.current_queue_item_id = qid;
     }
