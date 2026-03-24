@@ -61,16 +61,16 @@ enum class QCloudProto : int32_t {
 
 enum class MsgType : int32_t {
     UNKNOWN = 0,
-    // Renderer -> Server  (21-29)
+    // Renderer -> Server  (21-29) — verified against qonductor proto
     RNDR_JOIN_SESSION          = 21,
     RNDR_DEVICE_INFO_UPDATED   = 22,
     RNDR_STATE_UPDATED         = 23,
     RNDR_ACTION                = 24,
     RNDR_VOLUME_CHANGED        = 25,
-    RNDR_VOLUME_MUTED          = 26,
-    RNDR_FILE_QUALITY          = 27,
-    RNDR_DEVICE_QUALITY        = 28,
-    RNDR_MAX_QUALITY           = 29,
+    RNDR_FILE_QUALITY          = 26,   // RndrSrvrFileAudioQualityChanged
+    RNDR_DEVICE_QUALITY        = 27,   // RndrSrvrDeviceAudioQualityChanged
+    RNDR_MAX_QUALITY           = 28,   // RndrSrvrMaxAudioQualityChanged (was 29)
+    RNDR_VOLUME_MUTED          = 29,   // RndrSrvrVolumeMuted            (was 26)
     // Server -> Renderer  (41-47)
     CMD_SET_STATE              = 41,
     CMD_SET_VOLUME             = 42,
@@ -79,12 +79,12 @@ enum class MsgType : int32_t {
     CMD_SET_LOOP_MODE          = 45,
     CMD_SET_SHUFFLE_MODE       = 46,
     CMD_SET_AUTOPLAY_MODE      = 47,
-    // Controller -> Server  (61-80)
+    // Controller -> Server  (61-80) — verified against qonductor proto
     CTRL_JOIN_SESSION          = 61,
     CTRL_SET_PLAYER_STATE      = 62,
     CTRL_SET_ACTIVE_RENDERER   = 63,
     CTRL_SET_VOLUME            = 64,
-    CTRL_MUTE_VOLUME           = 65,
+    CTRL_CLEAR_QUEUE           = 65,   // CtrlSrvrClearQueue (was CTRL_MUTE_VOLUME)
     CTRL_LOAD_TRACKS           = 66,
     CTRL_INSERT_TRACKS         = 67,
     CTRL_ADD_TRACKS            = 68,
@@ -92,11 +92,13 @@ enum class MsgType : int32_t {
     CTRL_REORDER_TRACKS        = 70,
     CTRL_SET_SHUFFLE_MODE      = 71,
     CTRL_SET_LOOP_MODE         = 72,
-    CTRL_SET_MAX_QUALITY       = 73,
-    CTRL_ASK_QUEUE_STATE       = 74,
-    CTRL_ASK_RENDERER_STATE    = 75,
-    CTRL_SET_AUTOPLAY_MODE     = 76,
-    // Server -> Controller  (81-105)
+    CTRL_MUTE_VOLUME           = 73,   // CtrlSrvrMuteVolume (was CTRL_SET_MAX_QUALITY)
+    CTRL_SET_MAX_QUALITY       = 74,   // (was CTRL_ASK_QUEUE_STATE)
+    CTRL_SET_QUEUE_STATE       = 75,
+    CTRL_ASK_QUEUE_STATE       = 76,   // (was 74)
+    CTRL_ASK_RENDERER_STATE    = 77,   // (was 75)
+    CTRL_SET_AUTOPLAY_MODE     = 78,   // (was 76)
+    // Server -> Controller  (81-105) — verified against qonductor proto
     SRVRC_SESSION_STATE        = 81,
     SRVRC_RENDERER_STATE_UPD   = 82,
     SRVRC_ADD_RENDERER         = 83,
@@ -104,17 +106,17 @@ enum class MsgType : int32_t {
     SRVRC_REMOVE_RENDERER      = 85,
     SRVRC_ACTIVE_RNDR_CHANGED  = 86,
     SRVRC_VOLUME_CHANGED       = 87,
-    SRVRC_VOLUME_MUTED         = 88,
-    SRVRC_QUEUE_ERROR          = 89,
+    SRVRC_QUEUE_ERROR          = 88,   // SrvrCtrlQueueErrorMessage (was SRVRC_VOLUME_MUTED)
+    SRVRC_QUEUE_CLEARED        = 89,   // SrvrCtrlQueueCleared      (was 95)
     SRVRC_QUEUE_STATE          = 90,
-    SRVRC_TRACKS_INSERTED      = 91,
-    SRVRC_TRACKS_ADDED         = 92,
-    SRVRC_TRACKS_REMOVED       = 93,
-    SRVRC_TRACKS_REORDERED     = 94,
-    SRVRC_QUEUE_CLEARED        = 95,
-    SRVRC_QUEUE_LOAD_TRACKS    = 96,
-    SRVRC_SHUFFLE_MODE_SET     = 97,
-    SRVRC_LOOP_MODE_SET        = 98,
+    SRVRC_QUEUE_LOAD_TRACKS    = 91,   // SrvrCtrlQueueTracksLoaded (was 96)
+    SRVRC_TRACKS_INSERTED      = 92,   // SrvrCtrlQueueTracksInserted (was 91)
+    SRVRC_TRACKS_ADDED         = 93,   // SrvrCtrlQueueTracksAdded    (was 92)
+    SRVRC_TRACKS_REMOVED       = 94,   // SrvrCtrlQueueTracksRemoved  (was 93)
+    SRVRC_TRACKS_REORDERED     = 95,   // SrvrCtrlQueueTracksReordered (was 94)
+    SRVRC_SHUFFLE_MODE_SET     = 96,   // (was SRVRC_QUEUE_LOAD_TRACKS=96)
+    SRVRC_LOOP_MODE_SET        = 97,
+    SRVRC_SRVRC_VOLUME_MUTED   = 98,   // Server→Controller volume muted notification
     SRVRC_MAX_QUALITY_CHANGED  = 99,
     SRVRC_FILE_QUALITY_CHANGED = 100,
     SRVRC_DEVICE_QUALITY_CHANGED = 101,
@@ -161,7 +163,7 @@ struct QueueVersion {
 };
 
 struct QueueTrackRef {
-    uint32_t queue_item_id{0};
+    uint64_t queue_item_id{0};
     uint32_t track_id{0};
     Bytes    context_uuid; // 16-byte UUID
 };
@@ -171,8 +173,8 @@ struct RendererState {
     BufferState  buffer_state{BufferState::UNKNOWN};
     uint32_t     current_position_ms{0};
     uint32_t     duration_ms{0};
-    uint32_t     current_queue_item_id{0};
-    uint32_t     next_queue_item_id{0};
+    uint64_t     current_queue_item_id{0};
+    uint64_t     next_queue_item_id{0};
 };
 
 struct QueueRendererState {
@@ -233,7 +235,7 @@ struct MsgRemoveRenderer {
 };
 
 struct QueueTrack {
-    uint32_t queue_item_id{0};
+    uint64_t queue_item_id{0};
     uint32_t track_id{0};
     Bytes    context_uuid;
 };
@@ -263,7 +265,7 @@ struct MsgQueueTracksAdded {
 
 struct MsgQueueTracksRemoved {
     QueueVersion           queue_version;
-    std::vector<uint32_t>  queue_item_ids;
+    std::vector<uint64_t>  queue_item_ids;
 };
 
 // All parsed inbound data in one union-like struct.
@@ -325,6 +327,13 @@ Bytes buildSetActiveRenderer(uint64_t time_ms, int32_t batch_id,
 // Ask server to send current renderer state:
 Bytes buildAskRendererState(uint64_t time_ms, int32_t batch_id,
                              uint64_t session_id);
+
+// Report that this renderer is muted (or not):
+Bytes buildVolumeMuted(uint64_t time_ms, int32_t batch_id, bool muted);
+
+// Ask server to send current queue state (sent after activation):
+Bytes buildAskQueueState(uint64_t time_ms, int32_t batch_id,
+                          const Bytes& queue_uuid);
 
 // ---- Decoder API ------------------------------------------------------------
 

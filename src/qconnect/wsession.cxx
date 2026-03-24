@@ -157,6 +157,10 @@ bool WSession::sendRaw(const Bytes& data) {
 
 void WSession::reportState(const QueueRendererState& state) {
     if (!m_connected) return;
+    {
+        std::lock_guard<std::mutex> lk(m_state_mutex);
+        m_last_state = state;
+    }
     int bid = nextBatchId(m_batch_id);
     sendRaw(buildStateUpdated(nowMs(), bid, state));
 }
@@ -183,9 +187,12 @@ void WSession::setActiveRenderer(uint64_t renderer_id) {
 
 bool WSession::sendHeartbeat() {
     if (!m_connected || !m_is_active) return true;
-    QueueRendererState dummy{};
-    // Heartbeat: re-send current state to keep the session alive
-    return sendRaw(buildStateUpdated(nowMs(), nextBatchId(m_batch_id), dummy));
+    QueueRendererState state;
+    {
+        std::lock_guard<std::mutex> lk(m_state_mutex);
+        state = m_last_state;
+    }
+    return sendRaw(buildStateUpdated(nowMs(), nextBatchId(m_batch_id), state));
 }
 
 
@@ -309,9 +316,23 @@ void WSession::dispatchMessage(const Message& msg) {
         LOGDEB("WSession: SetActive active=" << msg.set_active.active << "\n");
         m_is_active = msg.set_active.active;
         if (m_is_active) {
-            // Handshake: report volume + quality so the app can show them
-            reportVolume(50);  // MPD volume will be reported by MpdCtl
-            reportMaxQuality(m_devinfo.max_quality);
+            // Activation handshake (matches qonductor order):
+            // 1. VolumeMuted(false)  — field 29, must be sent even with empty body
+            // 2. VolumeChanged       — field 25
+            // 3. MaxAudioQualityChanged — field 28, value is quality level 1-4
+            sendRaw(buildVolumeMuted(nowMs(), nextBatchId(m_batch_id), false));
+            reportVolume(50);  // MPD volume will be reported accurately by MpdCtl later
+            // Convert format_id to quality level: 27->4, 7->3, 6->2, 5->1
+            int32_t ql = 4;
+            if (m_devinfo.max_quality == 7) ql = 3;
+            else if (m_devinfo.max_quality == 6) ql = 2;
+            else if (m_devinfo.max_quality == 5) ql = 1;
+            reportMaxQuality(ql);
+            // Request current queue state from server
+            if (!m_session_uuid.empty()) {
+                sendRaw(buildAskQueueState(nowMs(), nextBatchId(m_batch_id),
+                                            m_session_uuid));
+            }
         }
         break;
 
@@ -325,6 +346,25 @@ void WSession::dispatchMessage(const Message& msg) {
             m_cbs.on_set_state(msg.set_state.playing_state,
                                 msg.set_state.current_position_ms,
                                 msg.set_state.current_queue_item);
+        }
+        // Immediately acknowledge SetState with a StateUpdated response
+        // (qonductor does this synchronously; async MPD callback may be too late)
+        {
+            QueueRendererState ack;
+            {
+                std::lock_guard<std::mutex> lk(m_state_mutex);
+                ack = m_last_state;
+            }
+            ack.state.playing_state = msg.set_state.playing_state;
+            if (msg.set_state.current_position_ms)
+                ack.state.current_position_ms = msg.set_state.current_position_ms;
+            if (msg.set_state.current_queue_item.queue_item_id)
+                ack.state.current_queue_item_id = msg.set_state.current_queue_item.queue_item_id;
+            {
+                std::lock_guard<std::mutex> lk(m_state_mutex);
+                m_last_state = ack;
+            }
+            sendRaw(buildStateUpdated(nowMs(), nextBatchId(m_batch_id), ack));
         }
         break;
 

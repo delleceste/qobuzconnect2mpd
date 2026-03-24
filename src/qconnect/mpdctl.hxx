@@ -105,10 +105,10 @@ public:
 
     // Map a Qobuz queue_item_id to an MPD song id (maintained internally).
     // Returns -1 if not found.
-    int queueItemToMpdId(uint32_t queue_item_id) const;
+    int queueItemToMpdId(uint64_t queue_item_id) const;
 
     // Register a mapping from Qobuz queue_item_id to mpd song id.
-    void registerQueueItem(uint32_t queue_item_id, int mpd_id);
+    void registerQueueItem(uint64_t queue_item_id, int mpd_id);
 
 private:
     bool openConnection();
@@ -132,7 +132,7 @@ private:
     std::mutex             m_cb_mutex;
 
     // Map Qobuz queue_item_id -> MPD song id
-    std::vector<std::pair<uint32_t, int>> m_item_map;
+    std::vector<std::pair<uint64_t, int>> m_item_map;
     mutable std::mutex                    m_map_mutex;
 
     // Saved queue for restoration on disconnect

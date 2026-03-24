@@ -61,7 +61,7 @@ struct WSessionCallbacks {
     std::function<void(const std::vector<QueueTrack>& /*tracks*/)>
         on_tracks_added;
 
-    std::function<void(const std::vector<uint32_t>& /*queue_item_ids*/)>
+    std::function<void(const std::vector<uint64_t>& /*queue_item_ids*/)>
         on_tracks_removed;
 };
 
@@ -127,6 +127,10 @@ private:
     uint64_t m_session_id{0};
     uint64_t m_renderer_id{0};
     bool     m_is_active{false};
+
+    // Last reported renderer state (used for heartbeats and immediate responses)
+    QueueRendererState   m_last_state{};
+    std::mutex           m_state_mutex;
 
     // Rolling counters for message IDs
     std::atomic<int32_t> m_batch_id{0};

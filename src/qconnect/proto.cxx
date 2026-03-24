@@ -17,6 +17,7 @@
 
 #include "proto.hxx"
 
+#include <chrono>
 #include <cstring>
 
 namespace QConnect {
@@ -26,6 +27,21 @@ namespace QConnect {
 // ============================================================
 
 namespace {
+
+static uint64_t nowMs() {
+    using namespace std::chrono;
+    return static_cast<uint64_t>(
+        duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
+
+// Convert Qobuz format_id (5/6/7/27) to QConnect quality level (1-4).
+// Level 1=MP3, 2=CD/FLAC, 3=HiRes-96k, 4=HiRes-192k.
+static int32_t formatIdToQualityLevel(int32_t fmt) {
+    if (fmt == 27) return 4;
+    if (fmt == 7)  return 3;
+    if (fmt == 6)  return 2;
+    return 1;
+}
 
 // Wire types
 constexpr uint8_t WT_VARINT = 0;
@@ -158,6 +174,17 @@ bool skipField(const uint8_t* data, size_t len, size_t& pos, uint8_t wire_type) 
     }
 }
 
+// Read a fixed32 field (4 bytes little-endian, wire type 5).
+bool readFixed32(const uint8_t* data, size_t len, size_t& pos, uint32_t& out) {
+    if (pos + 4 > len) return false;
+    out = static_cast<uint32_t>(data[pos])
+        | (static_cast<uint32_t>(data[pos+1]) << 8)
+        | (static_cast<uint32_t>(data[pos+2]) << 16)
+        | (static_cast<uint32_t>(data[pos+3]) << 24);
+    pos += 4;
+    return true;
+}
+
 // Read a length-delimited field and return its span.
 bool readLenField(const uint8_t* data, size_t len, size_t& pos,
                   const uint8_t*& field_data, size_t& field_len) {
@@ -198,8 +225,9 @@ bool decodeQueueTrackRef(const uint8_t* d, size_t len, QueueTrackRef& out) {
         uint64_t v;
         const uint8_t* fd; size_t fl;
         switch (fn) {
-        case 1: readVarint(d, len, pos, v); out.queue_item_id = static_cast<uint32_t>(v); break;
-        case 2: readVarint(d, len, pos, v); out.track_id = static_cast<uint32_t>(v); break;
+        case 1: readVarint(d, len, pos, v); out.queue_item_id = v; break;
+        case 2: // track_id is fixed32 (wire type 5, 4 bytes LE)
+            { uint32_t fv = 0; readFixed32(d, len, pos, fv); out.track_id = fv; } break;
         case 3:
             if (!readLenField(d, len, pos, fd, fl)) return false;
             out.context_uuid.assign(fd, fd + fl); break;
@@ -234,8 +262,8 @@ bool decodeRendererState(const uint8_t* d, size_t len, RendererState& out) {
             }
             break;
         case 4: readVarint(d, len, pos, v); out.duration_ms              = static_cast<uint32_t>(v); break;
-        case 5: readVarint(d, len, pos, v); out.current_queue_item_id    = static_cast<uint32_t>(v); break;
-        case 6: readVarint(d, len, pos, v); out.next_queue_item_id       = static_cast<uint32_t>(v); break;
+        case 5: readVarint(d, len, pos, v); out.current_queue_item_id    = v; break;
+        case 6: readVarint(d, len, pos, v); out.next_queue_item_id       = v; break;
         default: if (!skipField(d, len, pos, wt)) return false; break;
         }
     }
@@ -295,9 +323,9 @@ bool decodeQueueTrack(const uint8_t* d, size_t len, QueueTrack& out) {
         uint64_t v;
         const uint8_t* fd; size_t fl;
         switch (fn) {
-        case 1: readVarint(d,len,pos,v); out.queue_item_id = static_cast<uint32_t>(v); break;
-        // field 2 = track_id (fixed32 in some protos, varint in others – assume varint)
-        case 2: readVarint(d,len,pos,v); out.track_id = static_cast<uint32_t>(v); break;
+        case 1: readVarint(d,len,pos,v); out.queue_item_id = v; break;
+        case 2: // track_id is fixed32 (wire type 5, 4 bytes LE)
+            { uint32_t fv = 0; readFixed32(d, len, pos, fv); out.track_id = fv; } break;
         case 3: if (!readLenField(d,len,pos,fd,fl)) return false;
                 out.context_uuid.assign(fd, fd+fl); break;
         default: if (!skipField(d, len, pos, wt)) return false; break;
@@ -432,11 +460,11 @@ bool decodeMsgQueueRemoved(const uint8_t* d, size_t len, MsgQueueTracksRemoved& 
                 size_t p2 = 0;
                 while (p2 < fl) {
                     if (!readVarint(fd, fl, p2, v)) break;
-                    out.queue_item_ids.push_back(static_cast<uint32_t>(v));
+                    out.queue_item_ids.push_back(v);
                 }
             } else {
                 readVarint(d,len,pos,v);
-                out.queue_item_ids.push_back(static_cast<uint32_t>(v));
+                out.queue_item_ids.push_back(v);
             }
             break;
         default: if (!skipField(d, len, pos, wt)) return false; break;
@@ -597,11 +625,30 @@ Bytes encodeRendererState(const RendererState& s) {
 }
 
 Bytes encodeQueueRendererState(const QueueRendererState& s) {
+    // Wire layout matches QueueRendererState proto (flat, not nested):
+    //   1: playing_state (varint enum)
+    //   2: buffer_state  (varint enum)
+    //   3: current_position (Position message: fixed64 timestamp @1, uint32 value_ms @2)
+    //   4: duration (uint32, ms)
+    //   5: queue_version (QueueVersion message)
+    //   6: current_queue_item_id (uint64)
+    //   7: next_queue_item_id (uint64)
     Bytes b;
+    writeInt32Field(b, 1, static_cast<int32_t>(s.state.playing_state));
+    writeInt32Field(b, 2, static_cast<int32_t>(s.state.buffer_state));
+    if (s.state.current_position_ms) {
+        Bytes pos;
+        writeFixed64Field(pos, 1, nowMs()); // timestamp = wall clock in ms
+        writeUint32Field(pos, 2, s.state.current_position_ms);
+        writeMessageField(b, 3, pos);
+    }
+    writeUint32Field(b, 4, s.state.duration_ms);
     Bytes qv = encodeQueueVersion(s.queue_version);
-    writeMessageField(b, 1, qv);
-    Bytes rs = encodeRendererState(s.state);
-    writeMessageField(b, 2, rs);
+    if (!qv.empty()) writeMessageField(b, 5, qv);
+    if (s.state.current_queue_item_id)
+        writeUint64Field(b, 6, s.state.current_queue_item_id);
+    if (s.state.next_queue_item_id)
+        writeUint64Field(b, 7, s.state.next_queue_item_id);
     return b;
 }
 
@@ -613,24 +660,36 @@ Bytes encodeDeviceInfo(const DeviceInfo& d) {
     writeStringField(b, 4, d.model);
     writeStringField(b, 5, d.serial);
     writeInt32Field(b, 6, d.type);
-    // DeviceCapabilities field 7: { max_quality=1, ... } - minimal version
+    // DeviceCapabilities field 7: { min_quality@1, max_quality@2, volume_control@3 }
+    // Quality levels: 1=MP3, 2=CD/FLAC, 3=HiRes-96k, 4=HiRes-192k
     {
         Bytes caps;
-        writeInt32Field(caps, 1, d.max_quality);
+        writeInt32Field(caps, 1, 1); // min_audio_quality = MP3 (1)
+        writeInt32Field(caps, 2, formatIdToQualityLevel(d.max_quality));
+        writeInt32Field(caps, 3, 2); // volume_remote_control = 2
         writeMessageField(b, 7, caps);
     }
+    if (!d.software_version.empty())
+        writeStringField(b, 8, d.software_version);
     return b;
 }
 
-// Wrap an inner QConnect message in QConnectBatch + Payload envelope
+// Wrap an inner QConnect message in QConnectBatch + Payload envelope.
+// force_content: if true, always write the inner message field even if empty
+// (needed for messages like VolumeMuted(false) that must be present but have no fields).
 Bytes wrapInPayload(uint64_t time_ms, int32_t batch_id,
                      int inner_msg_field_number,
-                     const Bytes& inner_msg) {
+                     const Bytes& inner_msg,
+                     bool force_content = false) {
     // QConnectMessage { message_type=1 (varint), content at field=message_type }
     // The message_type field 1 must be present; qonductor always sets it.
     Bytes qcm;
     writeInt32Field(qcm, 1, inner_msg_field_number); // QConnectMessage.message_type
-    writeMessageField(qcm, inner_msg_field_number, inner_msg);
+    if (force_content || !inner_msg.empty()) {
+        writeTag(qcm, inner_msg_field_number, WT_LEN);
+        writeVarint(qcm, inner_msg.size());
+        qcm.insert(qcm.end(), inner_msg.begin(), inner_msg.end());
+    }
 
     // QConnectBatch { messages_time=1 (fixed64), messages_id=2, messages=3 }
     Bytes batch;
@@ -756,6 +815,28 @@ Bytes buildAskRendererState(uint64_t time_ms, int32_t batch_id,
     writeUint64Field(msg, 1, session_id);
     Bytes payload = wrapInPayload(time_ms, batch_id,
                                    static_cast<int>(MsgType::CTRL_ASK_RENDERER_STATE), msg);
+    return buildEnvelope(EnvType::PAYLOAD, payload);
+}
+
+Bytes buildVolumeMuted(uint64_t time_ms, int32_t batch_id, bool muted) {
+    // RndrSrvrVolumeMuted { value=1 (bool, optional) }
+    // Protocol convention: None (no field) = not muted, Some(true) = muted.
+    // Must always send the message even when not muted (empty body).
+    Bytes msg;
+    if (muted) writeBoolField(msg, 1, true);
+    Bytes payload = wrapInPayload(time_ms, batch_id,
+                                   static_cast<int>(MsgType::RNDR_VOLUME_MUTED), msg,
+                                   /*force_content=*/true);
+    return buildEnvelope(EnvType::PAYLOAD, payload);
+}
+
+Bytes buildAskQueueState(uint64_t time_ms, int32_t batch_id,
+                          const Bytes& queue_uuid) {
+    // CtrlSrvrAskForQueueState { queue_version=1 (omit), queue_uuid=2 (bytes) }
+    Bytes msg;
+    writeBytesField(msg, 2, queue_uuid);
+    Bytes payload = wrapInPayload(time_ms, batch_id,
+                                   static_cast<int>(MsgType::CTRL_ASK_QUEUE_STATE), msg);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
 

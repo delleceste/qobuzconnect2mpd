@@ -301,14 +301,14 @@ void MpdCtl::setStateCallback(MpdStateCallback cb) {
 
 // ---- Queue item mapping -----------------------------------------------------
 
-int MpdCtl::queueItemToMpdId(uint32_t queue_item_id) const {
+int MpdCtl::queueItemToMpdId(uint64_t queue_item_id) const {
     std::lock_guard<std::mutex> lk(m_map_mutex);
     for (const auto& p : m_item_map)
         if (p.first == queue_item_id) return p.second;
     return -1;
 }
 
-void MpdCtl::registerQueueItem(uint32_t queue_item_id, int mpd_id) {
+void MpdCtl::registerQueueItem(uint64_t queue_item_id, int mpd_id) {
     std::lock_guard<std::mutex> lk(m_map_mutex);
     m_item_map.emplace_back(queue_item_id, mpd_id);
 }

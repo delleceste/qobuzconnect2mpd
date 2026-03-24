@@ -225,7 +225,7 @@ void QcManager::onConnect(ConnectCredentials creds) {
     cbs.on_tracks_added = [this](const std::vector<QueueTrack>& tracks) {
         onTracksAdded(tracks);
     };
-    cbs.on_tracks_removed = [this](const std::vector<uint32_t>& ids) {
+    cbs.on_tracks_removed = [this](const std::vector<uint64_t>& ids) {
         onTracksRemoved(ids);
     };
     cbs.on_connected    = [this]() { onWsConnected(); };
@@ -303,7 +303,7 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
     LOGINF("QcManager: loading " << tracks.size()
            << " tracks from Qobuz, starting at " << start_idx << "\n");
 
-    std::vector<uint32_t> item_ids;
+    std::vector<uint64_t> item_ids;
     auto urls = resolveStreamUrls(tracks, item_ids);
     if (urls.empty()) {
         LOGERR("QcManager: failed to resolve any stream URLs\n");
@@ -322,7 +322,7 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
     // original track list, but we may have fewer entries now.
     int mpd_start = 0;
     if (start_idx > 0 && start_idx < tracks.size()) {
-        uint32_t target_item = tracks[start_idx].queue_item_id;
+        uint64_t target_item = tracks[start_idx].queue_item_id;
         int pos = mpdPosForQueueItem(target_item);
         if (pos >= 0) mpd_start = pos;
     }
@@ -331,7 +331,7 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
 
 void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
                                    uint32_t insert_after_item_id) {
-    std::vector<uint32_t> item_ids;
+    std::vector<uint64_t> item_ids;
     auto urls = resolveStreamUrls(tracks, item_ids);
     if (urls.empty() || !m_mpd) return;
 
@@ -359,7 +359,7 @@ void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
 }
 
 void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
-    std::vector<uint32_t> item_ids;
+    std::vector<uint64_t> item_ids;
     auto urls = resolveStreamUrls(tracks, item_ids);
     if (urls.empty() || !m_mpd) return;
 
@@ -371,12 +371,12 @@ void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
     m_mpd->addTracks(urls);
 }
 
-void QcManager::onTracksRemoved(const std::vector<uint32_t>& queue_item_ids) {
+void QcManager::onTracksRemoved(const std::vector<uint64_t>& queue_item_ids) {
     if (!m_mpd) return;
     // Remove from our mapping
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        for (uint32_t qid : queue_item_ids) {
+        for (uint64_t qid : queue_item_ids) {
             auto it = std::find(m_queue_item_ids.begin(),
                                 m_queue_item_ids.end(), qid);
             if (it != m_queue_item_ids.end())
@@ -384,7 +384,7 @@ void QcManager::onTracksRemoved(const std::vector<uint32_t>& queue_item_ids) {
         }
     }
     std::vector<int> mpd_ids;
-    for (uint32_t qid : queue_item_ids) {
+    for (uint64_t qid : queue_item_ids) {
         int mid = m_mpd->queueItemToMpdId(qid);
         if (mid >= 0) mpd_ids.push_back(mid);
     }
@@ -435,7 +435,7 @@ void QcManager::onMpdState(const MpdState& st) {
 
 std::vector<std::string> QcManager::resolveStreamUrls(
     const std::vector<QueueTrack>& tracks,
-    std::vector<uint32_t>& out_item_ids) {
+    std::vector<uint64_t>& out_item_ids) {
     std::vector<std::string> urls;
     urls.reserve(tracks.size());
     out_item_ids.clear();
@@ -455,14 +455,14 @@ std::vector<std::string> QcManager::resolveStreamUrls(
     return urls;
 }
 
-uint32_t QcManager::queueItemIdAt(int mpd_pos) const {
+uint64_t QcManager::queueItemIdAt(int mpd_pos) const {
     std::lock_guard<std::mutex> lk(m_qmap_mutex);
     if (mpd_pos >= 0 && static_cast<size_t>(mpd_pos) < m_queue_item_ids.size())
         return m_queue_item_ids[mpd_pos];
     return 0;
 }
 
-int QcManager::mpdPosForQueueItem(uint32_t queue_item_id) const {
+int QcManager::mpdPosForQueueItem(uint64_t queue_item_id) const {
     std::lock_guard<std::mutex> lk(m_qmap_mutex);
     for (size_t i = 0; i < m_queue_item_ids.size(); ++i) {
         if (m_queue_item_ids[i] == queue_item_id)
