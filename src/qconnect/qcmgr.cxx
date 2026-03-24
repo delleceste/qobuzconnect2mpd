@@ -270,6 +270,9 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
                            const QueueTrackRef& current_item) {
     if (!m_mpd) return;
 
+    // Clamp bogus positions (server can send unsigned-wrapped negatives)
+    if (position_ms > 0x7FFFFFFF) position_ms = 0;
+
     // Handle track change independently of play state
     // (server sends state=UNKNOWN + qitem=N to mean "switch track, keep state")
     if (current_item.has_queue_item_id) {
@@ -299,8 +302,19 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
 
     // Handle seek independently of play state (has_position distinguishes
     // "seek to 0" from "no seek requested")
-    if (has_position)
+    if (has_position) {
+        // "Previous track" logic: the Qobuz app sends seek-to-0 for the back
+        // button and expects the renderer to skip to the previous track when
+        // already near the start of the current one.
+        if (position_ms == 0) {
+            MpdState st = m_mpd->getState();
+            if (st.position_ms < 3000 && st.queue_pos > 0) {
+                m_mpd->previous();
+                return;
+            }
+        }
         m_mpd->seek(position_ms);
+    }
 }
 
 void QcManager::onSetVolume(uint32_t volume, int32_t delta) {
