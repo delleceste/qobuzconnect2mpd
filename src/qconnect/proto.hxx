@@ -166,15 +166,18 @@ struct QueueTrackRef {
     uint64_t queue_item_id{0};
     uint32_t track_id{0};
     Bytes    context_uuid; // 16-byte UUID
+    bool     has_queue_item_id{false}; // presence flag (0 is a valid ID)
 };
 
 struct RendererState {
     PlayingState playing_state{PlayingState::UNKNOWN};
     BufferState  buffer_state{BufferState::UNKNOWN};
     uint32_t     current_position_ms{0};
+    uint64_t     position_timestamp_ms{0}; // epoch ms when position was sampled
     uint32_t     duration_ms{0};
     uint64_t     current_queue_item_id{0};
     uint64_t     next_queue_item_id{0};
+    bool         has_current_queue_item_id{false}; // presence flag (0 is valid)
 };
 
 struct QueueRendererState {

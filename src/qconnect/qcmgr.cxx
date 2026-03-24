@@ -28,8 +28,15 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <mutex>
+
+static uint64_t nowMs() {
+    using namespace std::chrono;
+    return static_cast<uint64_t>(
+        duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
+}
 
 namespace QConnect {
 
@@ -263,7 +270,7 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
 
     // Handle track change independently of play state
     // (server sends state=UNKNOWN + qitem=N to mean "switch track, keep state")
-    if (current_item.queue_item_id != 0) {
+    if (current_item.has_queue_item_id) {
         int target_pos = mpdPosForQueueItem(current_item.queue_item_id);
         if (target_pos >= 0)
             m_mpd->play(target_pos);
@@ -273,7 +280,7 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
     switch (ps) {
     case PlayingState::PLAYING:
         // If no track change above, just resume
-        if (current_item.queue_item_id == 0)
+        if (!current_item.has_queue_item_id)
             m_mpd->play();
         break;
     case PlayingState::PAUSED:
@@ -307,6 +314,17 @@ void QcManager::onSetVolume(uint32_t volume, int32_t delta) {
 
 void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
                               uint32_t start_idx) {
+    // Empty queue = queue cleared: stop playback and clear MPD
+    if (tracks.empty()) {
+        LOGINF("QcManager: queue cleared — stopping playback\n");
+        {
+            std::lock_guard<std::mutex> lk(m_qmap_mutex);
+            m_queue_item_ids.clear();
+        }
+        if (m_mpd) m_mpd->stop();
+        return;
+    }
+
     LOGINF("QcManager: loading " << tracks.size()
            << " tracks from Qobuz, starting at " << start_idx << "\n");
     for (size_t i = 0; i < tracks.size(); ++i) {
@@ -408,17 +426,20 @@ void QcManager::onMpdState(const MpdState& st) {
     if (!m_ws || !m_ws_active) return;
 
     QueueRendererState qrs;
-    qrs.state.current_position_ms = st.position_ms;
-    qrs.state.duration_ms         = st.duration_ms;
+    qrs.state.current_position_ms  = st.position_ms;
+    qrs.state.position_timestamp_ms = nowMs(); // record when we sampled this
+    qrs.state.duration_ms          = st.duration_ms;
 
     // Map MPD queue position to Qobuz queue_item_id
     if (st.queue_pos >= 0) {
-        uint64_t qid = queueItemIdAt(st.queue_pos);
-        LOGDEB("QcManager: mpdState queue_pos=" << st.queue_pos
-               << " -> qitem=" << qid
-               << " (map size=" << m_queue_item_ids.size() << ")\n");
-        if (qid != 0)
-            qrs.state.current_queue_item_id = qid;
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        if (static_cast<size_t>(st.queue_pos) < m_queue_item_ids.size()) {
+            qrs.state.current_queue_item_id = m_queue_item_ids[st.queue_pos];
+            qrs.state.has_current_queue_item_id = true;
+            LOGDEB("QcManager: mpdState queue_pos=" << st.queue_pos
+                   << " -> qitem=" << qrs.state.current_queue_item_id
+                   << " (map size=" << m_queue_item_ids.size() << ")\n");
+        }
     }
 
     switch (st.status) {

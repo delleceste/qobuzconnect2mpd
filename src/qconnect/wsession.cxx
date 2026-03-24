@@ -342,19 +342,18 @@ void WSession::dispatchMessage(const Message& msg) {
                << " pos=" << msg.set_state.current_position_ms
                << " qitem=" << msg.set_state.current_queue_item.queue_item_id
                << "\n");
-        // Only act on SetState when at least one field is actually present
-        // (protobuf omits default values, so state=0/pos=0/qitem=0 means absent).
+        // Only act on SetState when at least one field is actually present.
         // Responding to empty SetState creates a feedback loop with the server.
+        // Use has_queue_item_id flag because 0 is a valid queue_item_id.
         if (msg.set_state.playing_state != PlayingState::UNKNOWN ||
             msg.set_state.current_position_ms != 0 ||
-            msg.set_state.current_queue_item.queue_item_id != 0) {
+            msg.set_state.current_queue_item.has_queue_item_id) {
             if (m_cbs.on_set_state) {
                 m_cbs.on_set_state(msg.set_state.playing_state,
                                     msg.set_state.current_position_ms,
                                     msg.set_state.current_queue_item);
             }
             // Immediately acknowledge with a StateUpdated response
-            // (qonductor does this synchronously; async MPD callback may be too late)
             QueueRendererState ack;
             {
                 std::lock_guard<std::mutex> lk(m_state_mutex);
@@ -362,10 +361,14 @@ void WSession::dispatchMessage(const Message& msg) {
             }
             if (msg.set_state.playing_state != PlayingState::UNKNOWN)
                 ack.state.playing_state = msg.set_state.playing_state;
-            if (msg.set_state.current_position_ms)
+            if (msg.set_state.current_position_ms) {
                 ack.state.current_position_ms = msg.set_state.current_position_ms;
-            if (msg.set_state.current_queue_item.queue_item_id)
+                ack.state.position_timestamp_ms = nowMs();
+            }
+            if (msg.set_state.current_queue_item.has_queue_item_id) {
                 ack.state.current_queue_item_id = msg.set_state.current_queue_item.queue_item_id;
+                ack.state.has_current_queue_item_id = true;
+            }
             {
                 std::lock_guard<std::mutex> lk(m_state_mutex);
                 m_last_state = ack;

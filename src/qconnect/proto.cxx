@@ -225,7 +225,7 @@ bool decodeQueueTrackRef(const uint8_t* d, size_t len, QueueTrackRef& out) {
         uint64_t v;
         const uint8_t* fd; size_t fl;
         switch (fn) {
-        case 1: readVarint(d, len, pos, v); out.queue_item_id = v; break;
+        case 1: readVarint(d, len, pos, v); out.queue_item_id = v; out.has_queue_item_id = true; break;
         case 2: // track_id is fixed32 (wire type 5, 4 bytes LE)
             { uint32_t fv = 0; readFixed32(d, len, pos, fv); out.track_id = fv; } break;
         case 3:
@@ -612,15 +612,18 @@ Bytes encodeRendererState(const RendererState& s) {
     Bytes b;
     writeInt32Field(b, 1, static_cast<int32_t>(s.playing_state));
     writeInt32Field(b, 2, static_cast<int32_t>(s.buffer_state));
-    // Position field 3: { timestamp=1 (unused), value_ms=2 }
-    if (s.current_position_ms) {
+    if (s.position_timestamp_ms || s.current_position_ms) {
         Bytes pos;
+        uint64_t ts = s.position_timestamp_ms ? s.position_timestamp_ms : nowMs();
+        writeFixed64Field(pos, 1, ts);
         writeUint32Field(pos, 2, s.current_position_ms);
         writeMessageField(b, 3, pos);
     }
     writeUint32Field(b, 4, s.duration_ms);
-    writeUint32Field(b, 5, s.current_queue_item_id);
-    writeUint32Field(b, 6, s.next_queue_item_id);
+    if (s.has_current_queue_item_id || s.current_queue_item_id)
+        writeUint64Field(b, 5, s.current_queue_item_id);
+    if (s.next_queue_item_id)
+        writeUint64Field(b, 6, s.next_queue_item_id);
     return b;
 }
 
@@ -636,16 +639,19 @@ Bytes encodeQueueRendererState(const QueueRendererState& s) {
     Bytes b;
     writeInt32Field(b, 1, static_cast<int32_t>(s.state.playing_state));
     writeInt32Field(b, 2, static_cast<int32_t>(s.state.buffer_state));
-    if (s.state.current_position_ms) {
+    // Always send Position when we have a timestamp (even if position_ms == 0,
+    // e.g. start of track). The server extrapolates: pos + (now - timestamp).
+    if (s.state.position_timestamp_ms || s.state.current_position_ms) {
         Bytes pos;
-        writeFixed64Field(pos, 1, nowMs()); // timestamp = wall clock in ms
+        uint64_t ts = s.state.position_timestamp_ms ? s.state.position_timestamp_ms : nowMs();
+        writeFixed64Field(pos, 1, ts);
         writeUint32Field(pos, 2, s.state.current_position_ms);
         writeMessageField(b, 3, pos);
     }
     writeUint32Field(b, 4, s.state.duration_ms);
     Bytes qv = encodeQueueVersion(s.queue_version);
     if (!qv.empty()) writeMessageField(b, 5, qv);
-    if (s.state.current_queue_item_id)
+    if (s.state.has_current_queue_item_id || s.state.current_queue_item_id)
         writeUint64Field(b, 6, s.state.current_queue_item_id);
     if (s.state.next_queue_item_id)
         writeUint64Field(b, 7, s.state.next_queue_item_id);
