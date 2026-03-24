@@ -35,7 +35,9 @@ namespace QConnect {
 struct WSessionCallbacks {
     // Play/pause/seek: playing_state is PLAYING/PAUSED/STOPPED,
     // position_ms is the target seek position (0 if no seek).
-    std::function<void(PlayingState, uint32_t /*position_ms*/)> on_set_state;
+    // current_item identifies which track the app wants us to play.
+    std::function<void(PlayingState, uint32_t /*position_ms*/,
+                        const QueueTrackRef& /*current_item*/)> on_set_state;
 
     // Volume change: absolute volume (0-100), or delta if delta != 0.
     std::function<void(uint32_t /*volume*/, int32_t /*delta*/)> on_set_volume;
@@ -45,18 +47,18 @@ struct WSessionCallbacks {
     std::function<void()> on_disconnected;
 
     // Full queue received (e.g. user pressed Play Album).
-    // track_ids are Qobuz track IDs in queue order.
+    // tracks carry both queue_item_id and track_id for each entry.
     // start_index is the position within the queue to start playing.
-    std::function<void(const std::vector<uint32_t>& /*track_ids*/,
-                        uint32_t                      /*start_index*/)>
+    std::function<void(const std::vector<QueueTrack>& /*tracks*/,
+                        uint32_t                       /*start_index*/)>
         on_queue_load;
 
-    // Incremental queue updates
-    std::function<void(const std::vector<uint32_t>& /*track_ids*/,
+    // Incremental queue updates (carry full QueueTrack for mapping)
+    std::function<void(const std::vector<QueueTrack>& /*tracks*/,
                         uint32_t /*insert_after_item_id*/)>
         on_tracks_inserted;
 
-    std::function<void(const std::vector<uint32_t>& /*track_ids*/)>
+    std::function<void(const std::vector<QueueTrack>& /*tracks*/)>
         on_tracks_added;
 
     std::function<void(const std::vector<uint32_t>& /*queue_item_ids*/)>

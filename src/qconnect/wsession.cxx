@@ -188,20 +188,6 @@ bool WSession::sendHeartbeat() {
     return sendRaw(buildStateUpdated(nowMs(), nextBatchId(m_batch_id), dummy));
 }
 
-// Helper: extract track_ids from a vector of QueueTrack
-static std::vector<uint32_t> extractTrackIds(const std::vector<QueueTrack>& qt) {
-    std::vector<uint32_t> ids;
-    ids.reserve(qt.size());
-    for (const auto& t : qt) ids.push_back(t.track_id);
-    return ids;
-}
-
-static std::vector<uint32_t> extractItemIds(const std::vector<QueueTrack>& qt) {
-    std::vector<uint32_t> ids;
-    ids.reserve(qt.size());
-    for (const auto& t : qt) ids.push_back(t.queue_item_id);
-    return ids;
-}
 
 void WSession::eventLoop() {
     // Get raw socket fd for select()-based waiting
@@ -332,10 +318,13 @@ void WSession::dispatchMessage(const Message& msg) {
     case MsgType::CMD_SET_STATE:
         LOGDEB("WSession: SetState state="
                << static_cast<int>(msg.set_state.playing_state)
-               << " pos=" << msg.set_state.current_position_ms << "\n");
+               << " pos=" << msg.set_state.current_position_ms
+               << " qitem=" << msg.set_state.current_queue_item.queue_item_id
+               << "\n");
         if (m_cbs.on_set_state) {
             m_cbs.on_set_state(msg.set_state.playing_state,
-                                msg.set_state.current_position_ms);
+                                msg.set_state.current_position_ms,
+                                msg.set_state.current_queue_item);
         }
         break;
 
@@ -353,7 +342,7 @@ void WSession::dispatchMessage(const Message& msg) {
                << msg.queue_state.tracks.size() << "\n");
         // Full queue snapshot: treat as load at position 0
         if (m_cbs.on_queue_load && !msg.queue_state.tracks.empty()) {
-            m_cbs.on_queue_load(extractTrackIds(msg.queue_state.tracks), 0);
+            m_cbs.on_queue_load(msg.queue_state.tracks, 0);
         }
         break;
 
@@ -363,7 +352,7 @@ void WSession::dispatchMessage(const Message& msg) {
                << " pos=" << msg.queue_load_tracks.queue_position << "\n");
         if (m_cbs.on_queue_load) {
             m_cbs.on_queue_load(
-                extractTrackIds(msg.queue_load_tracks.tracks),
+                msg.queue_load_tracks.tracks,
                 msg.queue_load_tracks.queue_position);
         }
         break;
@@ -371,14 +360,14 @@ void WSession::dispatchMessage(const Message& msg) {
     case MsgType::SRVRC_TRACKS_INSERTED:
         if (m_cbs.on_tracks_inserted) {
             m_cbs.on_tracks_inserted(
-                extractTrackIds(msg.tracks_inserted.tracks),
+                msg.tracks_inserted.tracks,
                 msg.tracks_inserted.insert_after);
         }
         break;
 
     case MsgType::SRVRC_TRACKS_ADDED:
         if (m_cbs.on_tracks_added) {
-            m_cbs.on_tracks_added(extractTrackIds(msg.tracks_added.tracks));
+            m_cbs.on_tracks_added(msg.tracks_added.tracks);
         }
         break;
 

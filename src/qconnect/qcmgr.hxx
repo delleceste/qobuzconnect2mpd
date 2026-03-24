@@ -100,12 +100,13 @@ private:
     void onConnect(ConnectCredentials creds);
 
     // Called by WSession callbacks
-    void onSetState(PlayingState ps, uint32_t position_ms);
+    void onSetState(PlayingState ps, uint32_t position_ms,
+                    const QueueTrackRef& current_item);
     void onSetVolume(uint32_t volume, int32_t delta);
-    void onQueueLoad(const std::vector<uint32_t>& track_ids, uint32_t start_idx);
-    void onTracksInserted(const std::vector<uint32_t>& track_ids,
+    void onQueueLoad(const std::vector<QueueTrack>& tracks, uint32_t start_idx);
+    void onTracksInserted(const std::vector<QueueTrack>& tracks,
                            uint32_t insert_after_item_id);
-    void onTracksAdded(const std::vector<uint32_t>& track_ids);
+    void onTracksAdded(const std::vector<QueueTrack>& tracks);
     void onTracksRemoved(const std::vector<uint32_t>& queue_item_ids);
     void onWsConnected();
     void onWsDisconnected();
@@ -113,9 +114,17 @@ private:
     // Called by MpdCtl's event thread
     void onMpdState(const MpdState& st);
 
-    // Qobuz API: get stream URLs for a list of track IDs (in order)
+    // Qobuz API: resolve stream URLs and build queue_item_id mapping.
+    // Returns URLs for successfully resolved tracks.
+    // out_item_ids is filled with the queue_item_id for each returned URL.
     std::vector<std::string> resolveStreamUrls(
-        const std::vector<uint32_t>& track_ids);
+        const std::vector<QueueTrack>& tracks,
+        std::vector<uint32_t>& out_item_ids);
+
+    // Look up Qobuz queue_item_id from MPD queue position.
+    uint32_t queueItemIdAt(int mpd_pos) const;
+    // Look up MPD queue position from Qobuz queue_item_id. Returns -1 if not found.
+    int mpdPosForQueueItem(uint32_t queue_item_id) const;
 
     // IPC with upmpdcli
     bool startIpcServer();
@@ -135,6 +144,10 @@ private:
     std::mutex       m_session_mutex;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_ws_active{false};
+
+    // Maps MPD queue position -> Qobuz queue_item_id (parallel to MPD queue)
+    mutable std::mutex        m_qmap_mutex;
+    std::vector<uint32_t>     m_queue_item_ids;
 
     // IPC
     int          m_ipc_sock{-1};

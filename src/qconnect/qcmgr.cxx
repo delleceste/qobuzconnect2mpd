@@ -27,6 +27,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 
@@ -208,20 +209,21 @@ void QcManager::onConnect(ConnectCredentials creds) {
 
     // Build WSession callbacks
     WSessionCallbacks cbs;
-    cbs.on_set_state  = [this](PlayingState ps, uint32_t pos_ms) {
-        onSetState(ps, pos_ms);
+    cbs.on_set_state  = [this](PlayingState ps, uint32_t pos_ms,
+                                const QueueTrackRef& cur) {
+        onSetState(ps, pos_ms, cur);
     };
     cbs.on_set_volume = [this](uint32_t v, int32_t d) {
         onSetVolume(v, d);
     };
-    cbs.on_queue_load = [this](const std::vector<uint32_t>& ids, uint32_t idx) {
-        onQueueLoad(ids, idx);
+    cbs.on_queue_load = [this](const std::vector<QueueTrack>& tracks, uint32_t idx) {
+        onQueueLoad(tracks, idx);
     };
-    cbs.on_tracks_inserted = [this](const std::vector<uint32_t>& ids, uint32_t after) {
-        onTracksInserted(ids, after);
+    cbs.on_tracks_inserted = [this](const std::vector<QueueTrack>& tracks, uint32_t after) {
+        onTracksInserted(tracks, after);
     };
-    cbs.on_tracks_added = [this](const std::vector<uint32_t>& ids) {
-        onTracksAdded(ids);
+    cbs.on_tracks_added = [this](const std::vector<QueueTrack>& tracks) {
+        onTracksAdded(tracks);
     };
     cbs.on_tracks_removed = [this](const std::vector<uint32_t>& ids) {
         onTracksRemoved(ids);
@@ -246,19 +248,32 @@ void QcManager::onWsConnected() {
 
 void QcManager::onWsDisconnected() {
     m_ws_active = false;
+    {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        m_queue_item_ids.clear();
+    }
     if (m_mpd) m_mpd->stop();
     notifyUpmpdcli("STOPPED\n");
     LOGINF("QcManager: WebSocket session ended\n");
 }
 
-void QcManager::onSetState(PlayingState ps, uint32_t position_ms) {
+void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
+                           const QueueTrackRef& current_item) {
     if (!m_mpd) return;
     switch (ps) {
-    case PlayingState::PLAYING:
+    case PlayingState::PLAYING: {
+        // If the app tells us which track to play, find its MPD position
+        int target_pos = -1;
+        if (current_item.queue_item_id != 0)
+            target_pos = mpdPosForQueueItem(current_item.queue_item_id);
+        if (target_pos >= 0)
+            m_mpd->play(target_pos);
+        else
+            m_mpd->play();
         if (position_ms > 0)
             m_mpd->seek(position_ms);
-        m_mpd->play();
         break;
+    }
     case PlayingState::PAUSED:
         m_mpd->pause(true);
         break;
@@ -283,37 +298,91 @@ void QcManager::onSetVolume(uint32_t volume, int32_t delta) {
     }
 }
 
-void QcManager::onQueueLoad(const std::vector<uint32_t>& track_ids,
+void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
                               uint32_t start_idx) {
-    LOGINF("QcManager: loading " << track_ids.size()
+    LOGINF("QcManager: loading " << tracks.size()
            << " tracks from Qobuz, starting at " << start_idx << "\n");
 
-    auto urls = resolveStreamUrls(track_ids);
+    std::vector<uint32_t> item_ids;
+    auto urls = resolveStreamUrls(tracks, item_ids);
     if (urls.empty()) {
         LOGERR("QcManager: failed to resolve any stream URLs\n");
         return;
     }
 
+    {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        m_queue_item_ids = std::move(item_ids);
+    }
+
     if (!m_mpd) return;
-    m_mpd->loadQueue(urls, static_cast<int>(start_idx));
+
+    // Adjust start_idx: if tracks before start_idx were skipped (failed URL),
+    // we need to find the new position. The start_idx from Qobuz refers to the
+    // original track list, but we may have fewer entries now.
+    int mpd_start = 0;
+    if (start_idx > 0 && start_idx < tracks.size()) {
+        uint32_t target_item = tracks[start_idx].queue_item_id;
+        int pos = mpdPosForQueueItem(target_item);
+        if (pos >= 0) mpd_start = pos;
+    }
+    m_mpd->loadQueue(urls, mpd_start);
 }
 
-void QcManager::onTracksInserted(const std::vector<uint32_t>& track_ids,
+void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
                                    uint32_t insert_after_item_id) {
-    auto urls = resolveStreamUrls(track_ids);
+    std::vector<uint32_t> item_ids;
+    auto urls = resolveStreamUrls(tracks, item_ids);
     if (urls.empty() || !m_mpd) return;
+
+    // Find insert position in our mapping
+    int insert_pos = -1;
+    {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        for (size_t i = 0; i < m_queue_item_ids.size(); ++i) {
+            if (m_queue_item_ids[i] == insert_after_item_id) {
+                insert_pos = static_cast<int>(i);
+                break;
+            }
+        }
+        // Insert new item_ids after insert_pos
+        if (insert_pos >= 0 && insert_pos + 1 <= static_cast<int>(m_queue_item_ids.size()))
+            m_queue_item_ids.insert(m_queue_item_ids.begin() + insert_pos + 1,
+                                     item_ids.begin(), item_ids.end());
+        else
+            m_queue_item_ids.insert(m_queue_item_ids.end(),
+                                     item_ids.begin(), item_ids.end());
+    }
+
     int mpd_id = m_mpd->queueItemToMpdId(insert_after_item_id);
     m_mpd->insertTracks(urls, mpd_id);
 }
 
-void QcManager::onTracksAdded(const std::vector<uint32_t>& track_ids) {
-    auto urls = resolveStreamUrls(track_ids);
+void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
+    std::vector<uint32_t> item_ids;
+    auto urls = resolveStreamUrls(tracks, item_ids);
     if (urls.empty() || !m_mpd) return;
+
+    {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        m_queue_item_ids.insert(m_queue_item_ids.end(),
+                                 item_ids.begin(), item_ids.end());
+    }
     m_mpd->addTracks(urls);
 }
 
 void QcManager::onTracksRemoved(const std::vector<uint32_t>& queue_item_ids) {
     if (!m_mpd) return;
+    // Remove from our mapping
+    {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        for (uint32_t qid : queue_item_ids) {
+            auto it = std::find(m_queue_item_ids.begin(),
+                                m_queue_item_ids.end(), qid);
+            if (it != m_queue_item_ids.end())
+                m_queue_item_ids.erase(it);
+        }
+    }
     std::vector<int> mpd_ids;
     for (uint32_t qid : queue_item_ids) {
         int mid = m_mpd->queueItemToMpdId(qid);
@@ -330,8 +399,13 @@ void QcManager::onMpdState(const MpdState& st) {
     QueueRendererState qrs;
     qrs.state.current_position_ms = st.position_ms;
     qrs.state.duration_ms         = st.duration_ms;
-    if (st.queue_id >= 0)
-        qrs.state.current_queue_item_id = static_cast<uint32_t>(st.queue_id);
+
+    // Map MPD queue position to Qobuz queue_item_id
+    if (st.queue_pos >= 0) {
+        uint32_t qid = queueItemIdAt(st.queue_pos);
+        if (qid != 0)
+            qrs.state.current_queue_item_id = qid;
+    }
 
     switch (st.status) {
     case MpdState::Status::PLAY:
@@ -348,6 +422,11 @@ void QcManager::onMpdState(const MpdState& st) {
         break;
     }
 
+    LOGDEB("QcManager: reportState state=" << static_cast<int>(qrs.state.playing_state)
+           << " pos_ms=" << qrs.state.current_position_ms
+           << " dur_ms=" << qrs.state.duration_ms
+           << " qitem=" << qrs.state.current_queue_item_id << "\n");
+
     m_ws->reportState(qrs);
     m_ws->reportVolume(st.volume);
 }
@@ -355,20 +434,41 @@ void QcManager::onMpdState(const MpdState& st) {
 // ---- Stream URL resolution --------------------------------------------------
 
 std::vector<std::string> QcManager::resolveStreamUrls(
-    const std::vector<uint32_t>& track_ids) {
+    const std::vector<QueueTrack>& tracks,
+    std::vector<uint32_t>& out_item_ids) {
     std::vector<std::string> urls;
-    urls.reserve(track_ids.size());
-    for (uint32_t tid : track_ids) {
+    urls.reserve(tracks.size());
+    out_item_ids.clear();
+    out_item_ids.reserve(tracks.size());
+    for (const auto& t : tracks) {
         TrackStreamInfo info;
-        if (m_api->getStreamUrl(tid, m_cfg.format_id, info)) {
+        if (m_api->getStreamUrl(t.track_id, m_cfg.format_id, info) &&
+            !info.stream_url.empty()) {
             urls.push_back(info.stream_url);
+            out_item_ids.push_back(t.queue_item_id);
         } else {
             LOGERR("QcManager: could not get stream URL for track "
-                   << tid << "\n");
-            urls.push_back(""); // keep index alignment; MpdCtl skips empty
+                   << t.track_id << " (qitem=" << t.queue_item_id << ")\n");
+            // Skip this track — don't add empty URL to MPD
         }
     }
     return urls;
+}
+
+uint32_t QcManager::queueItemIdAt(int mpd_pos) const {
+    std::lock_guard<std::mutex> lk(m_qmap_mutex);
+    if (mpd_pos >= 0 && static_cast<size_t>(mpd_pos) < m_queue_item_ids.size())
+        return m_queue_item_ids[mpd_pos];
+    return 0;
+}
+
+int QcManager::mpdPosForQueueItem(uint32_t queue_item_id) const {
+    std::lock_guard<std::mutex> lk(m_qmap_mutex);
+    for (size_t i = 0; i < m_queue_item_ids.size(); ++i) {
+        if (m_queue_item_ids[i] == queue_item_id)
+            return static_cast<int>(i);
+    }
+    return -1;
 }
 
 // ---- IPC with upmpdcli (Unix socket) ----------------------------------------
