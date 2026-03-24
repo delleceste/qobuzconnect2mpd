@@ -321,6 +321,14 @@ void WSession::dispatchMessage(const Message& msg) {
     case MsgType::CMD_SET_ACTIVE:
         LOGDEB("WSession: SetActive active=" << msg.set_active.active << "\n");
         m_is_active = msg.set_active.active;
+        if (!m_is_active) {
+            // Deactivated by server (queue cleared, renderer switched, etc.)
+            // Stop playback, matching qonductor behaviour.
+            if (m_cbs.on_set_state) {
+                QueueTrackRef empty_ref;
+                m_cbs.on_set_state(PlayingState::STOPPED, 0, false, empty_ref);
+            }
+        }
         if (m_is_active) {
             // Activation handshake (matches qonductor order):
             // 1. VolumeMuted(false)  — field 29, must be sent even with empty body
@@ -352,9 +360,9 @@ void WSession::dispatchMessage(const Message& msg) {
                << "\n");
         // Only act on SetState when at least one field is actually present.
         // Responding to empty SetState creates a feedback loop with the server.
-        // Use has_queue_item_id flag because 0 is a valid queue_item_id.
+        // Use has-flags because 0 is a valid value for position and queue_item_id.
         if (msg.set_state.playing_state != PlayingState::UNKNOWN ||
-            msg.set_state.current_position_ms != 0 ||
+            msg.set_state.has_position ||
             msg.set_state.current_queue_item.has_queue_item_id) {
             if (m_cbs.on_set_state) {
                 m_cbs.on_set_state(msg.set_state.playing_state,
