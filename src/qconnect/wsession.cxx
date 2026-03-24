@@ -346,7 +346,9 @@ void WSession::dispatchMessage(const Message& msg) {
         LOGDEB("WSession: SetState state="
                << static_cast<int>(msg.set_state.playing_state)
                << " pos=" << msg.set_state.current_position_ms
+               << " has_pos=" << msg.set_state.has_position
                << " qitem=" << msg.set_state.current_queue_item.queue_item_id
+               << " has_qitem=" << msg.set_state.current_queue_item.has_queue_item_id
                << "\n");
         // Only act on SetState when at least one field is actually present.
         // Responding to empty SetState creates a feedback loop with the server.

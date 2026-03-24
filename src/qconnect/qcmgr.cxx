@@ -336,11 +336,9 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
                << " trackid=" << tracks[i].track_id << "\n");
     }
 
-    // Stop MPD immediately so the old queue stops while we resolve URLs
+    // Pause MPD while we resolve URLs (don't use stop() — it restores saved queue)
     if (m_mpd) {
-        m_mpd->stop();
-        // Re-clear after stop (stop may restore saved queue)
-        // We just need silence while resolving
+        m_mpd->pause(true);
     }
 
     std::vector<uint64_t> item_ids;

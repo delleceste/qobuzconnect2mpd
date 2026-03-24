@@ -200,7 +200,9 @@ bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
     out.mime_type     = root.get("mime_type", "audio/flac").asString();
     out.format_id     = root.get("format_id", format_id).asInt();
     out.duration_ms   = root.get("duration", 0).asUInt() * 1000;
-    out.sampling_rate = root.get("sampling_rate", 44100).asInt();
+    // Qobuz returns sampling_rate in kHz as float (e.g. 96.0, 44.1)
+    double sr = root.get("sampling_rate", 44.1).asDouble();
+    out.sampling_rate = (sr < 1000) ? static_cast<int>(sr * 1000) : static_cast<int>(sr);
     out.bit_depth     = root.get("bit_depth", 16).asInt();
 
     if (out.stream_url.empty()) {
