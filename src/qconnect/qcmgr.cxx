@@ -281,9 +281,10 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
     // Handle play state change
     switch (ps) {
     case PlayingState::PLAYING:
-        // If no track change above, just resume
+        // If no track change above, just unpause (don't use play() —
+        // it can restart from wrong position after reconnection)
         if (!current_item.has_queue_item_id)
-            m_mpd->play();
+            m_mpd->pause(false);
         break;
     case PlayingState::PAUSED:
         m_mpd->pause(true);

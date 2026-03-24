@@ -194,16 +194,30 @@ bool MpdCtl::removeTracks(const std::vector<int>& mpd_song_ids) {
 
 bool MpdCtl::play(int queue_pos) {
     std::lock_guard<std::mutex> lk(m_conn_mutex);
-    if (!ensureConnected()) return false;
-    if (queue_pos >= 0)
-        return mpd_run_play_pos(m_conn, static_cast<unsigned>(queue_pos));
-    return mpd_run_play(m_conn);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!ensureConnected()) return false;
+        bool ok;
+        if (queue_pos >= 0)
+            ok = mpd_run_play_pos(m_conn, static_cast<unsigned>(queue_pos));
+        else
+            ok = mpd_run_play(m_conn);
+        if (ok) return true;
+        // First failure: stale connection — reconnect and retry
+        LOGDEB("MpdCtl::play: failed (attempt " << attempt << "), reconnecting\n");
+        if (m_conn) { mpd_connection_free(m_conn); m_conn = nullptr; }
+    }
+    return false;
 }
 
 bool MpdCtl::pause(bool on) {
     std::lock_guard<std::mutex> lk(m_conn_mutex);
-    if (!ensureConnected()) return false;
-    return mpd_run_pause(m_conn, on);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!ensureConnected()) return false;
+        if (mpd_run_pause(m_conn, on)) return true;
+        LOGDEB("MpdCtl::pause: failed (attempt " << attempt << "), reconnecting\n");
+        if (m_conn) { mpd_connection_free(m_conn); m_conn = nullptr; }
+    }
+    return false;
 }
 
 bool MpdCtl::stop() {
@@ -235,14 +249,23 @@ bool MpdCtl::stop() {
 
 bool MpdCtl::seek(uint32_t position_ms) {
     std::lock_guard<std::mutex> lk(m_conn_mutex);
-    if (!ensureConnected()) return false;
-    struct mpd_status* st = mpd_run_status(m_conn);
-    if (!st) return false;
-    int pos = mpd_status_get_song_pos(st);
-    mpd_status_free(st);
-    if (pos < 0) return false;
-    return mpd_run_seek_pos(m_conn, static_cast<unsigned>(pos),
-                             position_ms / 1000);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!ensureConnected()) return false;
+        struct mpd_status* st = mpd_run_status(m_conn);
+        if (!st) {
+            if (m_conn) { mpd_connection_free(m_conn); m_conn = nullptr; }
+            continue;
+        }
+        int pos = mpd_status_get_song_pos(st);
+        mpd_status_free(st);
+        if (pos < 0) return false;
+        if (mpd_run_seek_pos(m_conn, static_cast<unsigned>(pos),
+                              position_ms / 1000))
+            return true;
+        LOGDEB("MpdCtl::seek: failed (attempt " << attempt << "), reconnecting\n");
+        if (m_conn) { mpd_connection_free(m_conn); m_conn = nullptr; }
+    }
+    return false;
 }
 
 bool MpdCtl::next() {
