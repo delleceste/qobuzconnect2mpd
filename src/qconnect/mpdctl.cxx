@@ -139,6 +139,18 @@ bool MpdCtl::loadQueue(const std::vector<std::string>& stream_urls,
             LOGERR("MpdCtl::loadQueue: play_pos failed\n");
             return false;
         }
+        // MPD sometimes skips the first stream track (HTTP/TLS init latency).
+        // Detect and retry once.
+        struct mpd_status* st2 = mpd_run_status(m_conn);
+        if (st2) {
+            int actual = mpd_status_get_song_pos(st2);
+            mpd_status_free(st2);
+            if (actual != start_pos) {
+                LOGDEB("MpdCtl::loadQueue: skipped from " << start_pos
+                       << " to " << actual << ", retrying\n");
+                mpd_run_play_pos(m_conn, static_cast<unsigned>(start_pos));
+            }
+        }
     }
     LOGDEB("MpdCtl::loadQueue: " << stream_urls.size()
            << " tracks, starting at " << start_pos << "\n");
