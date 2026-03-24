@@ -34,9 +34,10 @@ namespace QConnect {
 // Callbacks fired from the WSession event loop (called from the ws thread).
 struct WSessionCallbacks {
     // Play/pause/seek: playing_state is PLAYING/PAUSED/STOPPED,
-    // position_ms is the target seek position (0 if no seek).
-    // current_item identifies which track the app wants us to play.
+    // position_ms is the target seek position, has_position distinguishes
+    // "seek to 0" from "no seek". current_item identifies the track.
     std::function<void(PlayingState, uint32_t /*position_ms*/,
+                        bool /*has_position*/,
                         const QueueTrackRef& /*current_item*/)> on_set_state;
 
     // Volume change: absolute volume (0-100), or delta if delta != 0.
@@ -99,6 +100,9 @@ public:
 
     // Report max audio quality supported.
     void reportMaxQuality(int32_t quality_fmt_id);
+
+    // Report actual file audio quality (sample rate in Hz) for current track.
+    void reportFileQuality(int32_t sample_rate_hz);
 
     // Declare renderer_id as the active renderer (sent after AddRenderer).
     void setActiveRenderer(uint64_t renderer_id);

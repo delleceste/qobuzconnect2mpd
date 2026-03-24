@@ -101,6 +101,7 @@ private:
 
     // Called by WSession callbacks
     void onSetState(PlayingState ps, uint32_t position_ms,
+                    bool has_position,
                     const QueueTrackRef& current_item);
     void onSetVolume(uint32_t volume, int32_t delta);
     void onQueueLoad(const std::vector<QueueTrack>& tracks, uint32_t start_idx);
@@ -148,6 +149,7 @@ private:
     // Maps MPD queue position -> Qobuz queue_item_id (parallel to MPD queue)
     mutable std::mutex        m_qmap_mutex;
     std::vector<uint64_t>     m_queue_item_ids;
+    std::vector<int>          m_track_sample_rates; // Hz, parallel to m_queue_item_ids
 
     // IPC
     int          m_ipc_sock{-1};

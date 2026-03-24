@@ -177,6 +177,12 @@ void WSession::reportMaxQuality(int32_t quality_fmt_id) {
     sendRaw(buildMaxQualityChanged(nowMs(), bid, quality_fmt_id));
 }
 
+void WSession::reportFileQuality(int32_t sample_rate_hz) {
+    if (!m_connected) return;
+    int bid = nextBatchId(m_batch_id);
+    sendRaw(buildFileAudioQualityChanged(nowMs(), bid, sample_rate_hz));
+}
+
 void WSession::setActiveRenderer(uint64_t renderer_id) {
     if (!m_connected) return;
     m_renderer_id = renderer_id;
@@ -351,6 +357,7 @@ void WSession::dispatchMessage(const Message& msg) {
             if (m_cbs.on_set_state) {
                 m_cbs.on_set_state(msg.set_state.playing_state,
                                     msg.set_state.current_position_ms,
+                                    msg.set_state.has_position,
                                     msg.set_state.current_queue_item);
             }
             // Immediately acknowledge with a StateUpdated response
@@ -361,7 +368,7 @@ void WSession::dispatchMessage(const Message& msg) {
             }
             if (msg.set_state.playing_state != PlayingState::UNKNOWN)
                 ack.state.playing_state = msg.set_state.playing_state;
-            if (msg.set_state.current_position_ms) {
+            if (msg.set_state.has_position) {
                 ack.state.current_position_ms = msg.set_state.current_position_ms;
                 ack.state.position_timestamp_ms = nowMs();
             }

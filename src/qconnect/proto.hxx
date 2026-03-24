@@ -201,6 +201,7 @@ struct DeviceInfo {
 struct MsgSetState {
     PlayingState  playing_state{PlayingState::UNKNOWN};
     uint32_t      current_position_ms{0};
+    bool          has_position{false}; // presence flag (0 = seek to start)
     QueueVersion  queue_version;
     QueueTrackRef current_queue_item;
     QueueTrackRef next_queue_item;
@@ -333,6 +334,10 @@ Bytes buildAskRendererState(uint64_t time_ms, int32_t batch_id,
 
 // Report that this renderer is muted (or not):
 Bytes buildVolumeMuted(uint64_t time_ms, int32_t batch_id, bool muted);
+
+// Report actual file audio quality (sample rate in Hz):
+Bytes buildFileAudioQualityChanged(uint64_t time_ms, int32_t batch_id,
+                                    int32_t sample_rate_hz);
 
 // Ask server to send current queue state (sent after activation):
 Bytes buildAskQueueState(uint64_t time_ms, int32_t batch_id,

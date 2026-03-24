@@ -217,8 +217,9 @@ void QcManager::onConnect(ConnectCredentials creds) {
     // Build WSession callbacks
     WSessionCallbacks cbs;
     cbs.on_set_state  = [this](PlayingState ps, uint32_t pos_ms,
+                                bool has_pos,
                                 const QueueTrackRef& cur) {
-        onSetState(ps, pos_ms, cur);
+        onSetState(ps, pos_ms, has_pos, cur);
     };
     cbs.on_set_volume = [this](uint32_t v, int32_t d) {
         onSetVolume(v, d);
@@ -265,6 +266,7 @@ void QcManager::onWsDisconnected() {
 }
 
 void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
+                           bool has_position,
                            const QueueTrackRef& current_item) {
     if (!m_mpd) return;
 
@@ -294,8 +296,9 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
         break;
     }
 
-    // Handle seek independently of play state
-    if (position_ms > 0)
+    // Handle seek independently of play state (has_position distinguishes
+    // "seek to 0" from "no seek requested")
+    if (has_position)
         m_mpd->seek(position_ms);
 }
 
@@ -320,6 +323,7 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
         {
             std::lock_guard<std::mutex> lk(m_qmap_mutex);
             m_queue_item_ids.clear();
+            m_track_sample_rates.clear();
         }
         if (m_mpd) m_mpd->stop();
         return;
@@ -330,6 +334,13 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
     for (size_t i = 0; i < tracks.size(); ++i) {
         LOGDEB("QcManager:   track[" << i << "] qitem=" << tracks[i].queue_item_id
                << " trackid=" << tracks[i].track_id << "\n");
+    }
+
+    // Stop MPD immediately so the old queue stops while we resolve URLs
+    if (m_mpd) {
+        m_mpd->stop();
+        // Re-clear after stop (stop may restore saved queue)
+        // We just need silence while resolving
     }
 
     std::vector<uint64_t> item_ids;
@@ -356,6 +367,10 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
         if (pos >= 0) mpd_start = pos;
     }
     m_mpd->loadQueue(urls, mpd_start);
+
+    // Report file quality for the starting track
+    if (m_ws && start_idx < m_track_sample_rates.size())
+        m_ws->reportFileQuality(m_track_sample_rates[start_idx]);
 }
 
 void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
@@ -464,6 +479,13 @@ void QcManager::onMpdState(const MpdState& st) {
 
     m_ws->reportState(qrs);
     m_ws->reportVolume(st.volume);
+
+    // Report file quality when track changes
+    if (st.queue_pos >= 0) {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        if (static_cast<size_t>(st.queue_pos) < m_track_sample_rates.size())
+            m_ws->reportFileQuality(m_track_sample_rates[st.queue_pos]);
+    }
 }
 
 // ---- Stream URL resolution --------------------------------------------------
@@ -475,16 +497,21 @@ std::vector<std::string> QcManager::resolveStreamUrls(
     urls.reserve(tracks.size());
     out_item_ids.clear();
     out_item_ids.reserve(tracks.size());
+    m_track_sample_rates.clear();
+    m_track_sample_rates.reserve(tracks.size());
     for (const auto& t : tracks) {
         TrackStreamInfo info;
         if (m_api->getStreamUrl(t.track_id, m_cfg.format_id, info) &&
             !info.stream_url.empty()) {
             urls.push_back(info.stream_url);
             out_item_ids.push_back(t.queue_item_id);
+            m_track_sample_rates.push_back(info.sampling_rate);
+            LOGDEB("QcManager:   resolved track " << t.track_id
+                   << " " << info.sampling_rate << "Hz/"
+                   << info.bit_depth << "bit\n");
         } else {
             LOGERR("QcManager: could not get stream URL for track "
                    << t.track_id << " (qitem=" << t.queue_item_id << ")\n");
-            // Skip this track — don't add empty URL to MPD
         }
     }
     return urls;

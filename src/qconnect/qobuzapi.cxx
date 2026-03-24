@@ -196,10 +196,12 @@ bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
         return false;
     }
 
-    out.stream_url  = root.get("url", "").asString();
-    out.mime_type   = root.get("mime_type", "audio/flac").asString();
-    out.format_id   = format_id;
-    out.duration_ms = root.get("duration", 0).asUInt() * 1000;
+    out.stream_url    = root.get("url", "").asString();
+    out.mime_type     = root.get("mime_type", "audio/flac").asString();
+    out.format_id     = root.get("format_id", format_id).asInt();
+    out.duration_ms   = root.get("duration", 0).asUInt() * 1000;
+    out.sampling_rate = root.get("sampling_rate", 44100).asInt();
+    out.bit_depth     = root.get("bit_depth", 16).asInt();
 
     if (out.stream_url.empty()) {
         LOGERR("QobuzApi::getStreamUrl: no url in response for track "

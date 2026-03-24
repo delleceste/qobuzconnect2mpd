@@ -345,7 +345,7 @@ bool decodeMsgSetState(const uint8_t* d, size_t len, MsgSetState& out) {
         const uint8_t* fd; size_t fl;
         switch (fn) {
         case 1: readVarint(d,len,pos,v); out.playing_state = static_cast<PlayingState>(v); break;
-        case 2: readVarint(d,len,pos,v); out.current_position_ms = static_cast<uint32_t>(v); break;
+        case 2: readVarint(d,len,pos,v); out.current_position_ms = static_cast<uint32_t>(v); out.has_position = true; break;
         case 3: if (!readLenField(d,len,pos,fd,fl)) return false;
                 decodeQueueVersion(fd, fl, out.queue_version); break;
         case 4: if (!readLenField(d,len,pos,fd,fl)) return false;
@@ -833,6 +833,16 @@ Bytes buildVolumeMuted(uint64_t time_ms, int32_t batch_id, bool muted) {
     Bytes payload = wrapInPayload(time_ms, batch_id,
                                    static_cast<int>(MsgType::RNDR_VOLUME_MUTED), msg,
                                    /*force_content=*/true);
+    return buildEnvelope(EnvType::PAYLOAD, payload);
+}
+
+Bytes buildFileAudioQualityChanged(uint64_t time_ms, int32_t batch_id,
+                                    int32_t sample_rate_hz) {
+    // RndrSrvrFileAudioQualityChanged { value=1 (int32) }
+    Bytes msg;
+    writeInt32Field(msg, 1, sample_rate_hz);
+    Bytes payload = wrapInPayload(time_ms, batch_id,
+                                   static_cast<int>(MsgType::RNDR_FILE_QUALITY), msg);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
 
