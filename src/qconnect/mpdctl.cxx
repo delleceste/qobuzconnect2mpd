@@ -123,9 +123,14 @@ bool MpdCtl::loadQueue(const std::vector<std::string>& stream_urls,
         m_queue_saved = true;
     }
 
-    // Stop and clear
+    // Stop, clear, and reset playback modes that could cause skipping
     mpd_run_stop(m_conn);
     mpd_run_clear(m_conn);
+    mpd_run_consume(m_conn, false);
+    mpd_run_single(m_conn, false);
+    mpd_run_random(m_conn, false);
+    mpd_run_repeat(m_conn, true);
+    mpd_run_clearerror(m_conn);
     clearQueueItemMap();
 
     // Add tracks
@@ -135,21 +140,12 @@ bool MpdCtl::loadQueue(const std::vector<std::string>& stream_urls,
 
     if (start_pos < 0) start_pos = 0;
     if (!stream_urls.empty()) {
+        mpd_run_clearerror(m_conn);
         if (!mpd_run_play_pos(m_conn, static_cast<unsigned>(start_pos))) {
-            LOGERR("MpdCtl::loadQueue: play_pos failed\n");
+            const char* emsg = mpd_connection_get_error_message(m_conn);
+            LOGERR("MpdCtl::loadQueue: play_pos failed: "
+                   << (emsg ? emsg : "?") << "\n");
             return false;
-        }
-        // MPD sometimes skips the first stream track (HTTP/TLS init latency).
-        // Detect and retry once.
-        struct mpd_status* st2 = mpd_run_status(m_conn);
-        if (st2) {
-            int actual = mpd_status_get_song_pos(st2);
-            mpd_status_free(st2);
-            if (actual != start_pos) {
-                LOGDEB("MpdCtl::loadQueue: skipped from " << start_pos
-                       << " to " << actual << ", retrying\n");
-                mpd_run_play_pos(m_conn, static_cast<unsigned>(start_pos));
-            }
         }
     }
     LOGDEB("MpdCtl::loadQueue: " << stream_urls.size()
@@ -214,8 +210,9 @@ bool MpdCtl::play(int queue_pos) {
         else
             ok = mpd_run_play(m_conn);
         if (ok) return true;
-        // First failure: stale connection — reconnect and retry
-        LOGDEB("MpdCtl::play: failed (attempt " << attempt << "), reconnecting\n");
+        const char* emsg = mpd_connection_get_error_message(m_conn);
+        LOGDEB("MpdCtl::play: failed (attempt " << attempt << "): "
+               << (emsg ? emsg : "?") << ", reconnecting\n");
         if (m_conn) { mpd_connection_free(m_conn); m_conn = nullptr; }
     }
     return false;
