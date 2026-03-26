@@ -41,7 +41,7 @@ struct TrackStreamInfo {
     int         format_id{6};
     uint32_t    duration_ms{0};
     int         sampling_rate{44100}; // Hz (e.g. 44100, 96000, 192000)
-    int         bit_depth{16};       // bits (e.g. 16, 24)
+    int         bit_depth{-1};       // bits (e.g. 16, 24), -1 when unspecified
 };
 
 struct TrackMeta {

@@ -622,7 +622,10 @@ std::vector<std::string> QcManager::resolveStreamUrls(
             out_local_paths.push_back(info.local_path);
             LOGDEB("QcManager:   resolved track " << t.track_id
                    << " " << info.sampling_rate << "Hz/"
-                   << info.bit_depth << "bit\n");
+                   << (info.bit_depth > 0 ?
+                          (std::to_string(info.bit_depth) + "bit") :
+                          "(unspecified)")
+                   << "\n");
         } else {
             LOGERR("QcManager: could not get stream URL for track "
                    << t.track_id << " (qitem=" << t.queue_item_id << ")\n");

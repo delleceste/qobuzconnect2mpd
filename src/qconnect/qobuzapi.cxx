@@ -598,7 +598,7 @@ bool QobuzApi::tryFileUrl(uint32_t track_id, int format_id,
     out.duration_ms = root.get("duration", 0).asUInt() * 1000;
     double sr = root.get("sampling_rate", 44.1).asDouble();
     out.sampling_rate = (sr < 1000) ? static_cast<int>(sr * 1000) : static_cast<int>(sr);
-    out.bit_depth = root.get("bit_depth", 16).asInt();
+    out.bit_depth = root.isMember("bit_depth") ? root["bit_depth"].asInt() : -1;
     if (!out.stream_url.empty()) {
         LOGDEB("QobuzApi: /file/url returned direct URL\n");
         return true;
@@ -702,7 +702,7 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
     out.duration_ms = static_cast<uint32_t>(root.get("duration", 0).asDouble() * 1000.0);
     double sr = root.get("sampling_rate", 44.1).asDouble();
     out.sampling_rate = (sr < 1000) ? static_cast<int>(sr * 1000) : static_cast<int>(sr);
-    out.bit_depth = root.get("bit_depth", 16).asInt();
+    out.bit_depth = root.isMember("bit_depth") ? root["bit_depth"].asInt() : -1;
     LOGINF("QobuzApi: started segmented materialization at " << final_path << "\n");
     return true;
 }
@@ -754,7 +754,7 @@ bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
     // Qobuz returns sampling_rate in kHz as float (e.g. 96.0, 44.1)
     double sr = root.get("sampling_rate", 44.1).asDouble();
     out.sampling_rate = (sr < 1000) ? static_cast<int>(sr * 1000) : static_cast<int>(sr);
-    out.bit_depth     = root.get("bit_depth", 16).asInt();
+    out.bit_depth     = root.isMember("bit_depth") ? root["bit_depth"].asInt() : -1;
 
     if (out.stream_url.empty()) {
         LOGERR("QobuzApi::getStreamUrl: no url in response for track "
