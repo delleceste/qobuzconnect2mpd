@@ -258,13 +258,19 @@ MHD_Result HttpHandler::handleRequest(struct MHD_Connection* conn,
         const std::string path = "/tmp/qconnect2mpd-segmented/" + name;
         const std::string marker_path = path + ".inprogress";
         if (std::filesystem::exists(marker_path)) {
+            // While materialization is still running, never return a fixed-length
+            // snapshot for GET requests (even if the client sends Range), or MPD
+            // may stop at the current partial size.
+            if (strcmp(method, "HEAD") == 0)
+                return sendFileResponse(conn, path, "audio/flac", true, marker_path);
+
             const char* range = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Range");
-            if ((range && *range) || strcmp(method, "HEAD") == 0)
-                return sendFileResponse(conn, path, "audio/flac",
-                                        strcmp(method, "HEAD") == 0,
-                                        marker_path);
+            if (range && *range) {
+                LOGDEB("HttpHandler: ignoring Range for growing segmented file "
+                       << name << "\n");
+            }
             return sendGrowingFileResponse(conn, path, marker_path, "audio/flac",
-                                           strcmp(method, "HEAD") == 0);
+                                           false);
         }
         return sendFileResponse(conn, path, "audio/flac",
                                 strcmp(method, "HEAD") == 0);

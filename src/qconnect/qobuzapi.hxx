@@ -111,16 +111,9 @@ private:
     std::string httpPostForm(const std::string& path,
                              const std::map<std::string, std::string>& form,
                              long* http_code_out = nullptr);
-    std::string buildFileUrlSignature(uint32_t track_id,
-                                       int fmt_id,
-                                       uint64_t ts,
-                                       const std::string& method_prefix) const;
     std::string buildRequestSignature(const std::string& method_prefix,
                                       const std::map<std::string, std::string>& args,
                                       uint64_t ts) const;
-
-    bool tryGetStreamUrl(uint32_t track_id, int format_id,
-                         TrackStreamInfo& out, long* http_code = nullptr);
 
     std::string m_base_url;
     std::string m_app_id;

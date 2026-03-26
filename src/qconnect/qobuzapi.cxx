@@ -17,14 +17,8 @@
 
 // Qobuz REST API client for qconnect2mpd.
 //
-// Track URL signing: MD5 of the concatenated parameter string with the
-// app_secret appended (matches the qobuz-player / qonductor approach):
-//   sig = md5( "trackgetFileUrl"
-//            + "format_id" + str(fmt_id)
-//            + "intent"    + "stream"
-//            + "track_id"  + str(track_id)
-//            + str(ts)
-//            + app_secret )
+// Request signing: MD5 of the concatenated parameter string with the
+// app_secret appended.
 //
 // app_id and app_secret are extracted automatically from the Qobuz web
 // player bundle.js when not configured explicitly (fetchAppCredentials).
@@ -365,38 +359,6 @@ bool QobuzApi::login(const std::string& user, const std::string& pass) {
     return true;
 }
 
-// Build the MD5 signature for /track/getFileUrl:
-//   md5( method_prefix + "format_id" + fmt_id + "intent" + intent
-//        + "track_id" + track_id + timestamp + app_secret )
-// method_prefix is typically "trackgetFileUrl" (legacy) or "fileurl" (newer).
-std::string QobuzApi::buildFileUrlSignature(uint32_t track_id,
-                                              int fmt_id,
-                                              uint64_t ts,
-                                              const std::string& method_prefix) const {
-    std::map<std::string, std::string> args;
-    args["format_id"] = std::to_string(fmt_id);
-    args["intent"] = "stream";
-    args["track_id"] = std::to_string(track_id);
-    std::string plain = method_prefix;
-    for (const auto& kv : args) {
-        plain += kv.first;
-        plain += kv.second;
-    }
-    plain += std::to_string(ts);
-    plain += m_app_secret;
-
-    LOGDEB("QobuzApi: sig plain: [" << plain << "] len=" << plain.size() << "\n");
-
-    uint8_t digest[EVP_MAX_MD_SIZE];
-    unsigned int digest_len = 0;
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_md5(), nullptr);
-    EVP_DigestUpdate(ctx, plain.data(), plain.size());
-    EVP_DigestFinal_ex(ctx, digest, &digest_len);
-    EVP_MD_CTX_free(ctx);
-    return hexString(digest, digest_len);
-}
-
 std::string QobuzApi::buildRequestSignature(const std::string& method_prefix,
                                             const std::map<std::string, std::string>& args,
                                             uint64_t ts) const {
@@ -421,46 +383,28 @@ bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
                               TrackStreamInfo& out) {
     bool refreshed_credentials = false;
 retry_after_refresh:
-    // If no confirmed secret yet but we have candidates from fetchAppCredentials,
-    // try each one; lock in the first that returns a valid or accepted response.
-    if (m_app_secret.empty() && !m_secret_candidates.empty()) {
-        for (const auto& cand : m_secret_candidates) {
-            m_app_secret = cand;
-            long code = 0;
-            if (tryGetStreamUrl(track_id, format_id, out, &code)) {
-                LOGINF("QobuzApi: active secret confirmed\n");
-                m_secret_candidates.clear();
-                return true;
-            }
-            // 404 = signature accepted but track not found at this quality
-            // → secret is valid, lock it in
-            if (code == 404) {
-                LOGINF("QobuzApi: active secret confirmed (track not at fmt "
-                       << format_id << ")\n");
-                m_secret_candidates.clear();
-                break;
-            }
+    if (!ensureStreamSession()) {
+        if (!refreshed_credentials && fetchAppCredentials()) {
+            m_app_secret.clear();
+            m_stream_session_id.clear();
+            m_stream_session_expires_at = 0;
+            refreshed_credentials = true;
+            goto retry_after_refresh;
         }
-        if (m_app_secret.empty()) {
-            LOGERR("QobuzApi: none of the secret candidates produced a valid sig\n");
-            return false;
-        }
+        LOGERR("QobuzApi: unable to establish stream session for /file/url\n");
+        return false;
     }
-    // Try requested format, then fall back to lower qualities.
-    // Prefer the new /file/url API when possible; keep legacy fallback for MPD.
+
+    // Try requested format, then fall back to lower qualities via /file/url only.
     static const int fallback_fmts[] = {27, 7, 6, 5};
     for (int fmt : fallback_fmts) {
         if (fmt > format_id) continue;
 
         long file_code = 0;
-        if (ensureStreamSession() && tryFileUrl(track_id, fmt, out, &file_code))
+        if (tryFileUrl(track_id, fmt, out, &file_code))
             return true;
-
-        long code = 0;
-        if (tryGetStreamUrl(track_id, fmt, out, &code))
-            return true;
-        if ((code == 400 || file_code == 400) && !refreshed_credentials) {
-            LOGINF("QobuzApi: signature rejected; refreshing app credentials and retrying\n");
+        if (file_code == 400 && !refreshed_credentials) {
+            LOGINF("QobuzApi: /file/url signature rejected; refreshing app credentials and retrying\n");
             if (fetchAppCredentials()) {
                 m_app_secret.clear();
                 m_stream_session_id.clear();
@@ -704,63 +648,6 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
     out.sampling_rate = (sr < 1000) ? static_cast<int>(sr * 1000) : static_cast<int>(sr);
     out.bit_depth = root.isMember("bit_depth") ? root["bit_depth"].asInt() : -1;
     LOGINF("QobuzApi: started segmented materialization at " << final_path << "\n");
-    return true;
-}
-
-bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
-                                TrackStreamInfo& out, long* http_code) {
-    // Legacy endpoint expects "trackgetFileUrl" signing prefix.
-    // The newer "fileurl" prefix belongs to /file/url + /session/start flow.
-    auto do_call = [&](uint64_t ts, long* code_out) {
-        static const std::string method_prefix = "trackgetFileUrl";
-        LOGDEB("QobuzApi: getFileUrl signing method=" << method_prefix
-               << " track_id=" << track_id
-               << " fmt=" << format_id
-               << " ts=" << ts << "\n");
-        std::string sig = buildFileUrlSignature(track_id, format_id, ts, method_prefix);
-        std::string path = "/track/getFileUrl"
-                           "?track_id="  + std::to_string(track_id)
-                         + "&format_id=" + std::to_string(format_id)
-                         + "&intent=stream"
-                         + "&request_ts="  + std::to_string(ts)
-                         + "&request_sig=" + sig
-                         + "&app_id="    + m_app_id;
-        return httpGet(path, code_out);
-    };
-
-    long code = 0;
-    uint64_t ts = unixTimestamp();
-    std::string resp = do_call(ts, &code);
-    if (!resp.empty()) {
-        LOGDEB("QobuzApi: getFileUrl succeeded with method=trackgetFileUrl"
-               << " (HTTP " << code << ")\n");
-    }
-    if (http_code) *http_code = code;
-    if (resp.empty()) return false;
-
-    Json::Value root;
-    Json::CharReaderBuilder rdr;
-    std::string errs;
-    std::istringstream ss(resp);
-    if (!Json::parseFromStream(rdr, ss, &root, &errs)) {
-        LOGERR("QobuzApi::getStreamUrl: JSON parse error: " << errs << "\n");
-        return false;
-    }
-
-    out.stream_url    = root.get("url", "").asString();
-    out.mime_type     = root.get("mime_type", "audio/flac").asString();
-    out.format_id     = root.get("format_id", format_id).asInt();
-    out.duration_ms   = root.get("duration", 0).asUInt() * 1000;
-    // Qobuz returns sampling_rate in kHz as float (e.g. 96.0, 44.1)
-    double sr = root.get("sampling_rate", 44.1).asDouble();
-    out.sampling_rate = (sr < 1000) ? static_cast<int>(sr * 1000) : static_cast<int>(sr);
-    out.bit_depth     = root.isMember("bit_depth") ? root["bit_depth"].asInt() : -1;
-
-    if (out.stream_url.empty()) {
-        LOGERR("QobuzApi::getStreamUrl: no url in response for track "
-               << track_id << "\n");
-        return false;
-    }
     return true;
 }
 
