@@ -268,9 +268,19 @@ bool MpdCtl::seek(uint32_t position_ms) {
         int pos = mpd_status_get_song_pos(st);
         mpd_status_free(st);
         if (pos < 0) return false;
+        // Record seek time BEFORE calling MPD so that any event-thread tick
+        // that fires while mpd_run_seek_pos blocks is inside the cooldown
+        // window and won't broadcast a stale pre-seek position to the phone.
+        uint64_t now_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        m_last_seek_ms.store(now_ms, std::memory_order_relaxed);
         if (mpd_run_seek_pos(m_conn, static_cast<unsigned>(pos),
-                              position_ms / 1000))
+                              position_ms / 1000)) {
             return true;
+        }
+        // Seek failed — clear the cooldown so normal reporting resumes
+        m_last_seek_ms.store(0, std::memory_order_relaxed);
         LOGDEB("MpdCtl::seek: failed (attempt " << attempt << "), reconnecting\n");
         if (m_conn) { mpd_connection_free(m_conn); m_conn = nullptr; }
     }
@@ -353,8 +363,19 @@ void MpdCtl::clearQueueItemMap() {
 // ---- Event loop -------------------------------------------------------------
 
 void MpdCtl::eventLoop() {
+    // Position-report interval during playback (milliseconds).
+    // The Qobuz phone app doesn't interpolate position client-side, so we
+    // must send regular updates for the seek bar to advance in real time.
+    constexpr int POSITION_REPORT_MS = 1000;
+
+    // Rate-limiting state: fire callback at most once per POSITION_REPORT_MS
+    // during playback, and immediately on real state changes.
+    auto last_cb = std::chrono::steady_clock::now();
+    MpdState::Status last_status  = MpdState::Status::UNKNOWN;
+    int              last_queue_pos = -1;
+
     while (!m_stop) {
-        // Send idle command and wait for any MPD event
+        // Enter MPD idle mode for player/queue/mixer events
         if (!mpd_send_idle_mask(m_idle_conn,
                                  static_cast<enum mpd_idle>(
                                      MPD_IDLE_PLAYER |
@@ -362,7 +383,6 @@ void MpdCtl::eventLoop() {
                                      MPD_IDLE_MIXER))) {
             LOGERR("MpdCtl: send_idle failed; reconnecting\n");
             std::this_thread::sleep_for(std::chrono::seconds(2));
-            // Reconnect idle connection
             mpd_connection_free(m_idle_conn);
             m_idle_conn = mpd_connection_new(m_host.c_str(),
                                               static_cast<unsigned>(m_port), 0);
@@ -372,19 +392,80 @@ void MpdCtl::eventLoop() {
             continue;
         }
 
-        enum mpd_idle events = mpd_recv_idle(m_idle_conn, true /* disable_timeout */);
-        if (m_stop) break;
-        if (!events) continue;
+        // Wait up to POSITION_REPORT_MS for an MPD event using select().
+        // On timeout we cancel idle, check position, and re-enter idle.
+        int fd = mpd_connection_get_fd(m_idle_conn);
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        struct timeval tv{POSITION_REPORT_MS / 1000,
+                         (POSITION_REPORT_MS % 1000) * 1000};
+        int r = select(fd + 1, &rfds, nullptr, nullptr, &tv);
 
-        // Fetch state on command connection and fire callback
+        if (r > 0) {
+            // Data available — receive the idle event normally
+            mpd_recv_idle(m_idle_conn, true);
+        } else {
+            // Timeout (or EINTR): cancel idle and treat as position-poll tick
+            mpd_send_noidle(m_idle_conn);
+            mpd_recv_idle(m_idle_conn, true); // consume the cancelled-idle response
+        }
+
+        if (m_stop) break;
+
+        // Fetch current MPD state
         MpdState st;
         {
             std::lock_guard<std::mutex> lk(m_conn_mutex);
             if (ensureConnected()) st = fetchState();
         }
 
-        std::lock_guard<std::mutex> lk(m_cb_mutex);
-        if (m_state_cb) m_state_cb(st);
+        auto now = std::chrono::steady_clock::now();
+
+        // Seek cooldown: for 300 ms after seek() starts, suppress all
+        // position-tick callbacks.  This prevents a pre-seek position sampled
+        // by the event thread DURING mpd_run_seek_pos from reaching the phone
+        // before the WSession seek-ack (which carries the correct position).
+        // Real state changes (PLAY/PAUSE/track switch) are still forwarded so
+        // the phone stays responsive to those events.
+        bool state_changed = (st.status != last_status ||
+                               st.queue_pos != last_queue_pos);
+        {
+            uint64_t now_ms = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()).count());
+            uint64_t seek_ms = m_last_seek_ms.load(std::memory_order_relaxed);
+            if (seek_ms > 0 && now_ms - seek_ms < 300 && !state_changed) {
+                continue; // still in seek cooldown — skip position tick
+            }
+        }
+        bool interval_elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - last_cb).count() >= POSITION_REPORT_MS;
+
+        if (state_changed ||
+            (st.status == MpdState::Status::PLAY && interval_elapsed)) {
+            {
+                std::lock_guard<std::mutex> lk(m_cb_mutex);
+                if (m_state_cb) m_state_cb(st);
+            }
+            last_cb        = now;
+            last_status    = st.status;
+            last_queue_pos = st.queue_pos;
+        } else if (!m_stop) {
+            // MPD fires events continuously during HTTP streaming (buffer /
+            // bitrate events).  If we have nothing to report yet, sleep up
+            // to 100 ms so we don't busy-spin, while still responding to
+            // real state changes (play/pause/stop) within ~100 ms.
+            auto remaining_ms =
+                POSITION_REPORT_MS -
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - last_cb).count();
+            long long sleep_ms = std::min(100LL, (long long)remaining_ms);
+            if (sleep_ms > 0)
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(sleep_ms));
+        }
     }
 }
 

@@ -128,6 +128,7 @@ private:
 
     std::thread            m_event_thread;
     std::atomic<bool>      m_stop{false};
+    std::atomic<uint64_t>  m_last_seek_ms{0}; // steady_clock ms at last seek()
     MpdStateCallback       m_state_cb;
     std::mutex             m_cb_mutex;
 

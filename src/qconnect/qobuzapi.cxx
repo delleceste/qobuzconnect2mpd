@@ -399,6 +399,81 @@ bool QobuzApi::fetchAppCredentials() {
     return true;
 }
 
+bool QobuzApi::fetchQwsToken(std::string& out_endpoint, std::string& out_jwt) {
+    if (m_user_token.empty()) {
+        LOGERR("QobuzApi::fetchQwsToken: no user token — call login() first\n");
+        return false;
+    }
+
+    const std::string url = "https://www.qobuz.com/api.json/0.2/qws/createToken";
+    const std::string post_body =
+        "jwt=jwt_qws&user_auth_token_needed=true&strong_auth_needed=true";
+
+    LOGINF("QobuzApi::fetchQwsToken: POST " << url << "\n");
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+
+    std::string result;
+    curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    post_body.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &result);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT,       15L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,1L);
+
+    struct curl_slist* hdrs = nullptr;
+    std::string auth_hdr = "X-User-Auth-Token: " + m_user_token;
+    std::string app_hdr  = "X-App-Id: "          + m_app_id;
+    hdrs = curl_slist_append(hdrs, auth_hdr.c_str());
+    hdrs = curl_slist_append(hdrs, app_hdr.c_str());
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/x-www-form-urlencoded");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+
+    CURLcode rc = curl_easy_perform(curl);
+    long http_code = 0;
+    if (rc == CURLE_OK)
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+
+    if (rc != CURLE_OK) {
+        LOGERR("QobuzApi::fetchQwsToken: curl error: " << curl_easy_strerror(rc) << "\n");
+        return false;
+    }
+    if (http_code != 200) {
+        LOGERR("QobuzApi::fetchQwsToken: HTTP " << http_code
+               << " body: " << result.substr(0, 300) << "\n");
+        return false;
+    }
+
+    Json::Value root;
+    Json::CharReaderBuilder rdr;
+    std::string errs;
+    std::istringstream ss(result);
+    if (!Json::parseFromStream(rdr, ss, &root, &errs)) {
+        LOGERR("QobuzApi::fetchQwsToken: JSON parse error: " << errs << "\n");
+        return false;
+    }
+
+    const Json::Value& jwt_payload = root["jwt_qws"];
+    if (jwt_payload.isNull()) {
+        LOGERR("QobuzApi::fetchQwsToken: response missing jwt_qws\n");
+        return false;
+    }
+
+    out_endpoint = jwt_payload.get("endpoint", "wss://play.qobuz.com/ws").asString();
+    out_jwt      = jwt_payload.get("jwt", "").asString();
+
+    if (out_endpoint.empty()) {
+        LOGERR("QobuzApi::fetchQwsToken: empty endpoint in response\n");
+        return false;
+    }
+
+    LOGINF("QobuzApi::fetchQwsToken: ok, endpoint=" << out_endpoint << "\n");
+    return true;
+}
+
 std::string QobuzApi::httpGet(const std::string& path, long* http_code_out) {
     std::string url = m_base_url + path;
     LOGDEB("QobuzApi: GET " << url << "\n");

@@ -156,16 +156,24 @@ bool QcManager::start() {
     // ---- IPC with upmpdcli (optional) --------------------------------------
     if (!m_cfg.upmpdcli_sock.empty()) startIpcServer();
 
-    // The WebSocket endpoint wss://play.qobuz.com/ws requires a QConnect JWT,
-    // which is issued by the Qobuz cloud and only delivered by the mobile app
-    // (or web player) in the POST /connect-to-qconnect request.  The REST API
-    // user_auth_token is a different credential and is not accepted here.
-    //
-    // Discovery flow:
-    //   Mobile app  → mDNS → finds this device → POSTs jwt_qconnect → we connect WS
-    //   Web player  → cloud → lists WS-connected renderers → we appear once mobile
-    //                         app has established the first session
-    LOGINF("QcManager: waiting for Qobuz app to POST connect credentials\n");
+    // Proactively connect to the Qobuz Connect cloud WebSocket by fetching a
+    // JWT via POST /qws/createToken.  This makes the device visible from any
+    // network without requiring the phone to be on the same LAN first.
+    // mDNS continues to work as a fallback for same-network direct discovery.
+    if (!m_cfg.qobuz_user.empty()) {
+        std::string ws_endpoint, ws_jwt;
+        if (m_api->fetchQwsToken(ws_endpoint, ws_jwt)) {
+            LOGINF("QcManager: cloud JWT obtained — connecting to WebSocket\n");
+            ConnectCredentials cloud_creds;
+            cloud_creds.ws_endpoint = ws_endpoint;
+            cloud_creds.ws_jwt      = ws_jwt;
+            onConnect(std::move(cloud_creds));
+        } else {
+            LOGERR("QcManager: cloud JWT fetch failed — will connect when phone discovers via mDNS\n");
+        }
+    } else {
+        LOGINF("QcManager: no Qobuz credentials configured — waiting for mDNS discovery\n");
+    }
 
     m_running = true;
     LOGINF("QcManager: ready — device '" << m_cfg.friendly_name
@@ -347,7 +355,7 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
     LOGINF("QcManager: loading " << tracks.size()
            << " tracks from Qobuz, starting at " << start_idx << "\n");
     for (size_t i = 0; i < tracks.size(); ++i) {
-        LOGDEB("QcManager:   track[" << i << "] qitem=" << tracks[i].queue_item_id
+        LOGINF("QcManager:   track[" << i << "] qitem=" << tracks[i].queue_item_id
                << " trackid=" << tracks[i].track_id << "\n");
     }
 

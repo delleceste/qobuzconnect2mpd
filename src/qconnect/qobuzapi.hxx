@@ -86,6 +86,12 @@ public:
     // Get track metadata (title, artist, album, duration).
     bool getTrackMeta(uint32_t track_id, TrackMeta& out);
 
+    // Fetch a QConnect WebSocket JWT directly from the Qobuz cloud.
+    // Calls POST /qws/createToken using the stored user_auth_token.
+    // On success populates out_endpoint (e.g. "wss://play.qobuz.com/ws")
+    // and out_jwt, and returns true.  Requires a prior successful login().
+    bool fetchQwsToken(std::string& out_endpoint, std::string& out_jwt);
+
 private:
     std::string httpGet(const std::string& path,
                          long* http_code_out = nullptr);

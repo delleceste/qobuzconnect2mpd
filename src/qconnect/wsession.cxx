@@ -157,12 +157,19 @@ bool WSession::sendRaw(const Bytes& data) {
 
 void WSession::reportState(const QueueRendererState& state) {
     if (!m_connected) return;
+    QueueRendererState s = state;
     {
         std::lock_guard<std::mutex> lk(m_state_mutex);
-        m_last_state = state;
+        // Preserve the server-assigned queue_version; QcManager doesn't track it.
+        if (m_last_state.queue_version.major || m_last_state.queue_version.minor)
+            s.queue_version = m_last_state.queue_version;
+        m_last_state = s;
     }
+    LOGDEB("WSession: reportState pos_ms=" << s.state.current_position_ms
+           << " buf=" << static_cast<int>(s.state.buffer_state)
+           << " qver=" << s.queue_version.major << "." << s.queue_version.minor << "\n");
     int bid = nextBatchId(m_batch_id);
-    sendRaw(buildStateUpdated(nowMs(), bid, state));
+    sendRaw(buildStateUpdated(nowMs(), bid, s));
 }
 
 void WSession::reportVolume(uint32_t volume) {
@@ -198,7 +205,25 @@ bool WSession::sendHeartbeat() {
         std::lock_guard<std::mutex> lk(m_state_mutex);
         state = m_last_state;
     }
-    return sendRaw(buildStateUpdated(nowMs(), nextBatchId(m_batch_id), state));
+    // m_last_state.position_timestamp_ms was set when we last polled MPD.
+    // If the event loop was blocked (e.g. during a long HTTP seek via
+    // on_set_state), this timestamp can be 10-15 s stale.  Sending it as-is
+    // causes the phone to project: position + (now - stale_ts), which is
+    // many seconds ahead of reality.  Fix: always use nowMs() as timestamp.
+    //   - BUFFERING: position unchanged (seek still in progress).
+    //   - Playing:   advance position by elapsed time since last poll so the
+    //                heartbeat gives a reasonable estimate until the next
+    //                regular reportState arrives.
+    uint64_t now = nowMs();
+    uint64_t old_ts = state.state.position_timestamp_ms;
+    if (state.state.buffer_state != BufferState::BUFFERING &&
+        old_ts && now > old_ts) {
+        uint64_t elapsed = now - old_ts;
+        if (elapsed < 30000) // don't advance past a stale-by->30s snapshot
+            state.state.current_position_ms += static_cast<uint32_t>(elapsed);
+    }
+    state.state.position_timestamp_ms = now;
+    return sendRaw(buildStateUpdated(now, nextBatchId(m_batch_id), state));
 }
 
 
@@ -357,20 +382,29 @@ void WSession::dispatchMessage(const Message& msg) {
                << " has_pos=" << msg.set_state.has_position
                << " qitem=" << msg.set_state.current_queue_item.queue_item_id
                << " has_qitem=" << msg.set_state.current_queue_item.has_queue_item_id
+               << " qver=" << msg.set_state.queue_version.major
+               << "." << msg.set_state.queue_version.minor
                << "\n");
+        // Always capture the server's current queue_version so our state
+        // reports echo it back correctly (phone ignores stale versions).
+        if (msg.set_state.queue_version.major || msg.set_state.queue_version.minor) {
+            std::lock_guard<std::mutex> lk(m_state_mutex);
+            m_last_state.queue_version = msg.set_state.queue_version;
+        }
         // Only act on SetState when at least one field is actually present.
         // Responding to empty SetState creates a feedback loop with the server.
         // Use has-flags because 0 is a valid value for position and queue_item_id.
         if (msg.set_state.playing_state != PlayingState::UNKNOWN ||
             msg.set_state.has_position ||
             msg.set_state.current_queue_item.has_queue_item_id) {
-            if (m_cbs.on_set_state) {
-                m_cbs.on_set_state(msg.set_state.playing_state,
-                                    msg.set_state.current_position_ms,
-                                    msg.set_state.has_position,
-                                    msg.set_state.current_queue_item);
-            }
-            // Immediately acknowledge with a StateUpdated response
+            // Build and send the ack BEFORE calling on_set_state.
+            // on_set_state → QcManager → MpdCtl::seek() → mpd_run_seek_pos()
+            // can block this thread for many seconds while MPD repositions an
+            // HTTP stream.  If we send the ack after that delay the phone has
+            // already moved on (local interpolation) and rejects our position
+            // as stale.  Sending first ensures the phone freezes its bar at
+            // the seeked position (BUFFERING) within ~100 ms of the command,
+            // then resumes when the MpdCtl event loop later sends OK.
             QueueRendererState ack;
             {
                 std::lock_guard<std::mutex> lk(m_state_mutex);
@@ -381,6 +415,10 @@ void WSession::dispatchMessage(const Message& msg) {
             if (msg.set_state.has_position) {
                 ack.state.current_position_ms = msg.set_state.current_position_ms;
                 ack.state.position_timestamp_ms = nowMs();
+                // BUFFERING pauses the phone's local interpolation timer so it
+                // doesn't overshoot while MPD is seeking.  The timer restarts
+                // when we send buffer_state=OK once MPD is playing again.
+                ack.state.buffer_state = BufferState::BUFFERING;
             }
             if (msg.set_state.current_queue_item.has_queue_item_id) {
                 ack.state.current_queue_item_id = msg.set_state.current_queue_item.queue_item_id;
@@ -391,6 +429,14 @@ void WSession::dispatchMessage(const Message& msg) {
                 m_last_state = ack;
             }
             sendRaw(buildStateUpdated(nowMs(), nextBatchId(m_batch_id), ack));
+
+            // Now call the (potentially slow) callback
+            if (m_cbs.on_set_state) {
+                m_cbs.on_set_state(msg.set_state.playing_state,
+                                    msg.set_state.current_position_ms,
+                                    msg.set_state.has_position,
+                                    msg.set_state.current_queue_item);
+            }
         }
         break;
 
@@ -404,8 +450,13 @@ void WSession::dispatchMessage(const Message& msg) {
         break;
 
     case MsgType::SRVRC_QUEUE_STATE:
-        LOGDEB("WSession: QueueState tracks="
-               << msg.queue_state.tracks.size() << "\n");
+        LOGDEB("WSession: QueueState tracks=" << msg.queue_state.tracks.size()
+               << " qver=" << msg.queue_state.queue_version.major
+               << "." << msg.queue_state.queue_version.minor << "\n");
+        {
+            std::lock_guard<std::mutex> lk(m_state_mutex);
+            m_last_state.queue_version = msg.queue_state.queue_version;
+        }
         // Full queue snapshot: treat as load at position 0
         if (m_cbs.on_queue_load && !msg.queue_state.tracks.empty()) {
             m_cbs.on_queue_load(msg.queue_state.tracks, 0);
@@ -415,7 +466,13 @@ void WSession::dispatchMessage(const Message& msg) {
     case MsgType::SRVRC_QUEUE_LOAD_TRACKS:
         LOGDEB("WSession: QueueLoadTracks tracks="
                << msg.queue_load_tracks.tracks.size()
-               << " pos=" << msg.queue_load_tracks.queue_position << "\n");
+               << " pos=" << msg.queue_load_tracks.queue_position
+               << " qver=" << msg.queue_load_tracks.queue_version.major
+               << "." << msg.queue_load_tracks.queue_version.minor << "\n");
+        {
+            std::lock_guard<std::mutex> lk(m_state_mutex);
+            m_last_state.queue_version = msg.queue_load_tracks.queue_version;
+        }
         if (m_cbs.on_queue_load) {
             m_cbs.on_queue_load(
                 msg.queue_load_tracks.tracks,
