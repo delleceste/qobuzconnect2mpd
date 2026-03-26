@@ -1,0 +1,19 @@
+[Unit]
+Description=Qobuz Connect to MPD bridge
+After=network-online.target mpd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mpd
+Group=mpd
+ExecStart=@QOBUZCONNECT2MPD_BIN@ -c /etc/qobuzconnect2mpd.conf
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

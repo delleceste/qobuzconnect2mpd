@@ -198,6 +198,21 @@ executable(
 
 ########################## Install data
 
+systemd_conf = configuration_data()
+systemd_conf.set(
+  'QOBUZCONNECT2MPD_BIN',
+  join_paths(get_option('prefix'), get_option('bindir'), 'qobuzconnect2mpd'),
+)
+
+systemd_unit = configure_file(
+  input: 'systemd/qobuzconnect2mpd.service.in',
+  output: 'qobuzconnect2mpd.service',
+  configuration: systemd_conf,
+)
+
+install_data(systemd_unit, install_dir: join_paths(get_option('prefix'), 'lib/systemd/system'))
+install_data('conf/qobuzconnect2mpd.conf', install_dir: '/etc')
+
 #upmpdcli_data = files(
 #  'src/AVTransport.xml',
 #  'src/ConnectionManager.xml',
