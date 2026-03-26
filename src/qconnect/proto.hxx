@@ -348,11 +348,13 @@ Bytes buildAskQueueState(uint64_t time_ms, int32_t batch_id,
 // Parse one WebSocket binary message (envelope + payload).
 // Returns false if data is malformed or type is unrecognised.
 // msgs is appended to (not cleared) so callers may process incrementally.
-bool parseFrame(const uint8_t* data, size_t len, std::vector<Message>& msgs);
+bool parseFrame(const uint8_t* data, size_t len, std::vector<Message>& msgs,
+                uint64_t* payload_msg_date_ms = nullptr);
 
 // Convenience overload for Bytes
-inline bool parseFrame(const Bytes& data, std::vector<Message>& msgs) {
-    return parseFrame(data.data(), data.size(), msgs);
+inline bool parseFrame(const Bytes& data, std::vector<Message>& msgs,
+                       uint64_t* payload_msg_date_ms = nullptr) {
+    return parseFrame(data.data(), data.size(), msgs, payload_msg_date_ms);
 }
 
 } // namespace QConnect

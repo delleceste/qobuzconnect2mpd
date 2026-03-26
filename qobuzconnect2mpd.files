@@ -1,5 +1,4 @@
 meson.build
-meson_options.txt
 src/conftree.cpp
 src/conftree.h
 src/pathut.cpp

@@ -108,6 +108,8 @@ public:
     void setActiveRenderer(uint64_t renderer_id);
 
 private:
+    uint64_t nowAlignedMs() const;
+    uint64_t alignTimestampMs(uint64_t ts_ms) const;
     void eventLoop();
     bool sendRaw(const Bytes& data);
     bool sendHeartbeat();
@@ -135,6 +137,8 @@ private:
     // Last reported renderer state (used for heartbeats and immediate responses)
     QueueRendererState   m_last_state{};
     std::mutex           m_state_mutex;
+    // Estimated cloud-time offset (cloud_epoch_ms - local_epoch_ms).
+    std::atomic<int64_t> m_cloud_time_offset_ms{0};
 
     // Rolling counters for message IDs
     std::atomic<int32_t> m_batch_id{0};

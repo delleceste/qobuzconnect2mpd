@@ -145,6 +145,13 @@ private:
     std::mutex       m_session_mutex;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_ws_active{false};
+    // Startup synchronization gate: only switch to buffer_state=OK once MPD
+    // shows sustained position progression on the current track.
+    MpdState::Status   m_last_mpd_status{MpdState::Status::UNKNOWN};
+    int                m_last_mpd_queue_pos{-1};
+    uint32_t           m_last_mpd_pos_ms{0};
+    int                m_play_progress_samples{0};
+    bool               m_playback_ready{false};
 
     // Maps MPD queue position -> Qobuz queue_item_id (parallel to MPD queue)
     mutable std::mutex        m_qmap_mutex;

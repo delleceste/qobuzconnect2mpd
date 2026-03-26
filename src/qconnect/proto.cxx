@@ -82,6 +82,18 @@ void writeUint64Field(Bytes& b, int fn, uint64_t v) {
     writeVarint(b, v);
 }
 
+// Presence-sensitive variant: emit field even when value is 0.
+void writeUint32FieldPresent(Bytes& b, int fn, uint32_t v) {
+    writeTag(b, fn, WT_VARINT);
+    writeVarint(b, v);
+}
+
+// Presence-sensitive variant: emit field even when value is 0.
+void writeUint64FieldPresent(Bytes& b, int fn, uint64_t v) {
+    writeTag(b, fn, WT_VARINT);
+    writeVarint(b, v);
+}
+
 void writeInt32Field(Bytes& b, int fn, int32_t v) {
     if (!v) return;
     writeTag(b, fn, WT_VARINT);
@@ -582,13 +594,18 @@ bool decodeQConnectBatch(const uint8_t* d, size_t len,
 }
 
 bool decodePayload(const uint8_t* d, size_t len,
-                    std::vector<Message>& msgs) {
+                    std::vector<Message>& msgs,
+                    uint64_t* payload_msg_date_ms = nullptr) {
     // Payload { msg_id=1, msg_date=2, proto=3, src=4, dests=5, payload=7 }
     size_t pos = 0;
     while (pos < len) {
         int fn; uint8_t wt;
         if (!readTag(d, len, pos, fn, wt)) return false;
-        if (fn == 7 && wt == WT_LEN) {
+        if (fn == 2 && wt == WT_VARINT) {
+            uint64_t v = 0;
+            if (!readVarint(d, len, pos, v)) return false;
+            if (payload_msg_date_ms) *payload_msg_date_ms = v;
+        } else if (fn == 7 && wt == WT_LEN) {
             const uint8_t* fd; size_t fl;
             if (!readLenField(d, len, pos, fd, fl)) return false;
             decodeQConnectBatch(fd, fl, msgs);
@@ -616,12 +633,14 @@ Bytes encodeRendererState(const RendererState& s) {
         Bytes pos;
         uint64_t ts = s.position_timestamp_ms ? s.position_timestamp_ms : nowMs();
         writeFixed64Field(pos, 1, ts);
-        writeUint32Field(pos, 2, s.current_position_ms);
+        // value_ms=0 is semantically meaningful (start of track / seek-to-zero),
+        // so emit it explicitly when Position is present.
+        writeUint32FieldPresent(pos, 2, s.current_position_ms);
         writeMessageField(b, 3, pos);
     }
     writeUint32Field(b, 4, s.duration_ms);
     if (s.has_current_queue_item_id || s.current_queue_item_id)
-        writeUint64Field(b, 5, s.current_queue_item_id);
+        writeUint64FieldPresent(b, 5, s.current_queue_item_id);
     if (s.next_queue_item_id)
         writeUint64Field(b, 6, s.next_queue_item_id);
     return b;
@@ -645,14 +664,16 @@ Bytes encodeQueueRendererState(const QueueRendererState& s) {
         Bytes pos;
         uint64_t ts = s.state.position_timestamp_ms ? s.state.position_timestamp_ms : nowMs();
         writeFixed64Field(pos, 1, ts);
-        writeUint32Field(pos, 2, s.state.current_position_ms);
+        // value_ms=0 is semantically meaningful (start of track / seek-to-zero),
+        // so emit it explicitly when Position is present.
+        writeUint32FieldPresent(pos, 2, s.state.current_position_ms);
         writeMessageField(b, 3, pos);
     }
     writeUint32Field(b, 4, s.state.duration_ms);
     Bytes qv = encodeQueueVersion(s.queue_version);
     if (!qv.empty()) writeMessageField(b, 5, qv);
     if (s.state.has_current_queue_item_id || s.state.current_queue_item_id)
-        writeUint64Field(b, 6, s.state.current_queue_item_id);
+        writeUint64FieldPresent(b, 6, s.state.current_queue_item_id);
     if (s.state.next_queue_item_id)
         writeUint64Field(b, 7, s.state.next_queue_item_id);
     return b;
@@ -856,7 +877,8 @@ Bytes buildAskQueueState(uint64_t time_ms, int32_t batch_id,
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
 
-bool parseFrame(const uint8_t* data, size_t len, std::vector<Message>& msgs) {
+bool parseFrame(const uint8_t* data, size_t len, std::vector<Message>& msgs,
+                uint64_t* payload_msg_date_ms) {
     if (len < 2) return false;
 
     size_t pos = 0;
@@ -871,7 +893,7 @@ bool parseFrame(const uint8_t* data, size_t len, std::vector<Message>& msgs) {
 
     switch (type) {
     case EnvType::PAYLOAD:
-        return decodePayload(payload, plen, msgs);
+        return decodePayload(payload, plen, msgs, payload_msg_date_ms);
     case EnvType::AUTHENTICATE:
     case EnvType::SUBSCRIBE:
     case EnvType::DISCONNECT:

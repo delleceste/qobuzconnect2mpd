@@ -106,16 +106,15 @@ bool QobuzApi::login(const std::string& user, const std::string& pass) {
     return true;
 }
 
-// Build the MD5 signature for /track/getFileUrl as in raw.py:
-//   md5( "trackgetFileUrl" + "format_id" + fmt_id + "intent" + intent
-//        + "track_id" + track_id + timestamp )
-// Then XOR with app_secret nibbles.
+// Build the MD5 signature for /track/getFileUrl:
+//   md5( method_prefix + "format_id" + fmt_id + "intent" + intent
+//        + "track_id" + track_id + timestamp + app_secret )
+// method_prefix is typically "trackgetFileUrl" (legacy) or "fileurl" (newer).
 std::string QobuzApi::buildFileUrlSignature(uint32_t track_id,
                                               int fmt_id,
-                                              uint64_t ts) const {
-    // Append the secret to the plain string before hashing — this is the
-    // modern Qobuz signing method used by qobuz-player / qonductor.
-    std::string plain = "trackgetFileUrl"
+                                              uint64_t ts,
+                                              const std::string& method_prefix) const {
+    std::string plain = method_prefix
                       + std::string("format_id") + std::to_string(fmt_id)
                       + std::string("intent")    + std::string("stream")
                       + std::string("track_id")  + std::to_string(track_id)
@@ -136,6 +135,8 @@ std::string QobuzApi::buildFileUrlSignature(uint32_t track_id,
 
 bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
                               TrackStreamInfo& out) {
+    bool refreshed_credentials = false;
+retry_after_refresh:
     // If no confirmed secret yet but we have candidates from fetchAppCredentials,
     // try each one; lock in the first that returns a valid or accepted response.
     if (m_app_secret.empty() && !m_secret_candidates.empty()) {
@@ -165,26 +166,50 @@ bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
     static const int fallback_fmts[] = {27, 7, 6, 5};
     for (int fmt : fallback_fmts) {
         if (fmt > format_id) continue;
-        if (tryGetStreamUrl(track_id, fmt, out))
+        long code = 0;
+        if (tryGetStreamUrl(track_id, fmt, out, &code))
             return true;
+        if (code == 400 && !refreshed_credentials) {
+            LOGINF("QobuzApi: signature rejected; refreshing app credentials and retrying\n");
+            if (fetchAppCredentials()) {
+                m_app_secret.clear();
+                refreshed_credentials = true;
+                goto retry_after_refresh;
+            }
+        }
     }
     return false;
 }
 
 bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
                                 TrackStreamInfo& out, long* http_code) {
-    uint64_t ts  = unixTimestamp();
-    std::string sig = buildFileUrlSignature(track_id, format_id, ts);
+    // Legacy endpoint expects "trackgetFileUrl" signing prefix.
+    // The newer "fileurl" prefix belongs to /file/url + /session/start flow.
+    auto do_call = [&](uint64_t ts, long* code_out) {
+        static const std::string method_prefix = "trackgetFileUrl";
+        LOGDEB("QobuzApi: getFileUrl signing method=" << method_prefix
+               << " track_id=" << track_id
+               << " fmt=" << format_id
+               << " ts=" << ts << "\n");
+        std::string sig = buildFileUrlSignature(track_id, format_id, ts, method_prefix);
+        std::string path = "/track/getFileUrl"
+                           "?track_id="  + std::to_string(track_id)
+                         + "&format_id=" + std::to_string(format_id)
+                         + "&intent=stream"
+                         + "&request_ts="  + std::to_string(ts)
+                         + "&request_sig=" + sig
+                         + "&app_id="    + m_app_id;
+        return httpGet(path, code_out);
+    };
 
-    std::string path = "/track/getFileUrl"
-                       "?track_id="  + std::to_string(track_id)
-                     + "&format_id=" + std::to_string(format_id)
-                     + "&intent=stream"
-                     + "&request_ts="  + std::to_string(ts)
-                     + "&request_sig=" + sig
-                     + "&app_id="    + m_app_id;
-
-    std::string resp = httpGet(path, http_code);
+    long code = 0;
+    uint64_t ts = unixTimestamp();
+    std::string resp = do_call(ts, &code);
+    if (!resp.empty()) {
+        LOGDEB("QobuzApi: getFileUrl succeeded with method=trackgetFileUrl"
+               << " (HTTP " << code << ")\n");
+    }
+    if (http_code) *http_code = code;
     if (resp.empty()) return false;
 
     Json::Value root;

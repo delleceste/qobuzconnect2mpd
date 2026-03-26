@@ -97,7 +97,8 @@ private:
                          long* http_code_out = nullptr);
     std::string buildFileUrlSignature(uint32_t track_id,
                                        int fmt_id,
-                                       uint64_t ts) const;
+                                       uint64_t ts,
+                                       const std::string& method_prefix) const;
 
     bool tryGetStreamUrl(uint32_t track_id, int format_id,
                          TrackStreamInfo& out, long* http_code = nullptr);

@@ -22,6 +22,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <sys/select.h>
 
 namespace QConnect {
@@ -35,6 +36,21 @@ static uint64_t nowMs() {
 
 static int nextBatchId(std::atomic<int32_t>& counter) {
     return ++counter;
+}
+
+uint64_t WSession::nowAlignedMs() const {
+    int64_t now = static_cast<int64_t>(nowMs());
+    int64_t off = m_cloud_time_offset_ms.load(std::memory_order_relaxed);
+    int64_t out = now + off;
+    return out > 0 ? static_cast<uint64_t>(out) : 0;
+}
+
+uint64_t WSession::alignTimestampMs(uint64_t ts_ms) const {
+    if (!ts_ms) return 0;
+    int64_t ts = static_cast<int64_t>(ts_ms);
+    int64_t off = m_cloud_time_offset_ms.load(std::memory_order_relaxed);
+    int64_t out = ts + off;
+    return out > 0 ? static_cast<uint64_t>(out) : 0;
 }
 
 WSession::WSession(const DeviceInfo& devinfo, const WSessionCallbacks& cbs)
@@ -169,32 +185,33 @@ void WSession::reportState(const QueueRendererState& state) {
            << " buf=" << static_cast<int>(s.state.buffer_state)
            << " qver=" << s.queue_version.major << "." << s.queue_version.minor << "\n");
     int bid = nextBatchId(m_batch_id);
-    sendRaw(buildStateUpdated(nowMs(), bid, s));
+    s.state.position_timestamp_ms = alignTimestampMs(s.state.position_timestamp_ms);
+    sendRaw(buildStateUpdated(nowAlignedMs(), bid, s));
 }
 
 void WSession::reportVolume(uint32_t volume) {
     if (!m_connected) return;
     int bid = nextBatchId(m_batch_id);
-    sendRaw(buildVolumeChanged(nowMs(), bid, volume));
+    sendRaw(buildVolumeChanged(nowAlignedMs(), bid, volume));
 }
 
 void WSession::reportMaxQuality(int32_t quality_fmt_id) {
     if (!m_connected) return;
     int bid = nextBatchId(m_batch_id);
-    sendRaw(buildMaxQualityChanged(nowMs(), bid, quality_fmt_id));
+    sendRaw(buildMaxQualityChanged(nowAlignedMs(), bid, quality_fmt_id));
 }
 
 void WSession::reportFileQuality(int32_t sample_rate_hz) {
     if (!m_connected) return;
     int bid = nextBatchId(m_batch_id);
-    sendRaw(buildFileAudioQualityChanged(nowMs(), bid, sample_rate_hz));
+    sendRaw(buildFileAudioQualityChanged(nowAlignedMs(), bid, sample_rate_hz));
 }
 
 void WSession::setActiveRenderer(uint64_t renderer_id) {
     if (!m_connected) return;
     m_renderer_id = renderer_id;
     int bid = nextBatchId(m_batch_id);
-    sendRaw(buildSetActiveRenderer(nowMs(), bid,
+    sendRaw(buildSetActiveRenderer(nowAlignedMs(), bid,
                                     static_cast<int32_t>(renderer_id)));
 }
 
@@ -214,13 +231,14 @@ bool WSession::sendHeartbeat() {
     //   - Playing:   advance position by elapsed time since last poll so the
     //                heartbeat gives a reasonable estimate until the next
     //                regular reportState arrives.
-    uint64_t now = nowMs();
-    uint64_t old_ts = state.state.position_timestamp_ms;
-    if (state.state.buffer_state != BufferState::BUFFERING &&
-        old_ts && now > old_ts) {
+    uint64_t now = nowAlignedMs();
+    uint64_t old_ts = alignTimestampMs(state.state.position_timestamp_ms);
+    if (old_ts && now > old_ts) {
         uint64_t elapsed = now - old_ts;
-        if (elapsed < 30000) // don't advance past a stale-by->30s snapshot
+        if (state.state.buffer_state != BufferState::BUFFERING &&
+            elapsed < 30000) { // don't advance past a stale-by->30s snapshot
             state.state.current_position_ms += static_cast<uint32_t>(elapsed);
+        }
     }
     state.state.position_timestamp_ms = now;
     return sendRaw(buildStateUpdated(now, nextBatchId(m_batch_id), state));
@@ -291,7 +309,18 @@ void WSession::eventLoop() {
 
             if (!frame.empty()) {
                 std::vector<Message> msgs;
-                if (parseFrame(frame, msgs)) {
+                uint64_t rx_msg_date_ms = 0;
+                if (parseFrame(frame, msgs, &rx_msg_date_ms)) {
+                    if (rx_msg_date_ms) {
+                        int64_t local_now = static_cast<int64_t>(nowMs());
+                        int64_t sample_off = static_cast<int64_t>(rx_msg_date_ms) - local_now;
+                        // Guard against bogus timestamps; then smooth to reduce jitter.
+                        if (std::llabs(sample_off) < 300000) { // 5 minutes
+                            int64_t old_off = m_cloud_time_offset_ms.load(std::memory_order_relaxed);
+                            int64_t new_off = (old_off * 7 + sample_off) / 8;
+                            m_cloud_time_offset_ms.store(new_off, std::memory_order_relaxed);
+                        }
+                    }
                     for (auto& msg : msgs) dispatchMessage(msg);
                 } else {
                     LOGDEB("WSession: failed to parse frame of "
@@ -322,7 +351,7 @@ void WSession::dispatchMessage(const Message& msg) {
         m_session_uuid = msg.session_state.session_uuid;
         m_session_id   = msg.session_state.session_id;
         // Ask server to send current renderer state
-        sendRaw(buildAskRendererState(nowMs(), nextBatchId(m_batch_id),
+        sendRaw(buildAskRendererState(nowAlignedMs(), nextBatchId(m_batch_id),
                                        m_session_id));
         if (m_cbs.on_connected) m_cbs.on_connected();
         break;
@@ -359,7 +388,7 @@ void WSession::dispatchMessage(const Message& msg) {
             // 1. VolumeMuted(false)  — field 29, must be sent even with empty body
             // 2. VolumeChanged       — field 25
             // 3. MaxAudioQualityChanged — field 28, value is quality level 1-4
-            sendRaw(buildVolumeMuted(nowMs(), nextBatchId(m_batch_id), false));
+            sendRaw(buildVolumeMuted(nowAlignedMs(), nextBatchId(m_batch_id), false));
             reportVolume(50);  // MPD volume will be reported accurately by MpdCtl later
             // Convert format_id to quality level: 27->4, 7->3, 6->2, 5->1
             int32_t ql = 4;
@@ -369,7 +398,7 @@ void WSession::dispatchMessage(const Message& msg) {
             reportMaxQuality(ql);
             // Request current queue state from server
             if (!m_session_uuid.empty()) {
-                sendRaw(buildAskQueueState(nowMs(), nextBatchId(m_batch_id),
+                sendRaw(buildAskQueueState(nowAlignedMs(), nextBatchId(m_batch_id),
                                             m_session_uuid));
             }
         }
@@ -414,21 +443,35 @@ void WSession::dispatchMessage(const Message& msg) {
                 ack.state.playing_state = msg.set_state.playing_state;
             if (msg.set_state.has_position) {
                 ack.state.current_position_ms = msg.set_state.current_position_ms;
-                ack.state.position_timestamp_ms = nowMs();
-                // BUFFERING pauses the phone's local interpolation timer so it
-                // doesn't overshoot while MPD is seeking.  The timer restarts
-                // when we send buffer_state=OK once MPD is playing again.
-                ack.state.buffer_state = BufferState::BUFFERING;
+                ack.state.position_timestamp_ms = nowAlignedMs();
             }
             if (msg.set_state.current_queue_item.has_queue_item_id) {
+                bool item_changed =
+                    (!ack.state.has_current_queue_item_id ||
+                     ack.state.current_queue_item_id !=
+                         msg.set_state.current_queue_item.queue_item_id);
                 ack.state.current_queue_item_id = msg.set_state.current_queue_item.queue_item_id;
                 ack.state.has_current_queue_item_id = true;
+                // Track switch without explicit position should reset to start.
+                // Reusing a stale pre-switch timestamp/position makes the phone
+                // jump ahead by several seconds on the new track.
+                if (item_changed && !msg.set_state.has_position) {
+                    ack.state.current_position_ms = 0;
+                    ack.state.position_timestamp_ms = nowAlignedMs();
+                }
+            }
+            // If no explicit seek was provided, refresh timestamp when entering
+            // PLAYING so the app does not extrapolate from an old snapshot.
+            if (!msg.set_state.has_position &&
+                msg.set_state.playing_state == PlayingState::PLAYING &&
+                ack.state.position_timestamp_ms == 0) {
+                ack.state.position_timestamp_ms = nowAlignedMs();
             }
             {
                 std::lock_guard<std::mutex> lk(m_state_mutex);
                 m_last_state = ack;
             }
-            sendRaw(buildStateUpdated(nowMs(), nextBatchId(m_batch_id), ack));
+            sendRaw(buildStateUpdated(nowAlignedMs(), nextBatchId(m_batch_id), ack));
 
             // Now call the (potentially slow) callback
             if (m_cbs.on_set_state) {

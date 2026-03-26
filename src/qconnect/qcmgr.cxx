@@ -481,13 +481,42 @@ void QcManager::onMpdState(const MpdState& st) {
     switch (st.status) {
     case MpdState::Status::PLAY:
         qrs.state.playing_state = PlayingState::PLAYING;
-        qrs.state.buffer_state  = BufferState::OK;
+        // Keep BUFFERING until MPD reports sustained position progression on
+        // this track. This is state-based (not fixed-delay) and avoids phone
+        // timer lead during startup/network warmup.
+        {
+            bool new_play_context =
+                (m_last_mpd_status != MpdState::Status::PLAY) ||
+                (st.queue_pos != m_last_mpd_queue_pos);
+            if (new_play_context) {
+                m_play_progress_samples = 0;
+                m_playback_ready = false;
+            }
+            bool has_timing = (st.duration_ms > 0);
+            bool progressed = (st.position_ms > m_last_mpd_pos_ms + 200);
+            if (!m_playback_ready && has_timing && progressed) {
+                ++m_play_progress_samples;
+                if (m_play_progress_samples >= 2) {
+                    m_playback_ready = true;
+                }
+            } else if (!progressed && !new_play_context) {
+                // avoid stale count if progress stalls
+                m_play_progress_samples = 0;
+            }
+            qrs.state.buffer_state = m_playback_ready
+                                     ? BufferState::OK
+                                     : BufferState::BUFFERING;
+        }
         break;
     case MpdState::Status::PAUSE:
         qrs.state.playing_state = PlayingState::PAUSED;
+        m_playback_ready = false;
+        m_play_progress_samples = 0;
         break;
     case MpdState::Status::STOP:
         qrs.state.playing_state = PlayingState::STOPPED;
+        m_playback_ready = false;
+        m_play_progress_samples = 0;
         break;
     default:
         break;
@@ -507,6 +536,10 @@ void QcManager::onMpdState(const MpdState& st) {
         if (static_cast<size_t>(st.queue_pos) < m_track_sample_rates.size())
             m_ws->reportFileQuality(m_track_sample_rates[st.queue_pos]);
     }
+
+    m_last_mpd_status = st.status;
+    m_last_mpd_queue_pos = st.queue_pos;
+    m_last_mpd_pos_ms = st.position_ms;
 }
 
 // ---- Stream URL resolution --------------------------------------------------
