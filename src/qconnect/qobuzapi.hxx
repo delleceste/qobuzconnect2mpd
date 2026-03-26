@@ -19,6 +19,8 @@
 #include <string>
 #include <cstdint>
 #include <vector>
+#include <map>
+#include <json/json.h>
 
 namespace QConnect {
 
@@ -34,6 +36,7 @@ namespace QConnect {
 
 struct TrackStreamInfo {
     std::string stream_url;  // signed HTTPS URL, valid for ~10 min
+    std::string local_path;  // set for locally materialized segmented streams
     std::string mime_type;   // e.g. "audio/flac"
     int         format_id{6};
     uint32_t    duration_ms{0};
@@ -92,13 +95,29 @@ public:
     // and out_jwt, and returns true.  Requires a prior successful login().
     bool fetchQwsToken(std::string& out_endpoint, std::string& out_jwt);
 
+    // Configure local HTTP proxy base URL used when materializing segmented
+    // /file/url tracks (e.g. "http://127.0.0.1:9093/qobuz-segmented").
+    void setLocalProxyBaseUrl(const std::string& v) { m_local_proxy_base_url = v; }
+
 private:
+    bool ensureStreamSession();
+    bool startStreamSession();
+    bool tryFileUrl(uint32_t track_id, int format_id, TrackStreamInfo& out,
+                    long* http_code = nullptr);
+    bool materializeSegmentedTrack(const Json::Value& root, uint32_t track_id,
+                                   int format_id, TrackStreamInfo& out);
     std::string httpGet(const std::string& path,
                          long* http_code_out = nullptr);
+    std::string httpPostForm(const std::string& path,
+                             const std::map<std::string, std::string>& form,
+                             long* http_code_out = nullptr);
     std::string buildFileUrlSignature(uint32_t track_id,
                                        int fmt_id,
                                        uint64_t ts,
                                        const std::string& method_prefix) const;
+    std::string buildRequestSignature(const std::string& method_prefix,
+                                      const std::map<std::string, std::string>& args,
+                                      uint64_t ts) const;
 
     bool tryGetStreamUrl(uint32_t track_id, int format_id,
                          TrackStreamInfo& out, long* http_code = nullptr);
@@ -109,6 +128,10 @@ private:
     std::vector<std::string> m_secret_candidates; // decoded from bundle.js
     std::string m_user_token;              // from /user/login
     std::string m_jwt;                     // from Qobuz app JWT (preferred)
+    std::string m_stream_session_id;       // from /session/start
+    uint64_t    m_stream_session_expires_at{0}; // unix seconds
+    std::string m_stream_session_infos;    // from /session/start
+    std::string m_local_proxy_base_url;
 };
 
 } // namespace QConnect

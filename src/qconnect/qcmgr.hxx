@@ -22,6 +22,7 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <condition_variable>
 
 #include "proto.hxx"
 #include "mpdctl.hxx"
@@ -111,6 +112,10 @@ private:
     void onTracksRemoved(const std::vector<uint64_t>& queue_item_ids);
     void onWsConnected();
     void onWsDisconnected();
+    void queueLoadLoop();
+    void stopQueueLoadWorker();
+    void cleanupMaterializedFiles(const std::vector<std::string>& paths);
+    void cleanupPlayedMaterializedFiles(int queue_pos);
 
     // Called by MpdCtl's event thread
     void onMpdState(const MpdState& st);
@@ -120,7 +125,9 @@ private:
     // out_item_ids is filled with the queue_item_id for each returned URL.
     std::vector<std::string> resolveStreamUrls(
         const std::vector<QueueTrack>& tracks,
-        std::vector<uint64_t>& out_item_ids);
+        std::vector<uint64_t>& out_item_ids,
+        std::vector<int>& out_sample_rates,
+        std::vector<std::string>& out_local_paths);
 
     // Look up Qobuz queue_item_id from MPD queue position.
     uint64_t queueItemIdAt(int mpd_pos) const;
@@ -157,6 +164,20 @@ private:
     mutable std::mutex        m_qmap_mutex;
     std::vector<uint64_t>     m_queue_item_ids;
     std::vector<int>          m_track_sample_rates; // Hz, parallel to m_queue_item_ids
+    std::vector<std::string>  m_track_local_paths;  // local materialized FLAC paths
+
+    struct PendingQueueLoad {
+        std::vector<QueueTrack> tracks;
+        uint32_t                start_idx{0};
+        uint64_t                generation{0};
+        bool                    pending{false};
+    };
+    std::mutex                m_queue_load_mutex;
+    std::condition_variable   m_queue_load_cv;
+    std::thread               m_queue_load_thread;
+    std::atomic<bool>         m_queue_load_stop{false};
+    std::atomic<uint64_t>     m_queue_load_generation{0};
+    PendingQueueLoad          m_pending_queue_load;
 
     // IPC
     int          m_ipc_sock{-1};

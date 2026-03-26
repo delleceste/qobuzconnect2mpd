@@ -500,8 +500,10 @@ void WSession::dispatchMessage(const Message& msg) {
             std::lock_guard<std::mutex> lk(m_state_mutex);
             m_last_state.queue_version = msg.queue_state.queue_version;
         }
-        // Full queue snapshot: treat as load at position 0
-        if (m_cbs.on_queue_load && !msg.queue_state.tracks.empty()) {
+        // Full queue snapshot: treat as load at position 0, including the
+        // empty-queue case. Some clients appear to clear playback by sending
+        // QueueState with zero tracks instead of a dedicated QueueCleared.
+        if (m_cbs.on_queue_load) {
             m_cbs.on_queue_load(msg.queue_state.tracks, 0);
         }
         break;
