@@ -49,8 +49,11 @@ HttpHandler::HttpHandler(const std::string& uuid,
 HttpHandler::~HttpHandler() { stop(); }
 
 bool HttpHandler::start() {
+    // MHD_USE_THREAD_PER_CONNECTION: each connection (including the blocking
+    // growingFileReader for audio streaming) runs in its own thread, so a slow
+    // or stalled audio response never blocks the accept loop or other requests.
     m_daemon = MHD_start_daemon(
-        MHD_USE_SELECT_INTERNALLY | MHD_USE_DUAL_STACK,
+        MHD_USE_SELECT_INTERNALLY | MHD_USE_THREAD_PER_CONNECTION | MHD_USE_DUAL_STACK,
         static_cast<uint16_t>(m_port),
         nullptr, nullptr,          // accept policy callback
         &HttpHandler::requestCallback, this,
@@ -252,17 +255,19 @@ MHD_Result HttpHandler::handleRequest(struct MHD_Connection* conn,
         std::string(url).rfind(seg_prefix, 0) == 0) {
         std::string name = std::string(url).substr(seg_prefix.size());
         if (name.empty() || name.find("..") != std::string::npos ||
-            name.find('/') != std::string::npos) {
+            name.front() == '/' || name.back() == '/') {
             return sendResponse(conn, MHD_HTTP_BAD_REQUEST, R"({"error":"bad path"})");
         }
         const std::string path = "/tmp/qconnect2mpd-segmented/" + name;
         const std::string marker_path = path + ".inprogress";
         if (std::filesystem::exists(marker_path)) {
-            // While materialization is still running, never return a fixed-length
-            // snapshot for GET requests (even if the client sends Range), or MPD
-            // may stop at the current partial size.
+            // While materialization is still running, never return a fixed-size
+            // snapshot. Some MPD builds appear to probe with HEAD before GET; if
+            // we advertise the current partial Content-Length they can stop at
+            // that early boundary on slower machines.
             if (strcmp(method, "HEAD") == 0)
-                return sendFileResponse(conn, path, "audio/flac", true, marker_path);
+                return sendGrowingFileResponse(conn, path, marker_path,
+                                               "audio/flac", true);
 
             const char* range = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Range");
             if (range && *range) {
@@ -377,6 +382,27 @@ MHD_Result HttpHandler::handleRequest(struct MHD_Connection* conn,
         if (m_on_connect) m_on_connect(std::move(creds));
 
         return sendResponse(conn, MHD_HTTP_OK, R"({"status":"ok"})");
+    }
+
+    // ---- GET /oauth/callback — browser redirect after Qobuz login -----------
+    if (strcmp(method, "GET") == 0 &&
+        std::string(url) == "/oauth/callback") {
+        const char* code = MHD_lookup_connection_value(
+            conn, MHD_GET_ARGUMENT_KIND, "code_autorisation");
+        if (code && *code) {
+            LOGINF("HttpHandler: OAuth code received\n");
+            if (m_oauth_cb) m_oauth_cb(code);
+            static const std::string kOkHtml =
+                "<html><body><h2>Login successful!</h2>"
+                "<p>You can close this tab and return to qconnect2mpd.</p>"
+                "</body></html>";
+            return sendResponse(conn, MHD_HTTP_OK, kOkHtml, "text/html");
+        }
+        static const std::string kFailHtml =
+            "<html><body><h2>Login failed</h2>"
+            "<p>No authorization code (code_autorisation) in redirect URL.</p>"
+            "</body></html>";
+        return sendResponse(conn, MHD_HTTP_BAD_REQUEST, kFailHtml, "text/html");
     }
 
     // Unknown endpoint

@@ -46,7 +46,6 @@ struct WSessionCallbacks {
     // Qobuz app connected/disconnected
     std::function<void()> on_connected;
     std::function<void()> on_disconnected;
-
     // Full queue received (e.g. user pressed Play Album).
     // tracks carry both queue_item_id and track_id for each entry.
     // start_index is the position within the queue to start playing.

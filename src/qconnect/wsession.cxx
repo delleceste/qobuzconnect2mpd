@@ -372,17 +372,14 @@ void WSession::dispatchMessage(const Message& msg) {
             m_renderer_id = 0;
         break;
 
+    case MsgType::SRVRC_ACTIVE_RNDR_CHANGED:
+        LOGDEB("WSession: ActiveRendererChanged id="
+               << msg.active_renderer_changed.renderer_id << "\n");
+        break;
+
     case MsgType::CMD_SET_ACTIVE:
         LOGDEB("WSession: SetActive active=" << msg.set_active.active << "\n");
         m_is_active = msg.set_active.active;
-        if (!m_is_active) {
-            // Deactivated by server (queue cleared, renderer switched, etc.)
-            // Stop playback, matching qonductor behaviour.
-            if (m_cbs.on_set_state) {
-                QueueTrackRef empty_ref;
-                m_cbs.on_set_state(PlayingState::STOPPED, 0, false, empty_ref);
-            }
-        }
         if (m_is_active) {
             // Activation handshake (matches qonductor order):
             // 1. VolumeMuted(false)  — field 29, must be sent even with empty body
@@ -549,6 +546,12 @@ void WSession::dispatchMessage(const Message& msg) {
         LOGDEB("WSession: QueueCleared\n");
         if (m_cbs.on_queue_load)
             m_cbs.on_queue_load({}, 0); // empty queue
+        break;
+
+    case MsgType::SRVRC_QUEUE_VERSION_CHANGED:
+        LOGDEB("WSession: QueueVersionChanged qver="
+               << msg.queue_version_changed.queue_version.major
+               << "." << msg.queue_version_changed.queue_version.minor << "\n");
         break;
 
     case MsgType::SRVRC_RENDERER_STATE_UPD:

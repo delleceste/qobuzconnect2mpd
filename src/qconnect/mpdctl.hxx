@@ -89,6 +89,7 @@ public:
     bool play(int queue_pos = -1);
     bool pause(bool on);
     bool stop();
+    bool stopAndClear();
     bool seek(uint32_t position_ms);
     bool next();
     bool previous();

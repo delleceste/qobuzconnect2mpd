@@ -238,6 +238,10 @@ struct MsgRemoveRenderer {
     uint64_t renderer_id{0};
 };
 
+struct MsgActiveRendererChanged {
+    uint64_t renderer_id{0};
+};
+
 struct QueueTrack {
     uint64_t queue_item_id{0};
     uint32_t track_id{0};
@@ -272,6 +276,10 @@ struct MsgQueueTracksRemoved {
     std::vector<uint64_t>  queue_item_ids;
 };
 
+struct MsgQueueVersionChanged {
+    QueueVersion queue_version;
+};
+
 // All parsed inbound data in one union-like struct.
 // Only the field matching .type is populated.
 struct Message {
@@ -283,11 +291,13 @@ struct Message {
     MsgRendererStateUpdated renderer_state_upd;
     MsgAddRenderer         add_renderer;
     MsgRemoveRenderer      remove_renderer;
+    MsgActiveRendererChanged active_renderer_changed;
     MsgQueueState          queue_state;
     MsgQueueLoadTracks     queue_load_tracks;
     MsgQueueTracksInserted tracks_inserted;
     MsgQueueTracksAdded    tracks_added;
     MsgQueueTracksRemoved  tracks_removed;
+    MsgQueueVersionChanged queue_version_changed;
 };
 
 // ---- Encoder API ------------------------------------------------------------

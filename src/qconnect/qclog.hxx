@@ -26,15 +26,13 @@
 #  include <iostream>
 #  include <sstream>
 #  ifndef LOGDEB
-#    define LOGDEB(X)  do { std::ostringstream _s; _s << X; \
-                             std::cerr << "[DBG] " << _s.str(); } while(0)
+#    define LOGDEB(X)  do {} while(0)
 #  endif
 #  ifndef LOGERR
 #    define LOGERR(X)  do { std::ostringstream _s; _s << X; \
                              std::cerr << "[ERR] " << _s.str(); } while(0)
 #  endif
 #  ifndef LOGINF
-#    define LOGINF(X)  do { std::ostringstream _s; _s << X; \
-                             std::cerr << "[INF] " << _s.str(); } while(0)
+#    define LOGINF(X)  do {} while(0)
 #  endif
 #endif

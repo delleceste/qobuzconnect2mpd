@@ -544,6 +544,21 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
                 }
             }
             break;
+        case MsgType::SRVRC_ACTIVE_RNDR_CHANGED:
+            {
+                size_t p = 0; uint64_t v;
+                while (p < fl) {
+                    int fn2; uint8_t wt2;
+                    if (!readTag(fd,fl,p,fn2,wt2)) break;
+                    if (fn2 == 1) {
+                        readVarint(fd,fl,p,v);
+                        msg.active_renderer_changed.renderer_id = v;
+                    } else {
+                        skipField(fd,fl,p,wt2);
+                    }
+                }
+            }
+            break;
         case MsgType::SRVRC_QUEUE_STATE:
             decodeMsgQueueTracks(fd, fl, msg.queue_state.tracks,
                                   msg.queue_state.queue_version);
@@ -565,6 +580,23 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
             break;
         case MsgType::SRVRC_TRACKS_REMOVED:
             decodeMsgQueueRemoved(fd, fl, msg.tracks_removed); break;
+        case MsgType::SRVRC_QUEUE_VERSION_CHANGED:
+            {
+                size_t p = 0;
+                while (p < fl) {
+                    int fn2; uint8_t wt2;
+                    if (!readTag(fd,fl,p,fn2,wt2)) break;
+                    const uint8_t* fd2; size_t fl2;
+                    if (fn2 == 1 && wt2 == WT_LEN &&
+                        readLenField(fd, fl, p, fd2, fl2)) {
+                        decodeQueueVersion(fd2, fl2,
+                                           msg.queue_version_changed.queue_version);
+                    } else {
+                        skipField(fd,fl,p,wt2);
+                    }
+                }
+            }
+            break;
         default:
             handled = false; break;
         }

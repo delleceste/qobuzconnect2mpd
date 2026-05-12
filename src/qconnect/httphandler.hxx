@@ -39,6 +39,11 @@ struct ConnectCredentials {
 // The callback is invoked from the MHD request thread.
 using ConnectCallback = std::function<void(ConnectCredentials)>;
 
+// Called when the browser completes the OAuth flow and redirects to
+// GET /oauth/callback?code_autorisation=<code>.
+// The code should be passed to QobuzApi::oauthExchangeCode().
+using OAuthCallback = std::function<void(const std::string& code)>;
+
 // Serves the three HTTP endpoints required by the Qobuz Connect protocol:
 //
 //   GET  /devices/<uuid>/get-display-info   -> device metadata JSON
@@ -72,6 +77,9 @@ public:
     // Update the session ID returned by get-connect-info.
     void setSessionId(const std::string& session_id);
 
+    // Register the callback invoked when the browser completes OAuth login.
+    void setOAuthCallback(OAuthCallback cb) { m_oauth_cb = std::move(cb); }
+
 private:
     static MHD_Result requestCallback(void* cls,
                                        struct MHD_Connection* conn,
@@ -98,6 +106,7 @@ private:
     int              m_max_quality;
     ConnectCallback  m_on_connect;
     std::string      m_session_id;
+    OAuthCallback    m_oauth_cb;
     struct MHD_Daemon* m_daemon{nullptr};
 };
 

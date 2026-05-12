@@ -23,6 +23,8 @@
 #include "mpdctl.hxx"
 #include "qobuzapi.hxx"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -31,6 +33,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <iostream>
 #include <mutex>
 
 static uint64_t nowMs() {
@@ -41,12 +44,31 @@ static uint64_t nowMs() {
 
 namespace QConnect {
 
+namespace {
+
+constexpr size_t kInitialQueuePrefetchTracks = 2;
+
+}
+
 static void removeMaterializedFile(const std::string& path) {
     if (path.empty()) return;
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::remove(path, ec);
     fs::remove(path + ".inprogress", ec);
+}
+
+static void removeAllMaterializedFiles() {
+    namespace fs = std::filesystem;
+    const fs::path dir("/tmp/qconnect2mpd-segmented");
+    std::error_code ec;
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec))
+        return;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        fs::remove_all(entry.path(), ec);
+        ec.clear();
+    }
 }
 
 // ---- UUID helpers -----------------------------------------------------------
@@ -114,6 +136,36 @@ QcManager::QcManager(const QcConfig& cfg) : m_cfg(cfg) {
 
 QcManager::~QcManager() { stop(); }
 
+// Returns the path used to persist the OAuth user_auth_token across restarts.
+static std::string tokenFilePath() {
+    const char* home = getenv("HOME");
+    if (home && *home)
+        return std::string(home) + "/.local/share/qconnect2mpd/user_token";
+    return "/tmp/qconnect2mpd_token";
+}
+
+// Detect the local outbound IP (the address other LAN hosts reach us on).
+// Uses a non-blocking UDP "connect" to 8.8.8.8 — no packets are sent.
+static std::string localIpAddr() {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return "127.0.0.1";
+    struct sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons(53);
+    inet_pton(AF_INET, "8.8.8.8", &dst.sin_addr);
+    if (connect(fd, reinterpret_cast<struct sockaddr*>(&dst), sizeof(dst)) < 0) {
+        close(fd);
+        return "127.0.0.1";
+    }
+    struct sockaddr_in local{};
+    socklen_t len = sizeof(local);
+    getsockname(fd, reinterpret_cast<struct sockaddr*>(&local), &len);
+    close(fd);
+    char ip[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &local.sin_addr, ip, sizeof(ip));
+    return ip[0] ? ip : "127.0.0.1";
+}
+
 bool QcManager::start() {
     // ---- Qobuz API client --------------------------------------------------
     m_api = std::make_unique<QobuzApi>(m_cfg.api_base_url,
@@ -127,11 +179,18 @@ bool QcManager::start() {
             LOGERR("QcManager: bundle.js fetch failed; streaming will not work\n");
     }
 
-    if (!m_cfg.qobuz_user.empty()) {
+    // Try loading a cached OAuth token first; fall back to classic login only
+    // if there is no cached token. As of April 2026 Qobuz's /user/login endpoint
+    // is broken for third-party clients (cloud migration); OAuth is the only
+    // reliable path. The token is cached so login is a one-time interactive step.
+    std::string tok_file = tokenFilePath();
+    bool have_token = m_api->loadToken(tok_file);
+
+    if (!have_token && !m_cfg.qobuz_user.empty()) {
         if (m_api->login(m_cfg.qobuz_user, m_cfg.qobuz_pass))
             LOGINF("QcManager: Qobuz API login OK (user=" << m_cfg.qobuz_user << ")\n");
         else
-            LOGERR("QcManager: Qobuz API login FAILED — check credentials\n");
+            LOGERR("QcManager: Qobuz API login FAILED\n");
     }
 
     // ---- MPD controller ----------------------------------------------------
@@ -155,6 +214,39 @@ bool QcManager::start() {
     m_api->setLocalProxyBaseUrl("http://127.0.0.1:" +
                                 std::to_string(m_cfg.http_port) +
                                 "/qobuz-segmented");
+
+    // Register the OAuth redirect handler.  The browser is sent to a Qobuz login
+    // page; after login Qobuz redirects to http://<device>:<port>/oauth/callback
+    // which is handled here.  Token is cached so this is a one-time step.
+    m_http->setOAuthCallback([this, tok_file](const std::string& code) {
+        if (!m_api->oauthExchangeCode(code)) {
+            LOGERR("QcManager: OAuth code exchange failed\n");
+            return;
+        }
+        m_api->saveToken(tok_file);
+        // Reconnect to the Qobuz Connect cloud WebSocket with the new token
+        std::string ws_endpoint, ws_jwt;
+        if (m_api->fetchQwsToken(ws_endpoint, ws_jwt)) {
+            LOGINF("QcManager: cloud JWT obtained after OAuth — connecting\n");
+            ConnectCredentials cloud_creds;
+            cloud_creds.ws_endpoint = ws_endpoint;
+            cloud_creds.ws_jwt      = ws_jwt;
+            onConnect(std::move(cloud_creds));
+        }
+    });
+
+    // If not yet authenticated, print the OAuth URL so the user can log in.
+    if (m_api->userToken().empty() && !m_api->appId().empty()) {
+        std::string ip    = localIpAddr();
+        std::string redir = "http://" + ip + ":" + std::to_string(m_cfg.http_port)
+                            + "/oauth/callback";
+        std::string oauth_url = m_api->buildOAuthUrl(redir);
+        std::cout << "\n"
+                  << "  Not authenticated — open this URL in a browser to log in:\n\n"
+                  << "  \033[1;33m" << oauth_url << "\033[0m\n\n"
+                  << "  (after login this device will connect automatically)\n\n"
+                  << std::flush;
+    }
     m_queue_load_stop = false;
     m_queue_load_thread = std::thread(&QcManager::queueLoadLoop, this);
 
@@ -174,7 +266,7 @@ bool QcManager::start() {
     // JWT via POST /qws/createToken.  This makes the device visible from any
     // network without requiring the phone to be on the same LAN first.
     // mDNS continues to work as a fallback for same-network direct discovery.
-    if (!m_cfg.qobuz_user.empty()) {
+    if (!m_api->userToken().empty()) {
         std::string ws_endpoint, ws_jwt;
         if (m_api->fetchQwsToken(ws_endpoint, ws_jwt)) {
             LOGINF("QcManager: cloud JWT obtained — connecting to WebSocket\n");
@@ -186,7 +278,7 @@ bool QcManager::start() {
             LOGERR("QcManager: cloud JWT fetch failed — will connect when phone discovers via mDNS\n");
         }
     } else {
-        LOGINF("QcManager: no Qobuz credentials configured — waiting for mDNS discovery\n");
+        LOGINF("QcManager: no auth token — waiting for mDNS discovery or OAuth login\n");
     }
 
     m_running = true;
@@ -212,7 +304,9 @@ void QcManager::stop() {
         m_queue_item_ids.clear();
         m_track_local_paths.clear();
         m_track_sample_rates.clear();
+        m_track_titles.clear();
     }
+    removeAllMaterializedFiles();
 
     LOGINF("QcManager: stopped\n");
 }
@@ -299,6 +393,7 @@ void QcManager::onWsDisconnected() {
         m_queue_item_ids.clear();
         m_track_local_paths.clear();
         m_track_sample_rates.clear();
+        m_track_titles.clear();
     }
     if (m_mpd) m_mpd->stop();
     notifyUpmpdcli("STOPPED\n");
@@ -345,8 +440,11 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
     if (has_position) {
         // "Previous track" logic: the Qobuz app sends seek-to-0 for the back
         // button and expects the renderer to skip to the previous track when
-        // already near the start of the current one.
-        if (position_ms == 0) {
+        // already near the start of the current one.  Only applies when there
+        // is no explicit track switch in the same command (has_queue_item_id),
+        // so that normal track auto-advance (server sends position=0 + new
+        // queue_item_id) does not incorrectly go backwards.
+        if (position_ms == 0 && !current_item.has_queue_item_id) {
             MpdState st = m_mpd->getState();
             if (st.position_ms < 3000 && st.queue_pos > 0) {
                 m_mpd->previous();
@@ -381,8 +479,9 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
             m_queue_item_ids.clear();
             m_track_local_paths.clear();
             m_track_sample_rates.clear();
+            m_track_titles.clear();
         }
-        if (m_mpd) m_mpd->stop();
+        if (m_mpd) m_mpd->stopAndClear();
         return;
     }
 
@@ -406,6 +505,7 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
         m_queue_item_ids.clear();
         m_track_local_paths.clear();
         m_track_sample_rates.clear();
+        m_track_titles.clear();
     }
     uint64_t generation = m_queue_load_generation.fetch_add(1, std::memory_order_relaxed) + 1;
     {
@@ -422,8 +522,8 @@ void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
                                    uint32_t insert_after_item_id) {
     std::vector<uint64_t> item_ids;
     std::vector<int> sample_rates;
-    std::vector<std::string> local_paths;
-    auto urls = resolveStreamUrls(tracks, item_ids, sample_rates, local_paths);
+    std::vector<std::string> local_paths, titles;
+    auto urls = resolveStreamUrls(tracks, item_ids, sample_rates, local_paths, titles);
     if (urls.empty() || !m_mpd) return;
 
     // Find insert position in our mapping
@@ -436,25 +536,17 @@ void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
                 break;
             }
         }
-        // Insert new item_ids after insert_pos
-        if (insert_pos >= 0 && insert_pos + 1 <= static_cast<int>(m_queue_item_ids.size()))
-            m_queue_item_ids.insert(m_queue_item_ids.begin() + insert_pos + 1,
-                                     item_ids.begin(), item_ids.end());
-        else
-            m_queue_item_ids.insert(m_queue_item_ids.end(),
-                                     item_ids.begin(), item_ids.end());
-        if (insert_pos >= 0 && insert_pos + 1 <= static_cast<int>(m_track_sample_rates.size()))
-            m_track_sample_rates.insert(m_track_sample_rates.begin() + insert_pos + 1,
-                                        sample_rates.begin(), sample_rates.end());
-        else
-            m_track_sample_rates.insert(m_track_sample_rates.end(),
-                                        sample_rates.begin(), sample_rates.end());
-        if (insert_pos >= 0 && insert_pos + 1 <= static_cast<int>(m_track_local_paths.size()))
-            m_track_local_paths.insert(m_track_local_paths.begin() + insert_pos + 1,
-                                       local_paths.begin(), local_paths.end());
-        else
-            m_track_local_paths.insert(m_track_local_paths.end(),
-                                       local_paths.begin(), local_paths.end());
+        auto ins = [&](auto& vec, const auto& src) {
+            int pos = insert_pos;
+            if (pos >= 0 && pos + 1 <= static_cast<int>(vec.size()))
+                vec.insert(vec.begin() + pos + 1, src.begin(), src.end());
+            else
+                vec.insert(vec.end(), src.begin(), src.end());
+        };
+        ins(m_queue_item_ids,     item_ids);
+        ins(m_track_sample_rates, sample_rates);
+        ins(m_track_local_paths,  local_paths);
+        ins(m_track_titles,       titles);
     }
 
     int mpd_id = m_mpd->queueItemToMpdId(insert_after_item_id);
@@ -464,18 +556,16 @@ void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
 void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
     std::vector<uint64_t> item_ids;
     std::vector<int> sample_rates;
-    std::vector<std::string> local_paths;
-    auto urls = resolveStreamUrls(tracks, item_ids, sample_rates, local_paths);
+    std::vector<std::string> local_paths, titles;
+    auto urls = resolveStreamUrls(tracks, item_ids, sample_rates, local_paths, titles);
     if (urls.empty() || !m_mpd) return;
 
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        m_queue_item_ids.insert(m_queue_item_ids.end(),
-                                 item_ids.begin(), item_ids.end());
-        m_track_sample_rates.insert(m_track_sample_rates.end(),
-                                    sample_rates.begin(), sample_rates.end());
-        m_track_local_paths.insert(m_track_local_paths.end(),
-                                   local_paths.begin(), local_paths.end());
+        m_queue_item_ids.insert(m_queue_item_ids.end(), item_ids.begin(), item_ids.end());
+        m_track_sample_rates.insert(m_track_sample_rates.end(), sample_rates.begin(), sample_rates.end());
+        m_track_local_paths.insert(m_track_local_paths.end(), local_paths.begin(), local_paths.end());
+        m_track_titles.insert(m_track_titles.end(), titles.begin(), titles.end());
     }
     m_mpd->addTracks(urls);
 }
@@ -498,6 +588,8 @@ void QcManager::onTracksRemoved(const std::vector<uint64_t>& queue_item_ids) {
                     m_track_sample_rates.erase(m_track_sample_rates.begin() + idx);
                 if (idx < m_track_local_paths.size())
                     m_track_local_paths.erase(m_track_local_paths.begin() + idx);
+                if (idx < m_track_titles.size())
+                    m_track_titles.erase(m_track_titles.begin() + idx);
             }
         }
     }
@@ -520,16 +612,48 @@ void QcManager::onMpdState(const MpdState& st) {
     qrs.state.position_timestamp_ms = nowMs(); // record when we sampled this
     qrs.state.duration_ms          = st.duration_ms;
 
-    // Map MPD queue position to Qobuz queue_item_id
+    // Map MPD queue position to Qobuz queue_item_id; collect display info on track change.
+    std::string track_title, track_local_path;
     if (st.queue_pos >= 0) {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
         if (static_cast<size_t>(st.queue_pos) < m_queue_item_ids.size()) {
             qrs.state.current_queue_item_id = m_queue_item_ids[st.queue_pos];
             qrs.state.has_current_queue_item_id = true;
-            LOGDEB("QcManager: mpdState queue_pos=" << st.queue_pos
-                   << " -> qitem=" << qrs.state.current_queue_item_id
-                   << " (map size=" << m_queue_item_ids.size() << ")\n");
         }
+        if (st.queue_pos != m_last_mpd_queue_pos.load() &&
+            st.status == MpdState::Status::PLAY) {
+            if (static_cast<size_t>(st.queue_pos) < m_track_titles.size())
+                track_title = m_track_titles[st.queue_pos];
+            if (static_cast<size_t>(st.queue_pos) < m_track_local_paths.size())
+                track_local_path = m_track_local_paths[st.queue_pos];
+        }
+    }
+    // Print now-playing outside the lock (popen/cout can be slow)
+    if (!track_title.empty()) {
+        std::cout << "\033[1;32m▶  " << track_title << "\033[0m\n";
+        if (!track_local_path.empty()) {
+            // Shell-escape the path for popen
+            std::string cmd = "file -b -- '";
+            for (char c : track_local_path) {
+                if (c == '\'') cmd += "'\\''";
+                else cmd += c;
+            }
+            cmd += "' 2>/dev/null";
+            FILE* fp = popen(cmd.c_str(), "r");
+            if (fp) {
+                char buf[512];
+                std::string file_info;
+                while (fgets(buf, sizeof(buf), fp)) file_info += buf;
+                pclose(fp);
+                while (!file_info.empty() &&
+                       (file_info.back() == '\n' || file_info.back() == '\r'))
+                    file_info.pop_back();
+                if (!file_info.empty())
+                    std::cout << "   \033[2m" << file_info << "\033[0m\n";
+            }
+            std::cout << "   \033[2m" << track_local_path << "\033[0m\n";
+        }
+        std::cout << std::flush;
     }
 
     switch (st.status) {
@@ -541,7 +665,7 @@ void QcManager::onMpdState(const MpdState& st) {
         {
             bool new_play_context =
                 (m_last_mpd_status != MpdState::Status::PLAY) ||
-                (st.queue_pos != m_last_mpd_queue_pos);
+                (st.queue_pos != m_last_mpd_queue_pos.load());
             if (new_play_context) {
                 m_play_progress_samples = 0;
                 m_playback_ready = false;
@@ -593,7 +717,7 @@ void QcManager::onMpdState(const MpdState& st) {
     cleanupPlayedMaterializedFiles(st.queue_pos);
 
     m_last_mpd_status = st.status;
-    m_last_mpd_queue_pos = st.queue_pos;
+    m_last_mpd_queue_pos.store(st.queue_pos);
     m_last_mpd_pos_ms = st.position_ms;
 }
 
@@ -603,7 +727,9 @@ std::vector<std::string> QcManager::resolveStreamUrls(
     const std::vector<QueueTrack>& tracks,
     std::vector<uint64_t>& out_item_ids,
     std::vector<int>& out_sample_rates,
-    std::vector<std::string>& out_local_paths) {
+    std::vector<std::string>& out_local_paths,
+    std::vector<std::string>& out_titles,
+    uint64_t generation) {
     std::vector<std::string> urls;
     urls.reserve(tracks.size());
     out_item_ids.clear();
@@ -612,26 +738,44 @@ std::vector<std::string> QcManager::resolveStreamUrls(
     out_sample_rates.reserve(tracks.size());
     out_local_paths.clear();
     out_local_paths.reserve(tracks.size());
+    out_titles.clear();
+    out_titles.reserve(tracks.size());
     for (const auto& t : tracks) {
+        if (queueLoadAborted(generation))
+            break;
         TrackStreamInfo info;
         if (m_api->getStreamUrl(t.track_id, m_cfg.format_id, info) &&
             !info.stream_url.empty()) {
+            if (queueLoadAborted(generation)) {
+                removeMaterializedFile(info.local_path);
+                break;
+            }
             urls.push_back(info.stream_url);
             out_item_ids.push_back(t.queue_item_id);
             out_sample_rates.push_back(info.sampling_rate);
             out_local_paths.push_back(info.local_path);
-            LOGDEB("QcManager:   resolved track " << t.track_id
-                   << " " << info.sampling_rate << "Hz/"
-                   << (info.bit_depth > 0 ?
-                          (std::to_string(info.bit_depth) + "bit") :
-                          "(unspecified)")
-                   << "\n");
+            // Title is set by materializeSegmentedTrack for segmented tracks;
+            // empty for direct-URL tracks (filled later in queueLoadLoop).
+            std::string label;
+            if (!info.artist.empty() || !info.title.empty()) {
+                label = info.artist.empty() ? info.title
+                                            : info.artist + " - " + info.title;
+            }
+            out_titles.push_back(std::move(label));
         } else {
             LOGERR("QcManager: could not get stream URL for track "
                    << t.track_id << " (qitem=" << t.queue_item_id << ")\n");
         }
     }
     return urls;
+}
+
+bool QcManager::queueLoadAborted(uint64_t generation) const {
+    if (m_queue_load_stop.load(std::memory_order_relaxed))
+        return true;
+    if (generation == 0)
+        return false;
+    return generation != m_queue_load_generation.load(std::memory_order_relaxed);
 }
 
 void QcManager::queueLoadLoop() {
@@ -649,10 +793,18 @@ void QcManager::queueLoadLoop() {
             m_pending_queue_load.pending = false;
         }
 
+        const size_t initial_track_count =
+            std::min(req.tracks.size(),
+                     std::max<size_t>(kInitialQueuePrefetchTracks,
+                                      static_cast<size_t>(req.start_idx) + 1));
+
         std::vector<uint64_t> item_ids;
         std::vector<int> sample_rates;
-        std::vector<std::string> local_paths;
-        auto urls = resolveStreamUrls(req.tracks, item_ids, sample_rates, local_paths);
+        std::vector<std::string> local_paths, titles;
+        auto urls = resolveStreamUrls(
+            std::vector<QueueTrack>(req.tracks.begin(),
+                                    req.tracks.begin() + initial_track_count),
+            item_ids, sample_rates, local_paths, titles, req.generation);
         if (req.generation != m_queue_load_generation.load(std::memory_order_relaxed)) {
             cleanupMaterializedFiles(local_paths);
             LOGINF("QcManager: queue load superseded while resolving streams\n");
@@ -678,9 +830,10 @@ void QcManager::queueLoadLoop() {
         {
             std::lock_guard<std::mutex> lk(m_qmap_mutex);
             cleanupMaterializedFiles(m_track_local_paths);
-            m_queue_item_ids = item_ids;
+            m_queue_item_ids    = item_ids;
             m_track_sample_rates = sample_rates;
-            m_track_local_paths = local_paths;
+            m_track_local_paths  = local_paths;
+            m_track_titles       = titles;
         }
 
         if (!m_mpd->loadQueue(urls, mpd_start)) {
@@ -693,11 +846,100 @@ void QcManager::queueLoadLoop() {
             if (static_cast<size_t>(mpd_start) < m_track_sample_rates.size())
                 m_ws->reportFileQuality(m_track_sample_rates[mpd_start]);
         }
+
+        // Fetch titles for initial tracks that don't have one yet (direct-URL tracks;
+        // segmented tracks already got their title from materializeSegmentedTrack).
+        // Runs after loadQueue so MPD is already playing.
+        for (size_t i = 0; i < initial_track_count; ++i) {
+            if (queueLoadAborted(req.generation)) break;
+            bool need_title;
+            {
+                std::lock_guard<std::mutex> lk(m_qmap_mutex);
+                need_title = i < m_track_titles.size() && m_track_titles[i].empty();
+            }
+            if (!need_title) continue;
+            TrackMeta meta;
+            if (!m_api->getTrackMeta(req.tracks[i].track_id, meta)) continue;
+            std::string label = meta.artist.empty() ? meta.title
+                                                    : meta.artist + " - " + meta.title;
+            bool print_now = false;
+            {
+                std::lock_guard<std::mutex> lk(m_qmap_mutex);
+                if (i < m_track_titles.size() && m_track_titles[i].empty()) {
+                    m_track_titles[i] = label;
+                    print_now = (m_last_mpd_queue_pos.load() == static_cast<int>(i))
+                                && !label.empty();
+                }
+            }
+            if (print_now)
+                std::cout << "\033[1;32m▶  " << label << "\033[0m\n" << std::flush;
+        }
+
+        if (initial_track_count >= req.tracks.size())
+            continue;
+
+        std::vector<uint64_t> add_item_ids;
+        std::vector<int> add_sample_rates;
+        std::vector<std::string> add_local_paths, add_titles;
+        auto add_urls = resolveStreamUrls(
+            std::vector<QueueTrack>(req.tracks.begin() + initial_track_count,
+                                    req.tracks.end()),
+            add_item_ids, add_sample_rates, add_local_paths, add_titles, req.generation);
+        if (req.generation != m_queue_load_generation.load(std::memory_order_relaxed)) {
+            cleanupMaterializedFiles(add_local_paths);
+            LOGINF("QcManager: queue load superseded while resolving remaining streams\n");
+            continue;
+        }
+        if (add_urls.empty())
+            continue;
+
+        {
+            std::lock_guard<std::mutex> lk(m_qmap_mutex);
+            m_queue_item_ids.insert(m_queue_item_ids.end(), add_item_ids.begin(), add_item_ids.end());
+            m_track_sample_rates.insert(m_track_sample_rates.end(), add_sample_rates.begin(), add_sample_rates.end());
+            m_track_local_paths.insert(m_track_local_paths.end(), add_local_paths.begin(), add_local_paths.end());
+            m_track_titles.insert(m_track_titles.end(), add_titles.begin(), add_titles.end());
+        }
+        if (!m_mpd->addTracks(add_urls)) {
+            LOGERR("QcManager: MPD addTracks failed for deferred queue tail\n");
+            cleanupMaterializedFiles(add_local_paths);
+            continue;
+        }
+
+        // Fetch titles for tail tracks that don't have one yet.
+        size_t tail_count = add_urls.size();
+        for (size_t i = 0; i < tail_count; ++i) {
+            if (queueLoadAborted(req.generation)) break;
+            size_t map_idx = initial_track_count + i;
+            size_t track_idx = initial_track_count + i;
+            bool need_title;
+            {
+                std::lock_guard<std::mutex> lk(m_qmap_mutex);
+                need_title = map_idx < m_track_titles.size() && m_track_titles[map_idx].empty();
+            }
+            if (!need_title) continue;
+            TrackMeta meta;
+            if (!m_api->getTrackMeta(req.tracks[track_idx].track_id, meta)) continue;
+            std::string label = meta.artist.empty() ? meta.title
+                                                    : meta.artist + " - " + meta.title;
+            bool print_now = false;
+            {
+                std::lock_guard<std::mutex> lk(m_qmap_mutex);
+                if (map_idx < m_track_titles.size() && m_track_titles[map_idx].empty()) {
+                    m_track_titles[map_idx] = label;
+                    print_now = (m_last_mpd_queue_pos.load() == static_cast<int>(map_idx))
+                                && !label.empty();
+                }
+            }
+            if (print_now)
+                std::cout << "\033[1;32m▶  " << label << "\033[0m\n" << std::flush;
+        }
     }
 }
 
 void QcManager::stopQueueLoadWorker() {
     m_queue_load_stop = true;
+    m_queue_load_generation.fetch_add(1, std::memory_order_relaxed);
     m_queue_load_cv.notify_all();
     if (m_queue_load_thread.joinable())
         m_queue_load_thread.join();

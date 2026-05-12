@@ -256,6 +256,17 @@ bool MpdCtl::stop() {
     return ok;
 }
 
+bool MpdCtl::stopAndClear() {
+    std::lock_guard<std::mutex> lk(m_conn_mutex);
+    if (!ensureConnected()) return false;
+    bool ok = mpd_run_stop(m_conn);
+    ok = mpd_run_clear(m_conn) && ok;
+    m_saved_queue = SavedQueue{};
+    m_queue_saved = false;
+    clearQueueItemMap();
+    return ok;
+}
+
 bool MpdCtl::seek(uint32_t position_ms) {
     std::lock_guard<std::mutex> lk(m_conn_mutex);
     for (int attempt = 0; attempt < 2; ++attempt) {

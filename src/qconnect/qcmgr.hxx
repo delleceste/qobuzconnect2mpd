@@ -127,7 +127,10 @@ private:
         const std::vector<QueueTrack>& tracks,
         std::vector<uint64_t>& out_item_ids,
         std::vector<int>& out_sample_rates,
-        std::vector<std::string>& out_local_paths);
+        std::vector<std::string>& out_local_paths,
+        std::vector<std::string>& out_titles,
+        uint64_t generation = 0);
+    bool queueLoadAborted(uint64_t generation) const;
 
     // Look up Qobuz queue_item_id from MPD queue position.
     uint64_t queueItemIdAt(int mpd_pos) const;
@@ -155,7 +158,7 @@ private:
     // Startup synchronization gate: only switch to buffer_state=OK once MPD
     // shows sustained position progression on the current track.
     MpdState::Status   m_last_mpd_status{MpdState::Status::UNKNOWN};
-    int                m_last_mpd_queue_pos{-1};
+    std::atomic<int>   m_last_mpd_queue_pos{-1};
     uint32_t           m_last_mpd_pos_ms{0};
     int                m_play_progress_samples{0};
     bool               m_playback_ready{false};
@@ -165,6 +168,7 @@ private:
     std::vector<uint64_t>     m_queue_item_ids;
     std::vector<int>          m_track_sample_rates; // Hz, parallel to m_queue_item_ids
     std::vector<std::string>  m_track_local_paths;  // local materialized FLAC paths
+    std::vector<std::string>  m_track_titles;        // "Artist - Title", parallel to m_queue_item_ids
 
     struct PendingQueueLoad {
         std::vector<QueueTrack> tracks;

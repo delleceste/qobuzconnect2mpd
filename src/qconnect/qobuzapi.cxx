@@ -34,8 +34,10 @@
 #include <cstring>
 #include <map>
 #include <algorithm>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <thread>
 #include <iomanip>
 #include <openssl/evp.h>
@@ -44,6 +46,44 @@
 #include <sstream>
 
 namespace QConnect {
+
+namespace {
+
+// On slower systems MPD can start consuming the first track before background
+// materialization gets far enough ahead, which may make playback stop at the
+// current end of the local file. Prefetch a larger initial window before
+// exposing the stream to MPD.
+constexpr size_t kInitialSegmentPrefetchCount = 12;
+// Allow two concurrent background materializations so that track N+1 can
+// finish downloading its tail while track N is still playing, without waiting
+// for a single global slot.
+constexpr size_t kMaxConcurrentBackgroundMaterializations = 2;
+
+std::mutex g_materialize_mutex;
+std::condition_variable g_materialize_cv;
+size_t g_background_materializers = 0;
+
+class BackgroundMaterializationSlot {
+public:
+    BackgroundMaterializationSlot() {
+        std::unique_lock<std::mutex> lk(g_materialize_mutex);
+        g_materialize_cv.wait(lk, [] {
+            return g_background_materializers < kMaxConcurrentBackgroundMaterializations;
+        });
+        ++g_background_materializers;
+    }
+
+    ~BackgroundMaterializationSlot() {
+        {
+            std::lock_guard<std::mutex> lk(g_materialize_mutex);
+            if (g_background_materializers > 0)
+                --g_background_materializers;
+        }
+        g_materialize_cv.notify_one();
+    }
+};
+
+} // namespace
 
 // ---- Helpers ----------------------------------------------------------------
 
@@ -333,30 +373,53 @@ QobuzApi::QobuzApi(const std::string& api_base_url,
         m_base_url.pop_back();
 }
 
+static std::string md5Hex(const std::string& s) {
+    uint8_t digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_md5(), nullptr);
+    EVP_DigestUpdate(ctx, s.data(), s.size());
+    EVP_DigestFinal_ex(ctx, digest, &digest_len);
+    EVP_MD_CTX_free(ctx);
+    return hexString(digest, digest_len);
+}
+
 bool QobuzApi::login(const std::string& user, const std::string& pass) {
     if (user.empty() || pass.empty()) return false;
 
-    std::string path = "/user/login?username=" + user + "&password=" + pass
-                       + "&app_id=" + m_app_id;
-    std::string resp = httpGet(path);
-    if (resp.empty()) return false;
+    // Try plain password first, then MD5-hashed password_auth as fallback.
+    // Note: as of early April 2026 Qobuz's /user/login endpoint is returning
+    // 401 for all third-party clients due to a cloud infrastructure migration.
+    // This is a Qobuz-side issue (see streamrip#954); we try both forms so we
+    // automatically recover when Qobuz resolves it.
+    struct LoginVariant { const char* pass_param; std::string pass_value; };
+    const LoginVariant kTries[] = {
+        {"password",      pass},
+        {"password_auth", md5Hex(pass)},
+    };
 
-    Json::Value root;
-    Json::CharReaderBuilder rdr;
-    std::string errs;
-    std::istringstream ss(resp);
-    if (!Json::parseFromStream(rdr, ss, &root, &errs)) {
-        LOGERR("QobuzApi::login: JSON parse error: " << errs << "\n");
-        return false;
+    for (const auto& v : kTries) {
+        std::string path = "/user/login?username=" + user
+                           + "&" + v.pass_param + "=" + v.pass_value
+                           + "&app_id=" + m_app_id;
+        long http_code = 0;
+        std::string resp = httpGet(path, &http_code);
+        if (resp.empty()) {
+            LOGDEB("QobuzApi::login: " << v.pass_param << " attempt HTTP " << http_code << "\n");
+            continue;
+        }
+        Json::Value root;
+        Json::CharReaderBuilder rdr;
+        std::string errs;
+        std::istringstream ss(resp);
+        if (!Json::parseFromStream(rdr, ss, &root, &errs)) continue;
+        m_user_token = root.get("user_auth_token", "").asString();
+        if (m_user_token.empty()) continue;
+        LOGINF("QobuzApi::login: ok via " << v.pass_param << "\n");
+        return true;
     }
-
-    m_user_token = root.get("user_auth_token", "").asString();
-    if (m_user_token.empty()) {
-        LOGERR("QobuzApi::login: no user_auth_token in response\n");
-        return false;
-    }
-    LOGDEB("QobuzApi::login: ok\n");
-    return true;
+    LOGERR("QobuzApi::login: failed (Qobuz cloud migration in progress — mDNS path still works)\n");
+    return false;
 }
 
 std::string QobuzApi::buildRequestSignature(const std::string& method_prefix,
@@ -383,28 +446,39 @@ bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
                               TrackStreamInfo& out) {
     bool refreshed_credentials = false;
 retry_after_refresh:
-    if (!ensureStreamSession()) {
-        if (!refreshed_credentials && fetchAppCredentials()) {
-            m_app_secret.clear();
-            m_stream_session_id.clear();
-            m_stream_session_expires_at = 0;
-            refreshed_credentials = true;
-            goto retry_after_refresh;
-        }
-        LOGERR("QobuzApi: unable to establish stream session for /file/url\n");
-        return false;
+    bool have_stream_session = ensureStreamSession();
+    if (!have_stream_session) {
+        LOGERR("QobuzApi: unable to establish stream session for /file/url, will try legacy endpoint\n");
     }
 
-    // Try requested format, then fall back to lower qualities via /file/url only.
+    // Try requested format, then fall back to lower qualities. Prefer the new
+    // /file/url API, but keep the legacy endpoint as a fallback because Qobuz
+    // changes this flow often and the renderer is useless if no URL reaches MPD.
     static const int fallback_fmts[] = {27, 7, 6, 5};
     for (int fmt : fallback_fmts) {
         if (fmt > format_id) continue;
 
         long file_code = 0;
-        if (tryFileUrl(track_id, fmt, out, &file_code))
+        if (have_stream_session) {
+            if (tryFileUrl(track_id, fmt, out, &file_code))
+                return true;
+            if (file_code == 400 && !refreshed_credentials) {
+                LOGINF("QobuzApi: /file/url signature rejected; refreshing app credentials and retrying\n");
+                if (fetchAppCredentials()) {
+                    m_app_secret.clear();
+                    m_stream_session_id.clear();
+                    m_stream_session_expires_at = 0;
+                    refreshed_credentials = true;
+                    goto retry_after_refresh;
+                }
+            }
+        }
+
+        long legacy_code = 0;
+        if (tryGetStreamUrl(track_id, fmt, out, &legacy_code))
             return true;
-        if (file_code == 400 && !refreshed_credentials) {
-            LOGINF("QobuzApi: /file/url signature rejected; refreshing app credentials and retrying\n");
+        if (legacy_code == 400 && !refreshed_credentials) {
+            LOGINF("QobuzApi: legacy getFileUrl signature rejected; refreshing app credentials and retrying\n");
             if (fetchAppCredentials()) {
                 m_app_secret.clear();
                 m_stream_session_id.clear();
@@ -582,10 +656,10 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
     if (!unwrapContentKey(session_key, keystr, content_key)) return false;
 
     fs::create_directories("/tmp/qconnect2mpd-segmented");
-    std::string file_name = std::to_string(track_id) + "_" +
-                            std::to_string(format_id) + "_" +
-                            std::to_string(unixTimestamp()) + ".flac";
-    std::string final_path = "/tmp/qconnect2mpd-segmented/" + file_name;
+    std::string rel_path = std::to_string(track_id) + "_" +
+                           std::to_string(format_id) + "_" +
+                           std::to_string(unixTimestamp()) + ".flac";
+    std::string final_path = "/tmp/qconnect2mpd-segmented/" + rel_path;
     std::string marker_path = final_path + ".inprogress";
 
     std::ofstream marker(marker_path, std::ios::binary);
@@ -603,25 +677,33 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
         ofs.close();
         fs::remove(marker_path);
     } else {
-        std::vector<uint8_t> seg1;
-        if (!fetchBinaryUrl(std::regex_replace(urltpl, std::regex("\\$SEGMENT\\$"), "1"), hdrs, seg1) ||
-            !appendMaterializedSegment(ofs, seg1, content_key)) {
-            ofs.close();
-            fs::remove(final_path);
-            fs::remove(marker_path);
-            return false;
+        const size_t prefetched_segments =
+            std::min(n_audio, kInitialSegmentPrefetchCount);
+        for (size_t i = 1; i <= prefetched_segments; ++i) {
+            std::vector<uint8_t> seg;
+            if (!fetchBinaryUrl(std::regex_replace(urltpl, std::regex("\\$SEGMENT\\$"),
+                                                   std::to_string(i)), hdrs, seg) ||
+                !appendMaterializedSegment(ofs, seg, content_key)) {
+                ofs.close();
+                fs::remove(final_path);
+                fs::remove(marker_path);
+                return false;
+            }
         }
         ofs.close();
 
-        if (n_audio > 1) {
-            std::thread([urltpl, hdrs, final_path, marker_path, n_audio, content_key]() {
+        if (n_audio > prefetched_segments) {
+            const size_t next_segment = prefetched_segments + 1;
+            std::thread([urltpl, hdrs, final_path, marker_path,
+                         next_segment, n_audio, content_key]() {
                 namespace fs = std::filesystem;
+                BackgroundMaterializationSlot slot;
                 std::ofstream append(final_path, std::ios::binary | std::ios::app);
                 if (!append) {
                     fs::remove(marker_path);
                     return;
                 }
-                for (size_t i = 2; i <= n_audio; ++i) {
+                for (size_t i = next_segment; i <= n_audio; ++i) {
                     std::vector<uint8_t> seg;
                     if (!fetchBinaryUrl(std::regex_replace(urltpl, std::regex("\\$SEGMENT\\$"),
                                                            std::to_string(i)), hdrs, seg) ||
@@ -639,7 +721,7 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
         }
     }
 
-    out.stream_url = m_local_proxy_base_url + "/" + file_name;
+    out.stream_url = m_local_proxy_base_url + "/" + rel_path;
     out.local_path = final_path;
     out.mime_type = "audio/flac";
     out.format_id = root.get("format_id", format_id).asInt();
@@ -648,6 +730,66 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
     out.sampling_rate = (sr < 1000) ? static_cast<int>(sr * 1000) : static_cast<int>(sr);
     out.bit_depth = root.isMember("bit_depth") ? root["bit_depth"].asInt() : -1;
     LOGINF("QobuzApi: started segmented materialization at " << final_path << "\n");
+    return true;
+}
+
+bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
+                                TrackStreamInfo& out, long* http_code) {
+    auto do_call = [&](uint64_t ts, long* code_out) {
+        static const std::string method_prefix = "trackgetFileUrl";
+        LOGDEB("QobuzApi: getFileUrl signing method=" << method_prefix
+               << " track_id=" << track_id
+               << " fmt=" << format_id
+               << " ts=" << ts << "\n");
+
+        std::map<std::string, std::string> sigargs;
+        sigargs["format_id"] = std::to_string(format_id);
+        sigargs["intent"] = "stream";
+        sigargs["track_id"] = std::to_string(track_id);
+        std::string sig = buildRequestSignature(method_prefix, sigargs, ts);
+
+        std::string path = "/track/getFileUrl"
+                           "?track_id="  + std::to_string(track_id)
+                         + "&format_id=" + std::to_string(format_id)
+                         + "&intent=stream"
+                         + "&request_ts="  + std::to_string(ts)
+                         + "&request_sig=" + sig
+                         + "&app_id="    + m_app_id;
+        return httpGet(path, code_out);
+    };
+
+    long code = 0;
+    uint64_t ts = unixTimestamp();
+    std::string resp = do_call(ts, &code);
+    if (!resp.empty()) {
+        LOGDEB("QobuzApi: getFileUrl succeeded with method=trackgetFileUrl"
+               << " (HTTP " << code << ")\n");
+    }
+    if (http_code) *http_code = code;
+    if (resp.empty()) return false;
+
+    Json::Value root;
+    Json::CharReaderBuilder rdr;
+    std::string errs;
+    std::istringstream ss(resp);
+    if (!Json::parseFromStream(rdr, ss, &root, &errs)) {
+        LOGERR("QobuzApi::getStreamUrl: JSON parse error: " << errs << "\n");
+        return false;
+    }
+
+    out.stream_url    = root.get("url", "").asString();
+    out.mime_type     = root.get("mime_type", "audio/flac").asString();
+    out.format_id     = root.get("format_id", format_id).asInt();
+    out.duration_ms   = root.get("duration", 0).asUInt() * 1000;
+    double sr = root.get("sampling_rate", 44.1).asDouble();
+    out.sampling_rate = (sr < 1000) ? static_cast<int>(sr * 1000) : static_cast<int>(sr);
+    out.bit_depth     = root.isMember("bit_depth") ? root["bit_depth"].asInt() : -1;
+
+    if (out.stream_url.empty()) {
+        LOGERR("QobuzApi::getStreamUrl: no url in response for track "
+               << track_id << "\n");
+        return false;
+    }
     return true;
 }
 
@@ -746,6 +888,73 @@ static std::string base64urlDecode(const std::string& in) {
     outlen -= static_cast<int>(total_pad);
     if (outlen < 0) return {};
     return std::string(reinterpret_cast<char*>(buf.data()), outlen);
+}
+
+// ---- OAuth login ------------------------------------------------------------
+
+bool QobuzApi::oauthExchangeCode(const std::string& code) {
+    // Private key is hardcoded in the Qobuz player (extracted from qobuz-player v0.9.0).
+    static const std::string kPrivateKey = "6lz8C03UDIC7";
+    std::string path = "/oauth/callback?code=" + code + "&private_key=" + kPrivateKey;
+    std::string resp = httpGet(path);
+    if (resp.empty()) {
+        LOGERR("QobuzApi::oauthExchangeCode: empty response\n");
+        return false;
+    }
+    Json::Value root;
+    Json::CharReaderBuilder rdr;
+    std::string errs;
+    std::istringstream ss(resp);
+    if (!Json::parseFromStream(rdr, ss, &root, &errs)) {
+        LOGERR("QobuzApi::oauthExchangeCode: JSON parse error: " << errs << "\n");
+        return false;
+    }
+    // Response has either "token" or "user_auth_token"
+    std::string tok = root.get("token", "").asString();
+    if (tok.empty()) tok = root.get("user_auth_token", "").asString();
+    if (tok.empty()) {
+        LOGERR("QobuzApi::oauthExchangeCode: no token in response: "
+               << resp.substr(0, 300) << "\n");
+        return false;
+    }
+    m_user_token = tok;
+    LOGINF("QobuzApi::oauthExchangeCode: user_auth_token obtained\n");
+    return true;
+}
+
+std::string QobuzApi::buildOAuthUrl(const std::string& redirect_url) const {
+    return "https://www.qobuz.com/signin/oauth?ext_app_id=" + m_app_id
+           + "&redirect_url=" + redirect_url;
+}
+
+bool QobuzApi::saveToken(const std::string& path) const {
+    if (m_user_token.empty() || path.empty()) return false;
+    namespace fs = std::filesystem;
+    fs::path p(path);
+    if (p.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(p.parent_path(), ec);
+    }
+    std::ofstream f(path);
+    if (!f) {
+        LOGERR("QobuzApi::saveToken: cannot write " << path << "\n");
+        return false;
+    }
+    f << m_user_token;
+    LOGINF("QobuzApi: token saved to " << path << "\n");
+    return true;
+}
+
+bool QobuzApi::loadToken(const std::string& path) {
+    if (path.empty()) return false;
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string tok;
+    std::getline(f, tok);
+    if (tok.empty()) return false;
+    m_user_token = tok;
+    LOGINF("QobuzApi: token loaded from " << path << "\n");
+    return true;
 }
 
 // ---- fetchAppCredentials ----------------------------------------------------
@@ -943,6 +1152,8 @@ std::string QobuzApi::httpPostForm(const std::string& path,
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
     struct curl_slist* hdrs = nullptr;
+    hdrs = curl_slist_append(hdrs, "Origin: https://play.qobuz.com");
+    hdrs = curl_slist_append(hdrs, "Referer: https://play.qobuz.com/");
     std::string appHdr = "X-App-Id: " + m_app_id;
     hdrs = curl_slist_append(hdrs, appHdr.c_str());
     if (!m_user_token.empty()) {
@@ -986,20 +1197,26 @@ std::string QobuzApi::httpGet(const std::string& path, long* http_code_out) {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT,
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
 
-    // Build auth header: use user_auth_token from login()
+    // Build auth headers. X-App-Id is sent on every request;
+    // Origin/Referer mimic a web-player request so the server accepts the web-player app_id.
+    // X-User-Auth-Token is added only after login.
     // (JWT from the Qobuz app is for the WebSocket, not the REST API)
     struct curl_slist* hdrs = nullptr;
-    std::string authHdr;
-    if (!m_user_token.empty()) {
-        authHdr = "X-User-Auth-Token: " + m_user_token;
-    }
-    if (!authHdr.empty()) {
-        hdrs = curl_slist_append(hdrs, authHdr.c_str());
+    hdrs = curl_slist_append(hdrs, "Origin: https://play.qobuz.com");
+    hdrs = curl_slist_append(hdrs, "Referer: https://play.qobuz.com/");
+    if (!m_app_id.empty()) {
         std::string appHdr = "X-App-Id: " + m_app_id;
         hdrs = curl_slist_append(hdrs, appHdr.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     }
+    if (!m_user_token.empty()) {
+        std::string authHdr = "X-User-Auth-Token: " + m_user_token;
+        hdrs = curl_slist_append(hdrs, authHdr.c_str());
+    }
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
 
     CURLcode rc = curl_easy_perform(curl);
     if (rc != CURLE_OK) {

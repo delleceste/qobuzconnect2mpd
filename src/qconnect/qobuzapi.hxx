@@ -42,6 +42,8 @@ struct TrackStreamInfo {
     uint32_t    duration_ms{0};
     int         sampling_rate{44100}; // Hz (e.g. 44100, 96000, 192000)
     int         bit_depth{-1};       // bits (e.g. 16, 24), -1 when unspecified
+    std::string title;
+    std::string artist;
 };
 
 struct TrackMeta {
@@ -68,8 +70,27 @@ public:
     // Calls /user/login and stores the user_auth_token.
     bool login(const std::string& user, const std::string& pass);
 
-    // Return the user_auth_token obtained from login() (empty if not logged in).
-    // This token can be used as ws_jwt to authenticate the WebSocket session.
+    // OAuth2 flow: exchange the code_autorisation parameter from the Qobuz
+    // OAuth redirect URL for a user_auth_token. This is the only login method
+    // that works reliably as of April 2026 (Qobuz deprecated /user/login).
+    //
+    // The OAuth URL that the user should open in a browser is built with
+    // buildOAuthUrl(). After login Qobuz redirects to the redirect_url with
+    // ?code_autorisation=... appended; pass that code here.
+    bool oauthExchangeCode(const std::string& code);
+
+    // Build the Qobuz OAuth browser login URL.
+    // redirect_url: the URL Qobuz will redirect to after login, e.g.
+    //   "http://192.168.1.5:9093/oauth/callback"
+    std::string buildOAuthUrl(const std::string& redirect_url) const;
+
+    // Persist the user_auth_token to a file so it survives restarts.
+    bool saveToken(const std::string& path) const;
+    // Load a previously saved user_auth_token. Returns true on success.
+    bool loadToken(const std::string& path);
+
+    // Return the user_auth_token obtained from login() or oauthExchangeCode()
+    // (empty if not logged in).
     const std::string& userToken() const { return m_user_token; }
 
     // Return the app_id (set via constructor or fetched from bundle.js).
@@ -104,6 +125,8 @@ private:
     bool startStreamSession();
     bool tryFileUrl(uint32_t track_id, int format_id, TrackStreamInfo& out,
                     long* http_code = nullptr);
+    bool tryGetStreamUrl(uint32_t track_id, int format_id, TrackStreamInfo& out,
+                         long* http_code = nullptr);
     bool materializeSegmentedTrack(const Json::Value& root, uint32_t track_id,
                                    int format_id, TrackStreamInfo& out);
     std::string httpGet(const std::string& path,
