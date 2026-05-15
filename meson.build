@@ -210,8 +210,8 @@ systemd_unit = configure_file(
   configuration: systemd_conf,
 )
 
-install_data(systemd_unit, install_dir: join_paths(get_option('prefix'), 'lib/systemd/system'))
-install_data('conf/qobuzconnect2mpd.conf', install_dir: '/etc')
+install_data(systemd_unit, install_dir: get_option('datadir') / 'systemd/user')
+install_data('conf/qobuzconnect2mpd.conf', install_dir: get_option('sysconfdir') / 'qobuzconnect2mpd')
 
 #upmpdcli_data = files(
 #  'src/AVTransport.xml',
