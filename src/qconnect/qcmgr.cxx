@@ -50,6 +50,31 @@ constexpr size_t kInitialQueuePrefetchTracks = 2;
 
 }
 
+static void printNowPlaying(const std::string& title, const std::string& local_path) {
+    std::cout << "\033[1;32m▶  " << title << "\033[0m\n";
+    if (!local_path.empty()) {
+        std::string cmd = "file -b -- '";
+        for (char c : local_path) {
+            if (c == '\'') cmd += "'\\''";
+            else cmd += c;
+        }
+        cmd += "' 2>/dev/null";
+        FILE* fp = popen(cmd.c_str(), "r");
+        if (fp) {
+            char buf[512];
+            std::string info;
+            while (fgets(buf, sizeof(buf), fp)) info += buf;
+            pclose(fp);
+            while (!info.empty() && (info.back() == '\n' || info.back() == '\r'))
+                info.pop_back();
+            if (!info.empty())
+                std::cout << "   \033[2m" << info << "\033[0m\n";
+        }
+        std::cout << "   \033[2m" << local_path << "\033[0m\n";
+    }
+    std::cout << std::flush;
+}
+
 static void removeMaterializedFile(const std::string& path) {
     if (path.empty()) return;
     namespace fs = std::filesystem;
@@ -629,32 +654,8 @@ void QcManager::onMpdState(const MpdState& st) {
         }
     }
     // Print now-playing outside the lock (popen/cout can be slow)
-    if (!track_title.empty()) {
-        std::cout << "\033[1;32m▶  " << track_title << "\033[0m\n";
-        if (!track_local_path.empty()) {
-            // Shell-escape the path for popen
-            std::string cmd = "file -b -- '";
-            for (char c : track_local_path) {
-                if (c == '\'') cmd += "'\\''";
-                else cmd += c;
-            }
-            cmd += "' 2>/dev/null";
-            FILE* fp = popen(cmd.c_str(), "r");
-            if (fp) {
-                char buf[512];
-                std::string file_info;
-                while (fgets(buf, sizeof(buf), fp)) file_info += buf;
-                pclose(fp);
-                while (!file_info.empty() &&
-                       (file_info.back() == '\n' || file_info.back() == '\r'))
-                    file_info.pop_back();
-                if (!file_info.empty())
-                    std::cout << "   \033[2m" << file_info << "\033[0m\n";
-            }
-            std::cout << "   \033[2m" << track_local_path << "\033[0m\n";
-        }
-        std::cout << std::flush;
-    }
+    if (!track_title.empty())
+        printNowPlaying(track_title, track_local_path);
 
     switch (st.status) {
     case MpdState::Status::PLAY:
@@ -862,6 +863,7 @@ void QcManager::queueLoadLoop() {
             if (!m_api->getTrackMeta(req.tracks[i].track_id, meta)) continue;
             std::string label = meta.artist.empty() ? meta.title
                                                     : meta.artist + " - " + meta.title;
+            std::string local_path;
             bool print_now = false;
             {
                 std::lock_guard<std::mutex> lk(m_qmap_mutex);
@@ -869,10 +871,12 @@ void QcManager::queueLoadLoop() {
                     m_track_titles[i] = label;
                     print_now = (m_last_mpd_queue_pos.load() == static_cast<int>(i))
                                 && !label.empty();
+                    if (print_now && i < m_track_local_paths.size())
+                        local_path = m_track_local_paths[i];
                 }
             }
             if (print_now)
-                std::cout << "\033[1;32m▶  " << label << "\033[0m\n" << std::flush;
+                printNowPlaying(label, local_path);
         }
 
         if (initial_track_count >= req.tracks.size())
@@ -922,6 +926,7 @@ void QcManager::queueLoadLoop() {
             if (!m_api->getTrackMeta(req.tracks[track_idx].track_id, meta)) continue;
             std::string label = meta.artist.empty() ? meta.title
                                                     : meta.artist + " - " + meta.title;
+            std::string local_path;
             bool print_now = false;
             {
                 std::lock_guard<std::mutex> lk(m_qmap_mutex);
@@ -929,10 +934,12 @@ void QcManager::queueLoadLoop() {
                     m_track_titles[map_idx] = label;
                     print_now = (m_last_mpd_queue_pos.load() == static_cast<int>(map_idx))
                                 && !label.empty();
+                    if (print_now && map_idx < m_track_local_paths.size())
+                        local_path = m_track_local_paths[map_idx];
                 }
             }
             if (print_now)
-                std::cout << "\033[1;32m▶  " << label << "\033[0m\n" << std::flush;
+                printNowPlaying(label, local_path);
         }
     }
 }
