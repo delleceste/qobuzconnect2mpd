@@ -52,10 +52,15 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <chrono>
 #include <thread>
 #include <unistd.h>
+
+// Definitions for globals declared in qclog.hxx
+std::ofstream g_qc_log_file;
+std::mutex    g_qc_log_mutex;
 
 // ---- Minimal config-file reader --------------------------------------------
 // We cannot link against libupnpp's conftree directly here (it carries the
@@ -116,9 +121,6 @@ int main(int argc, char* argv[]) {
 
     // ---- Load config -------------------------------------------------------
     ConfSimple cfg(config_file.c_str(), 1 /* readonly */);
-    std::cout << "qconnect2mpd: config: " << config_file;
-    if (!cfg.ok()) std::cout << " (not found — using defaults)";
-    std::cout << "\n";
 
     using namespace QConnect;
 
@@ -146,14 +148,29 @@ int main(int argc, char* argv[]) {
     qcfg.mpd_host     = cfgGet(cfg, "mpdhost", "localhost");
     qcfg.mpd_port     = cfgGetInt(cfg, "mpdport", 6600);
     qcfg.mpd_password = cfgGet(cfg, "mpdpassword");
-    std::cout << "qconnect2mpd: MPD " << qcfg.mpd_host << ":" << qcfg.mpd_port << "\n";
 
     // Status file: -o takes precedence over config key qconnectstatusfile
     qcfg.status_file = status_file_arg.empty()
                        ? cfgGet(cfg, "qconnectstatusfile")
                        : status_file_arg;
+
+    // Log file — open early so startup messages are captured
+    {
+        std::string log_path = cfgGet(cfg, "qconnectlogfile");
+        if (!log_path.empty()) {
+            g_qc_log_file.open(log_path, std::ios::app);
+            if (!g_qc_log_file)
+                std::cerr << "qconnect2mpd: cannot open log file: " << log_path << "\n";
+            else
+                LOGINF("qconnect2mpd: log opened\n");
+        }
+    }
+
+    LOGSTD("qconnect2mpd: config: " << config_file
+           << (cfg.ok() ? "" : " (not found — using defaults)") << "\n");
+    LOGSTD("qconnect2mpd: MPD " << qcfg.mpd_host << ":" << qcfg.mpd_port << "\n");
     if (!qcfg.status_file.empty())
-        std::cout << "qconnect2mpd: status file: " << qcfg.status_file << "\n";
+        LOGSTD("qconnect2mpd: status file: " << qcfg.status_file << "\n");
 
     // Qobuz credentials — prefer qconnect-specific, fall back to qobuz plugin
     qcfg.qobuz_user   = cfgGet(cfg, "qconnectuser",

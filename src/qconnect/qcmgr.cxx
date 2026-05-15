@@ -60,6 +60,7 @@ static std::string formatMs(uint32_t ms) {
 
 void QcManager::printNowPlaying(const std::string& title, const std::string& local_path) {
     std::cout << "\033[1;32m▶  " << title << "\033[0m\n";
+    LOGINF("▶  " << title << "\n");
     std::string fmt_info;
     if (!local_path.empty()) {
         std::string cmd = "file -b -- '";
@@ -266,12 +267,12 @@ bool QcManager::start() {
     m_mpd = std::make_unique<MpdCtl>(m_cfg.mpd_host, m_cfg.mpd_port,
                                       m_cfg.mpd_password);
     if (!m_mpd->connect()) {
-        std::cout << "qconnect2mpd: MPD connect FAILED ("
-                  << m_cfg.mpd_host << ":" << m_cfg.mpd_port << ")\n";
+        LOGSTD("qconnect2mpd: MPD connect FAILED ("
+               << m_cfg.mpd_host << ":" << m_cfg.mpd_port << ")\n");
         return false;
     }
-    std::cout << "qconnect2mpd: MPD connected OK ("
-              << m_cfg.mpd_host << ":" << m_cfg.mpd_port << ")\n";
+    LOGSTD("qconnect2mpd: MPD connected OK ("
+           << m_cfg.mpd_host << ":" << m_cfg.mpd_port << ")\n");
     m_mpd->setStateCallback(
         [this](const MpdState& st) { onMpdState(st); });
 

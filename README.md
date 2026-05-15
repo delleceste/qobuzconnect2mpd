@@ -62,6 +62,7 @@ provided at `conf/qobuzconnect2mpd.conf`.
 | `qconnectappid` | value of `qobuzappid` | Qobuz app ID (auto-fetched if empty) |
 | `qconnectcfvalue` | value of `qobuzcfvalue` | Qobuz app secret (auto-fetched if empty) |
 | `qconnectstatusfile` | *(disabled)* | Path for the now-playing status file (see `-o` below) |
+| `qconnectlogfile` | *(disabled)* | Path for the log file (errors, retries, now-playing, startup events) |
 
 ## Usage
 
@@ -106,6 +107,25 @@ FLAC audio bitstream data, 16 bit, stereo, 44.1 kHz
 The file is updated atomically (temp file + rename) so readers never see a
 partial write.  Useful for feeding external displays, OSD scripts, or status
 bars.
+
+### Log file (`qconnectlogfile`)
+
+When `qconnectlogfile` is set, timestamped entries are appended for:
+
+- Startup events (config path, MPD connection result)
+- Now-playing track changes
+- Segment fetch errors and retries (with error reason and segment N/total)
+- Qobuz API / WebSocket connection events
+
+```
+2026-05-15 14:32:01 [OUT] qconnect2mpd: MPD connected OK (localhost:6600)
+2026-05-15 14:32:15 [INF] ▶  Aphex Twin - Xtal
+2026-05-15 14:35:02 [ERR] QobuzApi: segment 18/72 fetch failed (HTTP 503) for ... — retrying
+2026-05-15 14:35:07 [ERR] QobuzApi: segment 18/72 fetch failed (HTTP 503) for ... — giving up
+```
+
+Log levels: `[OUT]` normal output, `[INF]` informational, `[ERR]` errors.
+The file is opened in append mode so it survives daemon restarts.
 
 ## Authentication
 

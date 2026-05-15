@@ -777,7 +777,7 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
     double sr = root.get("sampling_rate", 44.1).asDouble();
     out.sampling_rate = (sr < 1000) ? static_cast<int>(sr * 1000) : static_cast<int>(sr);
     out.bit_depth = root.isMember("bit_depth") ? root["bit_depth"].asInt() : -1;
-    std::cout << "QobuzApi: materializing " << n_audio << " segments -> " << final_path << "\n";
+    LOGSTD("QobuzApi: materializing " << n_audio << " segments -> " << final_path << "\n");
     return true;
 }
 
