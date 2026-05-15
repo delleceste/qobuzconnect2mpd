@@ -87,6 +87,7 @@ static int cfgGetInt(ConfSimple& cfg, const std::string& key, int dflt) {
 
 int main(int argc, char* argv[]) {
     std::string config_file = "/etc/upmpdcli.conf";
+    std::string status_file_arg;
     bool daemonise = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -94,8 +95,10 @@ int main(int argc, char* argv[]) {
             config_file = argv[++i];
         } else if (!strcmp(argv[i], "-d")) {
             daemonise = true;
+        } else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
+            status_file_arg = argv[++i];
         } else {
-            std::cerr << "Usage: " << argv[0] << " [-c configfile] [-d]\n";
+            std::cerr << "Usage: " << argv[0] << " [-c configfile] [-d] [-o statusfile]\n";
             return 1;
         }
     }
@@ -113,10 +116,9 @@ int main(int argc, char* argv[]) {
 
     // ---- Load config -------------------------------------------------------
     ConfSimple cfg(config_file.c_str(), 1 /* readonly */);
-    if (!cfg.ok()) {
-        std::cerr << "qconnect2mpd: cannot read config " << config_file << "\n";
-        // Non-fatal: use defaults
-    }
+    std::cout << "qconnect2mpd: config: " << config_file;
+    if (!cfg.ok()) std::cout << " (not found — using defaults)";
+    std::cout << "\n";
 
     using namespace QConnect;
 
@@ -144,6 +146,12 @@ int main(int argc, char* argv[]) {
     qcfg.mpd_host     = cfgGet(cfg, "mpdhost", "localhost");
     qcfg.mpd_port     = cfgGetInt(cfg, "mpdport", 6600);
     qcfg.mpd_password = cfgGet(cfg, "mpdpassword");
+    std::cout << "qconnect2mpd: MPD " << qcfg.mpd_host << ":" << qcfg.mpd_port << "\n";
+
+    // Status file (from -o command-line argument)
+    qcfg.status_file = status_file_arg;
+    if (!qcfg.status_file.empty())
+        std::cout << "qconnect2mpd: status file: " << qcfg.status_file << "\n";
 
     // Qobuz credentials — prefer qconnect-specific, fall back to qobuz plugin
     qcfg.qobuz_user   = cfgGet(cfg, "qconnectuser",

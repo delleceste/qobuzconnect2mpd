@@ -62,6 +62,9 @@ struct QcConfig {
 
     // IPC with upmpdcli (Unix socket path, empty = disable)
     std::string upmpdcli_sock;
+
+    // Status file path (empty = disabled); updated once per second while playing
+    std::string status_file;
 };
 
 // Top-level manager: wires together mDNS, HTTP, WebSocket, Qobuz API, and MPD.
@@ -137,6 +140,11 @@ private:
     // Look up MPD queue position from Qobuz queue_item_id. Returns -1 if not found.
     int mpdPosForQueueItem(uint64_t queue_item_id) const;
 
+    // Console + status file
+    void printNowPlaying(const std::string& title, const std::string& local_path);
+    void writeStatusFile();
+    void statusLoop();
+
     // IPC with upmpdcli
     bool startIpcServer();
     void stopIpcServer();
@@ -182,6 +190,15 @@ private:
     std::atomic<bool>         m_queue_load_stop{false};
     std::atomic<uint64_t>     m_queue_load_generation{0};
     PendingQueueLoad          m_pending_queue_load;
+
+    // Status file
+    std::string           m_status_title;
+    std::string           m_status_format_info;
+    std::atomic<uint32_t> m_status_pos_ms{0};
+    std::atomic<uint32_t> m_status_dur_ms{0};
+    mutable std::mutex    m_status_mutex;
+    std::thread           m_status_thread;
+    std::atomic<bool>     m_status_stop{false};
 
     // IPC
     int          m_ipc_sock{-1};

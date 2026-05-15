@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 
@@ -50,8 +51,16 @@ constexpr size_t kInitialQueuePrefetchTracks = 2;
 
 }
 
-static void printNowPlaying(const std::string& title, const std::string& local_path) {
+static std::string formatMs(uint32_t ms) {
+    uint32_t s = ms / 1000;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%u:%02u", s / 60, s % 60);
+    return buf;
+}
+
+void QcManager::printNowPlaying(const std::string& title, const std::string& local_path) {
     std::cout << "\033[1;32m▶  " << title << "\033[0m\n";
+    std::string fmt_info;
     if (!local_path.empty()) {
         std::string cmd = "file -b -- '";
         for (char c : local_path) {
@@ -62,17 +71,52 @@ static void printNowPlaying(const std::string& title, const std::string& local_p
         FILE* fp = popen(cmd.c_str(), "r");
         if (fp) {
             char buf[512];
-            std::string info;
-            while (fgets(buf, sizeof(buf), fp)) info += buf;
+            while (fgets(buf, sizeof(buf), fp)) fmt_info += buf;
             pclose(fp);
-            while (!info.empty() && (info.back() == '\n' || info.back() == '\r'))
-                info.pop_back();
-            if (!info.empty())
-                std::cout << "   \033[2m" << info << "\033[0m\n";
+            while (!fmt_info.empty() && (fmt_info.back() == '\n' || fmt_info.back() == '\r'))
+                fmt_info.pop_back();
+            if (!fmt_info.empty())
+                std::cout << "   \033[2m" << fmt_info << "\033[0m\n";
         }
         std::cout << "   \033[2m" << local_path << "\033[0m\n";
     }
     std::cout << std::flush;
+    // Update status file state
+    {
+        std::lock_guard<std::mutex> lk(m_status_mutex);
+        m_status_title = title;
+        m_status_format_info = fmt_info;
+    }
+    m_status_pos_ms.store(0);
+    writeStatusFile();
+}
+
+void QcManager::writeStatusFile() {
+    if (m_cfg.status_file.empty()) return;
+    std::string title, fmt_info;
+    {
+        std::lock_guard<std::mutex> lk(m_status_mutex);
+        title    = m_status_title;
+        fmt_info = m_status_format_info;
+    }
+    if (title.empty()) return;
+    uint32_t pos_ms = m_status_pos_ms.load();
+    uint32_t dur_ms = m_status_dur_ms.load();
+    std::string line1 = title + "  [" + formatMs(pos_ms) + " / " + formatMs(dur_ms) + "]";
+    std::string tmp = m_cfg.status_file + ".tmp";
+    std::ofstream f(tmp);
+    if (!f) return;
+    f << line1 << "\n";
+    if (!fmt_info.empty()) f << fmt_info << "\n";
+    f.close();
+    std::rename(tmp.c_str(), m_cfg.status_file.c_str());
+}
+
+void QcManager::statusLoop() {
+    while (!m_status_stop.load()) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        writeStatusFile();
+    }
 }
 
 static void removeMaterializedFile(const std::string& path) {
@@ -222,10 +266,12 @@ bool QcManager::start() {
     m_mpd = std::make_unique<MpdCtl>(m_cfg.mpd_host, m_cfg.mpd_port,
                                       m_cfg.mpd_password);
     if (!m_mpd->connect()) {
-        LOGERR("QcManager: cannot connect to MPD at "
-               << m_cfg.mpd_host << ":" << m_cfg.mpd_port << "\n");
+        std::cout << "qconnect2mpd: MPD connect FAILED ("
+                  << m_cfg.mpd_host << ":" << m_cfg.mpd_port << ")\n";
         return false;
     }
+    std::cout << "qconnect2mpd: MPD connected OK ("
+              << m_cfg.mpd_host << ":" << m_cfg.mpd_port << ")\n";
     m_mpd->setStateCallback(
         [this](const MpdState& st) { onMpdState(st); });
 
@@ -306,6 +352,11 @@ bool QcManager::start() {
         LOGINF("QcManager: no auth token — waiting for mDNS discovery or OAuth login\n");
     }
 
+    if (!m_cfg.status_file.empty()) {
+        m_status_stop = false;
+        m_status_thread = std::thread(&QcManager::statusLoop, this);
+    }
+
     m_running = true;
     LOGINF("QcManager: ready — device '" << m_cfg.friendly_name
            << "' advertised as " << m_cfg.uuid << "\n");
@@ -315,6 +366,9 @@ bool QcManager::start() {
 void QcManager::stop() {
     if (!m_running) return;
     m_running = false;
+
+    m_status_stop = true;
+    if (m_status_thread.joinable()) m_status_thread.join();
 
     stopIpcServer();
     stopQueueLoadWorker();
@@ -720,6 +774,8 @@ void QcManager::onMpdState(const MpdState& st) {
     m_last_mpd_status = st.status;
     m_last_mpd_queue_pos.store(st.queue_pos);
     m_last_mpd_pos_ms = st.position_ms;
+    m_status_pos_ms.store(st.position_ms);
+    m_status_dur_ms.store(st.duration_ms);
 }
 
 // ---- Stream URL resolution --------------------------------------------------
