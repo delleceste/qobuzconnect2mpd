@@ -58,6 +58,10 @@ constexpr size_t kInitialSegmentPrefetchCount = 12;
 // finish downloading its tail while track N is still playing, without waiting
 // for a single global slot.
 constexpr size_t kMaxConcurrentBackgroundMaterializations = 2;
+// Retry parameters for transient segment fetch failures (network timeouts,
+// HTTP 5xx, etc.).  Decrypt/write failures are not retried.
+constexpr int kSegmentMaxAttempts = 3;
+constexpr int kSegmentRetryDelaySecs = 3;
 
 std::mutex g_materialize_mutex;
 std::condition_variable g_materialize_cv;
@@ -110,9 +114,13 @@ static size_t curlWriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) 
 
 static bool fetchBinaryUrl(const std::string& url,
                            const std::vector<std::string>& headers,
-                           std::vector<uint8_t>& out) {
+                           std::vector<uint8_t>& out,
+                           std::string* err_out = nullptr) {
     CURL* curl = curl_easy_init();
-    if (!curl) return false;
+    if (!curl) {
+        if (err_out) *err_out = "curl_easy_init failed";
+        return false;
+    }
     std::string buf;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCb);
@@ -128,7 +136,18 @@ static bool fetchBinaryUrl(const std::string& url,
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
     if (hdrs) curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
-    if (rc != CURLE_OK || code != 200) return false;
+    if (rc != CURLE_OK) {
+        if (err_out) *err_out = curl_easy_strerror(rc);
+        return false;
+    }
+    if (code != 200) {
+        if (err_out) {
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "HTTP %ld", code);
+            *err_out = tmp;
+        }
+        return false;
+    }
     out.assign(buf.begin(), buf.end());
     return true;
 }
@@ -700,19 +719,48 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
                 BackgroundMaterializationSlot slot;
                 std::ofstream append(final_path, std::ios::binary | std::ios::app);
                 if (!append) {
+                    LOGERR("QobuzApi: cannot open for append: " << final_path << "\n");
                     fs::remove(marker_path);
                     return;
                 }
                 for (size_t i = next_segment; i <= n_audio; ++i) {
-                    std::vector<uint8_t> seg;
-                    if (!fetchBinaryUrl(std::regex_replace(urltpl, std::regex("\\$SEGMENT\\$"),
-                                                           std::to_string(i)), hdrs, seg) ||
-                        !appendMaterializedSegment(append, seg, content_key)) {
-                        LOGERR("QobuzApi: background materialization failed at segment "
-                               << i << " for " << final_path << "\n");
-                        break;
+                    const std::string seg_url = std::regex_replace(
+                        urltpl, std::regex("\\$SEGMENT\\$"), std::to_string(i));
+                    bool seg_ok = false;
+                    for (int attempt = 1;
+                         attempt <= kSegmentMaxAttempts && !seg_ok;
+                         ++attempt) {
+                        if (attempt > 1)
+                            std::this_thread::sleep_for(
+                                std::chrono::seconds(kSegmentRetryDelaySecs));
+                        std::vector<uint8_t> seg;
+                        std::string err;
+                        if (!fetchBinaryUrl(seg_url, hdrs, seg, &err)) {
+                            LOGERR("QobuzApi: segment " << i << "/" << n_audio
+                                   << " fetch failed (" << err << ") for "
+                                   << final_path
+                                   << (attempt < kSegmentMaxAttempts
+                                       ? " — retrying" : " — giving up") << "\n");
+                            continue;
+                        }
+                        if (!appendMaterializedSegment(append, seg, content_key)) {
+                            LOGERR("QobuzApi: segment " << i << "/" << n_audio
+                                   << " decrypt/write error for " << final_path
+                                   << " — aborting\n");
+                            goto mat_failed; // unrecoverable; don't retry
+                        }
+                        seg_ok = true;
+                    }
+                    if (!seg_ok) {
+                        LOGERR("QobuzApi: background materialization aborted at segment "
+                               << i << "/" << n_audio << " for " << final_path << "\n");
+                        goto mat_failed;
                     }
                 }
+                append.close();
+                fs::remove(marker_path);
+                return;
+            mat_failed:
                 append.close();
                 fs::remove(marker_path);
             }).detach();
@@ -729,7 +777,7 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
     double sr = root.get("sampling_rate", 44.1).asDouble();
     out.sampling_rate = (sr < 1000) ? static_cast<int>(sr * 1000) : static_cast<int>(sr);
     out.bit_depth = root.isMember("bit_depth") ? root["bit_depth"].asInt() : -1;
-    LOGINF("QobuzApi: started segmented materialization at " << final_path << "\n");
+    std::cout << "QobuzApi: materializing " << n_audio << " segments -> " << final_path << "\n";
     return true;
 }
 
