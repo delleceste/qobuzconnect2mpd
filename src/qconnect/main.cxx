@@ -158,7 +158,7 @@ int main(int argc, char* argv[]) {
     {
         std::string log_path = cfgGet(cfg, "qconnectlogfile");
         if (!log_path.empty()) {
-            g_qc_log_file.open(log_path, std::ios::app);
+            g_qc_log_file.open(log_path, std::ios::trunc);
             if (!g_qc_log_file)
                 std::cerr << "qconnect2mpd: cannot open log file: " << log_path << "\n";
             else
