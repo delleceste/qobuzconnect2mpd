@@ -148,8 +148,10 @@ int main(int argc, char* argv[]) {
     qcfg.mpd_password = cfgGet(cfg, "mpdpassword");
     std::cout << "qconnect2mpd: MPD " << qcfg.mpd_host << ":" << qcfg.mpd_port << "\n";
 
-    // Status file (from -o command-line argument)
-    qcfg.status_file = status_file_arg;
+    // Status file: -o takes precedence over config key qconnectstatusfile
+    qcfg.status_file = status_file_arg.empty()
+                       ? cfgGet(cfg, "qconnectstatusfile")
+                       : status_file_arg;
     if (!qcfg.status_file.empty())
         std::cout << "qconnect2mpd: status file: " << qcfg.status_file << "\n";
 

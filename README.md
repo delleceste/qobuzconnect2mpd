@@ -61,6 +61,7 @@ provided at `conf/qobuzconnect2mpd.conf`.
 | `qconnectpass` | value of `qobuzpass` | Qobuz account password |
 | `qconnectappid` | value of `qobuzappid` | Qobuz app ID (auto-fetched if empty) |
 | `qconnectcfvalue` | value of `qobuzcfvalue` | Qobuz app secret (auto-fetched if empty) |
+| `qconnectstatusfile` | *(disabled)* | Path for the now-playing status file (see `-o` below) |
 
 ## Usage
 
@@ -69,7 +70,8 @@ qconnect2mpd [-c configfile] [-d] [-o statusfile]
 
   -c configfile   Path to configuration file (default: /etc/upmpdcli.conf)
   -d              Daemonise (fork to background)
-  -o statusfile   Write now-playing status to this file (updated every second)
+  -o statusfile   Write now-playing status to this file (updated every second);
+                  overrides qconnectstatusfile in the config file
 ```
 
 ### Startup log
