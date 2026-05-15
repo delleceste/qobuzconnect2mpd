@@ -196,6 +196,7 @@ private:
     std::string           m_status_format_info;
     std::atomic<uint32_t> m_status_pos_ms{0};
     std::atomic<uint32_t> m_status_dur_ms{0};
+    std::atomic<int>      m_status_play_state{0}; // 0=unknown 1=stopped 2=playing 3=paused
     mutable std::mutex    m_status_mutex;
     std::thread           m_status_thread;
     std::atomic<bool>     m_status_stop{false};

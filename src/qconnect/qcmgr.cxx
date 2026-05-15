@@ -100,15 +100,21 @@ void QcManager::writeStatusFile() {
         title    = m_status_title;
         fmt_info = m_status_format_info;
     }
-    if (title.empty()) return;
-    uint32_t pos_ms = m_status_pos_ms.load();
-    uint32_t dur_ms = m_status_dur_ms.load();
-    std::string line1 = title + "  [" + formatMs(pos_ms) + " / " + formatMs(dur_ms) + "]";
+    int play_state = m_status_play_state.load();
+    const char* state_tag = (play_state == 2) ? "[playing] "
+                          : (play_state == 3) ? "[paused] "
+                                              : "[stopped] ";
     std::string tmp = m_cfg.status_file + ".tmp";
     std::ofstream f(tmp);
     if (!f) return;
-    f << line1 << "\n";
-    if (!fmt_info.empty()) f << fmt_info << "\n";
+    if (title.empty()) {
+        f << state_tag << "\n";
+    } else {
+        uint32_t pos_ms = m_status_pos_ms.load();
+        uint32_t dur_ms = m_status_dur_ms.load();
+        f << state_tag << title << "  [" << formatMs(pos_ms) << " / " << formatMs(dur_ms) << "]\n";
+        if (!fmt_info.empty()) f << fmt_info << "\n";
+    }
     f.close();
     std::rename(tmp.c_str(), m_cfg.status_file.c_str());
 }
@@ -370,6 +376,11 @@ void QcManager::stop() {
 
     m_status_stop = true;
     if (m_status_thread.joinable()) m_status_thread.join();
+    if (!m_cfg.status_file.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(m_cfg.status_file, ec);
+        std::filesystem::remove(m_cfg.status_file + ".tmp", ec);
+    }
 
     stopIpcServer();
     stopQueueLoadWorker();
@@ -777,6 +788,12 @@ void QcManager::onMpdState(const MpdState& st) {
     m_last_mpd_pos_ms = st.position_ms;
     m_status_pos_ms.store(st.position_ms);
     m_status_dur_ms.store(st.duration_ms);
+    switch (st.status) {
+    case MpdState::Status::PLAY:  m_status_play_state.store(2); break;
+    case MpdState::Status::PAUSE: m_status_play_state.store(3); break;
+    case MpdState::Status::STOP:  m_status_play_state.store(1); break;
+    default:                      m_status_play_state.store(0); break;
+    }
 }
 
 // ---- Stream URL resolution --------------------------------------------------
