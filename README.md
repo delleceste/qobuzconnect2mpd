@@ -61,8 +61,8 @@ provided at `conf/qobuzconnect2mpd.conf`.
 | `qconnectpass` | value of `qobuzpass` | Qobuz account password |
 | `qconnectappid` | value of `qobuzappid` | Qobuz app ID (auto-fetched if empty) |
 | `qconnectcfvalue` | value of `qobuzcfvalue` | Qobuz app secret (auto-fetched if empty) |
-| `qconnectstatusfile` | *(disabled)* | Path for the now-playing status file (see `-o` below) |
-| `qconnectlogfile` | *(disabled)* | Path for the log file (errors, retries, now-playing, startup events) |
+| `qconnectstatusfile` | `/tmp/qconnect2mpd-status.txt` | Path for the now-playing status file (see `-o` below) |
+| `qconnectlogfile` | `/tmp/qconnect2mpd.log` | Path for the log file (errors, retries, now-playing, startup events) |
 
 ## Usage
 
@@ -100,13 +100,14 @@ When a track starts playing the daemon prints to stdout:
 When `-o statusfile` is given the daemon writes (and rewrites every second):
 
 ```
-Artist Name - Track Title  [1:23 / 4:56]
+[playing] Artist Name - Track Title  [1:23 / 4:56]
 FLAC audio bitstream data, 16 bit, stereo, 44.1 kHz
 ```
 
-The file is updated atomically (temp file + rename) so readers never see a
-partial write.  Useful for feeding external displays, OSD scripts, or status
-bars.
+Line 1 is prefixed with the current playback state: `[playing]`, `[paused]`,
+or `[stopped]`.  The file is updated atomically (temp file + rename) so readers
+never see a partial write.  When the daemon stops it removes the status file.
+Useful for feeding external displays, OSD scripts, or status bars.
 
 ### Log file (`qconnectlogfile`)
 
@@ -125,7 +126,8 @@ When `qconnectlogfile` is set, timestamped entries are appended for:
 ```
 
 Log levels: `[OUT]` normal output, `[INF]` informational, `[ERR]` errors.
-The file is opened in append mode so it survives daemon restarts.
+The file is truncated (not appended) on each daemon restart, so the log always
+reflects the current session only.
 
 ## Authentication
 
