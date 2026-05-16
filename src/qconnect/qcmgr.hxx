@@ -139,6 +139,8 @@ private:
     uint64_t queueItemIdAt(int mpd_pos) const;
     // Look up MPD queue position from Qobuz queue_item_id. Returns -1 if not found.
     int mpdPosForQueueItem(uint64_t queue_item_id) const;
+    // Look up position in the full Qobuz queue (includes not-yet-loaded tracks).
+    int posInFullQueue(uint64_t queue_item_id) const;
 
     // Console + status file
     void printNowPlaying(const std::string& title, const std::string& local_path);
@@ -177,6 +179,10 @@ private:
     std::vector<int>          m_track_sample_rates; // Hz, parallel to m_queue_item_ids
     std::vector<std::string>  m_track_local_paths;  // local materialized FLAC paths
     std::vector<std::string>  m_track_titles;        // "Artist - Title", parallel to m_queue_item_ids
+    // Full ordered Qobuz queue (all items, including tracks not yet loaded into MPD).
+    // Set immediately when onQueueLoad fires so skip can find direction even
+    // before URL resolution completes.
+    std::vector<uint64_t>     m_all_queue_item_ids;
 
     struct PendingQueueLoad {
         std::vector<QueueTrack> tracks;

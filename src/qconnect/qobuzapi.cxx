@@ -49,11 +49,9 @@ namespace QConnect {
 
 namespace {
 
-// On slower systems MPD can start consuming the first track before background
-// materialization gets far enough ahead, which may make playback stop at the
-// current end of the local file. Prefetch a larger initial window before
-// exposing the stream to MPD.
-constexpr size_t kInitialSegmentPrefetchCount = 12;
+// Prefetch this many audio segments before handing the URL to MPD, so that
+// playback starts quickly. The rest is downloaded in the background.
+constexpr size_t kInitialSegmentPrefetchCount = 2;
 // Allow two concurrent background materializations so that track N+1 can
 // finish downloading its tail while track N is still playing, without waiting
 // for a single global slot.
@@ -692,6 +690,22 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
     size_t n_audio = init.segment_byte_lens.empty()
                      ? static_cast<size_t>(root.get("n_segments", 1).asUInt()) - 1
                      : init.segment_byte_lens.size();
+
+    // Compute expected total FLAC file size from the init segment byte lengths
+    // (these encode the decoded audio data size per segment).  Write to a .size
+    // companion file so the HTTP proxy can advertise Content-Length and
+    // Accept-Ranges even while the file is still being assembled, enabling
+    // MPD to seek into a growing file.
+    auto write_size_file = [&](const std::string& path, uint64_t sz) {
+        std::ofstream sf(path + ".size", std::ios::trunc);
+        if (sf) sf << sz;
+    };
+    if (!init.segment_byte_lens.empty()) {
+        uint64_t est = init.flac_header.size();
+        for (uint32_t b : init.segment_byte_lens) est += b;
+        write_size_file(final_path, est);
+    }
+
     if (n_audio == 0) {
         ofs.close();
         fs::remove(marker_path);
@@ -706,6 +720,7 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
                 ofs.close();
                 fs::remove(final_path);
                 fs::remove(marker_path);
+                fs::remove(final_path + ".size");
                 return false;
             }
         }
@@ -758,6 +773,16 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
                     }
                 }
                 append.close();
+                // Update .size file with the actual final size so seeks near
+                // the end are accurate.
+                {
+                    std::error_code ec;
+                    uint64_t actual = fs::file_size(final_path, ec);
+                    if (!ec) {
+                        std::ofstream sf(final_path + ".size", std::ios::trunc);
+                        if (sf) sf << actual;
+                    }
+                }
                 fs::remove(marker_path);
                 return;
             mat_failed:
@@ -765,6 +790,15 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
                 fs::remove(marker_path);
             }).detach();
         } else {
+            // All segments loaded; write actual size and remove marker.
+            {
+                std::error_code ec;
+                uint64_t actual = fs::file_size(final_path, ec);
+                if (!ec) {
+                    std::ofstream sf(final_path + ".size", std::ios::trunc);
+                    if (sf) sf << actual;
+                }
+            }
             fs::remove(marker_path);
         }
     }

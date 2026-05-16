@@ -132,6 +132,7 @@ static void removeMaterializedFile(const std::string& path) {
     std::error_code ec;
     fs::remove(path, ec);
     fs::remove(path + ".inprogress", ec);
+    fs::remove(path + ".size", ec);
 }
 
 static void removeAllMaterializedFiles() {
@@ -482,6 +483,7 @@ void QcManager::onWsDisconnected() {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
         cleanupMaterializedFiles(m_track_local_paths);
         m_queue_item_ids.clear();
+        m_all_queue_item_ids.clear();
         m_track_local_paths.clear();
         m_track_sample_rates.clear();
         m_track_titles.clear();
@@ -503,8 +505,23 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
     // (server sends state=UNKNOWN + qitem=N to mean "switch track, keep state")
     if (current_item.has_queue_item_id) {
         int target_pos = mpdPosForQueueItem(current_item.queue_item_id);
-        if (target_pos >= 0)
+        if (target_pos >= 0) {
             m_mpd->play(target_pos);
+        } else {
+            // Track URL not yet resolved (queue still loading).  Determine
+            // forward/backward from the full ordered queue and fall back to
+            // MPD's built-in next/previous so at least something happens.
+            LOGINF("QcManager: skip target qitem=" << current_item.queue_item_id
+                   << " not in MPD queue yet — using next/prev fallback\n");
+            MpdState st = m_mpd->getState();
+            uint64_t cur_qid = queueItemIdAt(st.queue_pos);
+            int cur_full  = posInFullQueue(cur_qid);
+            int tgt_full  = posInFullQueue(current_item.queue_item_id);
+            if (tgt_full > cur_full)
+                m_mpd->next();
+            else if (tgt_full >= 0 && tgt_full < cur_full)
+                m_mpd->previous();
+        }
     }
 
     // Handle play state change
@@ -529,6 +546,12 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
     // Handle seek independently of play state (has_position distinguishes
     // "seek to 0" from "no seek requested")
     if (has_position) {
+        // When switching tracks, MPD starts new tracks at position 0 anyway.
+        // Issuing a seek(0) can race with the play() call above and cause the
+        // seek cooldown to fire on the old track — skip it.
+        if (position_ms == 0 && current_item.has_queue_item_id)
+            return;
+
         // "Previous track" logic: the Qobuz app sends seek-to-0 for the back
         // button and expects the renderer to skip to the previous track when
         // already near the start of the current one.  Only applies when there
@@ -568,6 +591,7 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
             std::lock_guard<std::mutex> lk(m_qmap_mutex);
             cleanupMaterializedFiles(m_track_local_paths);
             m_queue_item_ids.clear();
+            m_all_queue_item_ids.clear();
             m_track_local_paths.clear();
             m_track_sample_rates.clear();
             m_track_titles.clear();
@@ -581,6 +605,16 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
     for (size_t i = 0; i < tracks.size(); ++i) {
         LOGINF("QcManager:   track[" << i << "] qitem=" << tracks[i].queue_item_id
                << " trackid=" << tracks[i].track_id << "\n");
+    }
+
+    // Capture the full ordered queue immediately so skip fallback has direction
+    // info before any URL resolution starts.
+    {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        m_all_queue_item_ids.clear();
+        m_all_queue_item_ids.reserve(tracks.size());
+        for (const auto& t : tracks)
+            m_all_queue_item_ids.push_back(t.queue_item_id);
     }
 
     // Clear the current QConnect queue immediately so a user pressing play
@@ -638,6 +672,19 @@ void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
         ins(m_track_sample_rates, sample_rates);
         ins(m_track_local_paths,  local_paths);
         ins(m_track_titles,       titles);
+
+        // Keep full-queue map in sync; find insert position using insert_after_item_id
+        int all_insert_pos = -1;
+        for (size_t i = 0; i < m_all_queue_item_ids.size(); ++i) {
+            if (m_all_queue_item_ids[i] == insert_after_item_id) {
+                all_insert_pos = static_cast<int>(i);
+                break;
+            }
+        }
+        auto all_ins_pos = all_insert_pos >= 0
+            ? m_all_queue_item_ids.begin() + all_insert_pos + 1
+            : m_all_queue_item_ids.end();
+        m_all_queue_item_ids.insert(all_ins_pos, item_ids.begin(), item_ids.end());
     }
 
     int mpd_id = m_mpd->queueItemToMpdId(insert_after_item_id);
@@ -654,6 +701,7 @@ void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
         m_queue_item_ids.insert(m_queue_item_ids.end(), item_ids.begin(), item_ids.end());
+        m_all_queue_item_ids.insert(m_all_queue_item_ids.end(), item_ids.begin(), item_ids.end());
         m_track_sample_rates.insert(m_track_sample_rates.end(), sample_rates.begin(), sample_rates.end());
         m_track_local_paths.insert(m_track_local_paths.end(), local_paths.begin(), local_paths.end());
         m_track_titles.insert(m_track_titles.end(), titles.begin(), titles.end());
@@ -668,6 +716,12 @@ void QcManager::onTracksRemoved(const std::vector<uint64_t>& queue_item_ids) {
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
         for (uint64_t qid : queue_item_ids) {
+            // Remove from full-queue map
+            auto ait = std::find(m_all_queue_item_ids.begin(),
+                                 m_all_queue_item_ids.end(), qid);
+            if (ait != m_all_queue_item_ids.end())
+                m_all_queue_item_ids.erase(ait);
+
             auto it = std::find(m_queue_item_ids.begin(),
                                 m_queue_item_ids.end(), qid);
             if (it != m_queue_item_ids.end()) {
@@ -1059,6 +1113,15 @@ int QcManager::mpdPosForQueueItem(uint64_t queue_item_id) const {
     std::lock_guard<std::mutex> lk(m_qmap_mutex);
     for (size_t i = 0; i < m_queue_item_ids.size(); ++i) {
         if (m_queue_item_ids[i] == queue_item_id)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+int QcManager::posInFullQueue(uint64_t queue_item_id) const {
+    std::lock_guard<std::mutex> lk(m_qmap_mutex);
+    for (size_t i = 0; i < m_all_queue_item_ids.size(); ++i) {
+        if (m_all_queue_item_ids[i] == queue_item_id)
             return static_cast<int>(i);
     }
     return -1;

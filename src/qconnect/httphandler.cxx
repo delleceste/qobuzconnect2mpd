@@ -196,19 +196,25 @@ static MHD_Result sendFileResponse(struct MHD_Connection* conn,
 struct GrowingFileCtx {
     std::string path;
     std::string marker_path;
+    uint64_t    start_offset{0}; // byte offset in the file where this response starts
 };
 
+// Reader callback for MHD_create_response_from_callback.
+// pos is the number of bytes already sent in this response; the actual file
+// offset is start_offset + pos.  Waits for data if the file hasn't grown
+// far enough yet, and returns END_OF_STREAM when the file is complete.
 static ssize_t growingFileReader(void* cls, uint64_t pos, char* buf, size_t max) {
     namespace fs = std::filesystem;
     auto* ctx = static_cast<GrowingFileCtx*>(cls);
+    uint64_t file_pos = ctx->start_offset + pos;
     for (;;) {
         std::error_code ec;
         uint64_t size = fs::exists(ctx->path, ec) ? fs::file_size(ctx->path, ec) : 0;
-        if (!ec && pos < size) {
+        if (!ec && file_pos < size) {
             std::ifstream ifs(ctx->path, std::ios::binary);
             if (!ifs) return MHD_CONTENT_READER_END_WITH_ERROR;
-            ifs.seekg(static_cast<std::streamoff>(pos), std::ios::beg);
-            size_t want = static_cast<size_t>(std::min<uint64_t>(size - pos, max));
+            ifs.seekg(static_cast<std::streamoff>(file_pos), std::ios::beg);
+            size_t want = static_cast<size_t>(std::min<uint64_t>(size - file_pos, max));
             ifs.read(buf, static_cast<std::streamsize>(want));
             auto got = static_cast<ssize_t>(ifs.gcount());
             if (got > 0) return got;
@@ -223,21 +229,46 @@ static void freeGrowingFileCtx(void* cls) {
     delete static_cast<GrowingFileCtx*>(cls);
 }
 
+// Send a growing-file response starting at start_offset.
+// If total_size > 0, it is used as Content-Length (enables MPD to seek via Range
+// requests even while the file is still being assembled).
+// If is_range is true, returns 206 Partial Content with a Content-Range header.
 static MHD_Result sendGrowingFileResponse(struct MHD_Connection* conn,
                                           const std::string& path,
                                           const std::string& marker_path,
                                           const std::string& content_type,
-                                          bool /*head_only*/) {
-    auto* ctx = new GrowingFileCtx{path, marker_path};
+                                          bool /*head_only*/,
+                                          uint64_t start_offset = 0,
+                                          uint64_t total_size   = 0,
+                                          bool     is_range     = false) {
+    auto* ctx = new GrowingFileCtx{path, marker_path, start_offset};
+    // For Range responses use MHD_SIZE_UNKNOWN (chunked body): the estimate may
+    // be slightly larger than the actual file, which would cause MHD to promise
+    // more bytes than it can send.  The initial GET uses the estimate so MPD
+    // sees a Content-Length and treats the stream as seekable.
+    uint64_t response_size = (!is_range && total_size > start_offset)
+                             ? total_size - start_offset
+                             : MHD_SIZE_UNKNOWN;
     struct MHD_Response* resp = MHD_create_response_from_callback(
-        MHD_SIZE_UNKNOWN, 64 * 1024, &growingFileReader, ctx, &freeGrowingFileCtx);
+        response_size, 64 * 1024, &growingFileReader, ctx, &freeGrowingFileCtx);
     if (!resp) {
         delete ctx;
         return sendResponse(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, R"({"error":"stream setup failed"})");
     }
     MHD_add_response_header(resp, "Content-Type", content_type.c_str());
+    MHD_add_response_header(resp, "Accept-Ranges", "bytes");
     MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
-    MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
+    unsigned int status = MHD_HTTP_OK;
+    if (is_range && (start_offset > 0 || total_size > 0)) {
+        status = MHD_HTTP_PARTIAL_CONTENT;
+        std::string cr = "bytes " + std::to_string(start_offset) + "-";
+        if (total_size > 0)
+            cr += std::to_string(total_size - 1) + "/" + std::to_string(total_size);
+        else
+            cr += "*/*";
+        MHD_add_response_header(resp, "Content-Range", cr.c_str());
+    }
+    MHD_Result ret = MHD_queue_response(conn, status, resp);
     MHD_destroy_response(resp);
     return ret;
 }
@@ -261,21 +292,34 @@ MHD_Result HttpHandler::handleRequest(struct MHD_Connection* conn,
         const std::string path = "/tmp/qconnect2mpd-segmented/" + name;
         const std::string marker_path = path + ".inprogress";
         if (std::filesystem::exists(marker_path)) {
-            // While materialization is still running, never return a fixed-size
-            // snapshot. Some MPD builds appear to probe with HEAD before GET; if
-            // we advertise the current partial Content-Length they can stop at
-            // that early boundary on slower machines.
-            if (strcmp(method, "HEAD") == 0)
-                return sendGrowingFileResponse(conn, path, marker_path,
-                                               "audio/flac", true);
-
-            const char* range = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Range");
-            if (range && *range) {
-                LOGDEB("HttpHandler: ignoring Range for growing segmented file "
-                       << name << "\n");
+            // File is still being assembled by the background materializer.
+            // Read the estimated total size written by the materializer so we
+            // can advertise Content-Length + Accept-Ranges, which lets MPD
+            // seek into the file even while it is growing.
+            uint64_t total_size = 0;
+            {
+                std::ifstream sf(path + ".size");
+                if (sf) sf >> total_size;
             }
+
+            // Parse optional Range header so seeks work during materialization.
+            uint64_t start_offset = 0;
+            bool is_range = false;
+            const char* range_hdr =
+                MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Range");
+            if (range_hdr && strncmp(range_hdr, "bytes=", 6) == 0) {
+                long long s = 0;
+                if (sscanf(range_hdr + 6, "%lld-", &s) >= 1 && s >= 0) {
+                    start_offset = static_cast<uint64_t>(s);
+                    is_range = true;
+                    LOGDEB("HttpHandler: Range request on growing file "
+                           << name << " start=" << start_offset << "\n");
+                }
+            }
+
             return sendGrowingFileResponse(conn, path, marker_path, "audio/flac",
-                                           false);
+                                           strcmp(method, "HEAD") == 0,
+                                           start_offset, total_size, is_range);
         }
         return sendFileResponse(conn, path, "audio/flac",
                                 strcmp(method, "HEAD") == 0);
