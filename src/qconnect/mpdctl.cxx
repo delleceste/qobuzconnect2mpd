@@ -198,6 +198,16 @@ bool MpdCtl::removeTracks(const std::vector<int>& mpd_song_ids) {
     return true;
 }
 
+bool MpdCtl::removeTracksByPos(const std::vector<int>& mpd_positions) {
+    std::lock_guard<std::mutex> lk(m_conn_mutex);
+    if (!ensureConnected()) return false;
+    for (int pos : mpd_positions) {
+        if (pos < 0) continue;
+        mpd_run_delete(m_conn, static_cast<unsigned>(pos));
+    }
+    return true;
+}
+
 // ---- Playback ---------------------------------------------------------------
 
 bool MpdCtl::play(int queue_pos) {
@@ -271,28 +281,25 @@ bool MpdCtl::seek(uint32_t position_ms) {
     std::lock_guard<std::mutex> lk(m_conn_mutex);
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (!ensureConnected()) return false;
-        struct mpd_status* st = mpd_run_status(m_conn);
-        if (!st) {
-            if (m_conn) { mpd_connection_free(m_conn); m_conn = nullptr; }
-            continue;
-        }
-        int pos = mpd_status_get_song_pos(st);
-        mpd_status_free(st);
-        if (pos < 0) return false;
         // Record seek time BEFORE calling MPD so that any event-thread tick
-        // that fires while mpd_run_seek_pos blocks is inside the cooldown
-        // window and won't broadcast a stale pre-seek position to the phone.
+        // that fires while mpd_run_seek_current blocks is inside the
+        // cooldown window and won't broadcast a stale pre-seek position.
         uint64_t now_ms = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
         m_last_seek_ms.store(now_ms, std::memory_order_relaxed);
-        if (mpd_run_seek_pos(m_conn, static_cast<unsigned>(pos),
-                              position_ms / 1000)) {
+        // Use mpd_run_seek_current (the only seek variant that accepts a
+        // float).  mpd_run_seek_pos takes `unsigned` seconds, so any sub-
+        // second precision sent by the Qobuz app would silently round down.
+        if (mpd_run_seek_current(m_conn,
+                                  static_cast<float>(position_ms) / 1000.0f,
+                                  false /*absolute*/)) {
             return true;
         }
         // Seek failed — clear the cooldown so normal reporting resumes
         m_last_seek_ms.store(0, std::memory_order_relaxed);
-        LOGDEB("MpdCtl::seek: failed (attempt " << attempt << "), reconnecting\n");
+        LOGERR("MpdCtl::seek: failed (attempt " << attempt << "): "
+               << mpd_connection_get_error_message(m_conn) << "\n");
         if (m_conn) { mpd_connection_free(m_conn); m_conn = nullptr; }
     }
     return false;

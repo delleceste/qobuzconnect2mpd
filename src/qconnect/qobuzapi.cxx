@@ -25,6 +25,7 @@
 
 #include "qobuzapi.hxx"
 #include "qclog.hxx"
+#include "segstream.hxx"
 
 #include <curl/curl.h>
 #include <json/json.h>
@@ -34,60 +35,14 @@
 #include <cstring>
 #include <map>
 #include <algorithm>
-#include <condition_variable>
 #include <filesystem>
 #include <fstream>
-#include <mutex>
-#include <thread>
 #include <iomanip>
 #include <openssl/evp.h>
-#include <openssl/kdf.h>
 #include <regex>
 #include <sstream>
 
 namespace QConnect {
-
-namespace {
-
-// On slower systems MPD can start consuming the first track before background
-// materialization gets far enough ahead, which may make playback stop at the
-// current end of the local file. Prefetch a larger initial window before
-// exposing the stream to MPD.
-constexpr size_t kInitialSegmentPrefetchCount = 12;
-// Allow two concurrent background materializations so that track N+1 can
-// finish downloading its tail while track N is still playing, without waiting
-// for a single global slot.
-constexpr size_t kMaxConcurrentBackgroundMaterializations = 2;
-// Retry parameters for transient segment fetch failures (network timeouts,
-// HTTP 5xx, etc.).  Decrypt/write failures are not retried.
-constexpr int kSegmentMaxAttempts = 3;
-constexpr int kSegmentRetryDelaySecs = 3;
-
-std::mutex g_materialize_mutex;
-std::condition_variable g_materialize_cv;
-size_t g_background_materializers = 0;
-
-class BackgroundMaterializationSlot {
-public:
-    BackgroundMaterializationSlot() {
-        std::unique_lock<std::mutex> lk(g_materialize_mutex);
-        g_materialize_cv.wait(lk, [] {
-            return g_background_materializers < kMaxConcurrentBackgroundMaterializations;
-        });
-        ++g_background_materializers;
-    }
-
-    ~BackgroundMaterializationSlot() {
-        {
-            std::lock_guard<std::mutex> lk(g_materialize_mutex);
-            if (g_background_materializers > 0)
-                --g_background_materializers;
-        }
-        g_materialize_cv.notify_one();
-    }
-};
-
-} // namespace
 
 // ---- Helpers ----------------------------------------------------------------
 
@@ -112,273 +67,9 @@ static size_t curlWriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) 
     return size * nmemb;
 }
 
-static bool fetchBinaryUrl(const std::string& url,
-                           const std::vector<std::string>& headers,
-                           std::vector<uint8_t>& out,
-                           std::string* err_out = nullptr) {
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        if (err_out) *err_out = "curl_easy_init failed";
-        return false;
-    }
-    std::string buf;
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    struct curl_slist* hdrs = nullptr;
-    for (const auto& h : headers) hdrs = curl_slist_append(hdrs, h.c_str());
-    if (hdrs) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-    CURLcode rc = curl_easy_perform(curl);
-    long code = 0;
-    if (rc == CURLE_OK)
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-    if (hdrs) curl_slist_free_all(hdrs);
-    curl_easy_cleanup(curl);
-    if (rc != CURLE_OK) {
-        if (err_out) *err_out = curl_easy_strerror(rc);
-        return false;
-    }
-    if (code != 200) {
-        if (err_out) {
-            char tmp[32];
-            snprintf(tmp, sizeof(tmp), "HTTP %ld", code);
-            *err_out = tmp;
-        }
-        return false;
-    }
-    out.assign(buf.begin(), buf.end());
-    return true;
-}
-
-static bool base64urlDecodeBytes(const std::string& in, std::vector<uint8_t>& out) {
-    if (in.empty()) return false;
-    std::string s = in;
-    for (char& c : s) {
-        if (c == '-') c = '+';
-        else if (c == '_') c = '/';
-    }
-    size_t pad = (4 - s.size() % 4) % 4;
-    s.append(pad, '=');
-    size_t total_pad = 0;
-    for (size_t i = s.size(); i > 0 && s[i - 1] == '='; --i) ++total_pad;
-    out.resize(s.size());
-    int n = EVP_DecodeBlock(out.data(),
-                            reinterpret_cast<const unsigned char*>(s.data()),
-                            static_cast<int>(s.size()));
-    if (n < 0) return false;
-    n -= static_cast<int>(total_pad);
-    if (n < 0) return false;
-    out.resize(static_cast<size_t>(n));
-    return true;
-}
-
-static bool hexDecode(const std::string& hex, std::vector<uint8_t>& out) {
-    if (hex.size() % 2) return false;
-    out.clear();
-    out.reserve(hex.size() / 2);
-    for (size_t i = 0; i < hex.size(); i += 2) {
-        unsigned v = 0;
-        if (sscanf(hex.c_str() + i, "%02x", &v) != 1) return false;
-        out.push_back(static_cast<uint8_t>(v));
-    }
-    return true;
-}
-
-struct CmafFrameEntry {
-    uint32_t size{0};
-    uint16_t flags{0};
-    uint8_t  iv[8]{0};
-};
-
-struct CmafSegmentCrypto {
-    size_t data_offset{0};
-    size_t mdat_end{0};
-    std::vector<CmafFrameEntry> entries;
-};
-
-struct CmafInitInfo {
-    std::vector<uint8_t> flac_header;
-    std::vector<uint32_t> segment_byte_lens;
-};
-
-static size_t readBoxSize(const std::vector<uint8_t>& d, size_t p) {
-    if (p + 8 > d.size()) return 0;
-    uint32_t s = (uint32_t(d[p]) << 24) | (uint32_t(d[p + 1]) << 16) |
-                 (uint32_t(d[p + 2]) << 8) | uint32_t(d[p + 3]);
-    if (s == 0) return d.size() - p;
-    if (s < 8) return 0;
-    return static_cast<size_t>(s);
-}
-
-static bool parseInitSegment(const std::vector<uint8_t>& data, CmafInitInfo& out) {
-    static const uint8_t QBZ_INIT_UUID[16] = {
-        0xc7,0xc7,0x5d,0xf0,0xfd,0xd9,0x51,0xe9,0x8f,0xc2,0x29,0x71,0xe4,0xac,0xf8,0xd2
-    };
-    size_t pos = 0;
-    while (pos + 8 <= data.size()) {
-        size_t sz = readBoxSize(data, pos);
-        if (sz < 8 || pos + sz > data.size()) break;
-        if (pos + 24 <= data.size() &&
-            memcmp(&data[pos + 4], "uuid", 4) == 0 &&
-            memcmp(&data[pos + 8], QBZ_INIT_UUID, 16) == 0) {
-            const uint8_t* p = data.data() + pos + 24;
-            size_t len = sz - 24;
-            if (len < 28) return false;
-            size_t a = 4 + 4 + 4 + 4 + 1 + 3 + 6;
-            if (a + 2 > len) return false;
-            uint16_t raw_len = (uint16_t(p[a]) << 8) | uint16_t(p[a + 1]); a += 2;
-            if (a + raw_len > len) raw_len = static_cast<uint16_t>(len - a);
-            std::vector<uint8_t> raw(p + a, p + a + raw_len); a += raw_len;
-            size_t flac_pos = std::string::npos;
-            for (size_t i = 0; i + 4 <= raw.size(); ++i) {
-                if (memcmp(&raw[i], "fLaC", 4) == 0) { flac_pos = i; break; }
-            }
-            if (flac_pos == std::string::npos || flac_pos + 42 > raw.size()) return false;
-            out.flac_header.assign(raw.begin() + flac_pos, raw.begin() + flac_pos + 42);
-            out.flac_header[4] |= 0x80;
-            if (a + 1 > len) return true;
-            uint8_t key_id_len = p[a]; a += 1 + key_id_len;
-            if (a + 2 > len) return true;
-            uint16_t seg_count = (uint16_t(p[a]) << 8) | uint16_t(p[a + 1]); a += 2;
-            out.segment_byte_lens.clear();
-            for (uint16_t i = 0; i < seg_count; ++i) {
-                if (a + 8 > len) break;
-                uint32_t blen = (uint32_t(p[a]) << 24) | (uint32_t(p[a + 1]) << 16) |
-                                (uint32_t(p[a + 2]) << 8) | uint32_t(p[a + 3]);
-                a += 8; // skip sample_count too
-                out.segment_byte_lens.push_back(blen);
-            }
-            return true;
-        }
-        pos += sz;
-    }
-    return false;
-}
-
-static bool parseSegmentCrypto(const std::vector<uint8_t>& data, CmafSegmentCrypto& out) {
-    static const uint8_t QBZ_SEG_UUID[16] = {
-        0x3b,0x42,0x12,0x92,0x56,0xf3,0x5f,0x75,0x92,0x36,0x63,0xb6,0x9a,0x1f,0x52,0xb2
-    };
-    size_t uuid_pos = std::string::npos;
-    size_t mdat_end = data.size();
-    size_t pos = 0;
-    while (pos + 8 <= data.size()) {
-        size_t sz = readBoxSize(data, pos);
-        if (sz < 8 || pos + sz > data.size()) break;
-        if (memcmp(&data[pos + 4], "uuid", 4) == 0 && pos + 24 <= data.size() &&
-            memcmp(&data[pos + 8], QBZ_SEG_UUID, 16) == 0) {
-            uuid_pos = pos;
-        } else if (memcmp(&data[pos + 4], "mdat", 4) == 0) {
-            mdat_end = pos + sz;
-        }
-        pos += sz;
-    }
-    if (uuid_pos == std::string::npos) return false;
-    size_t base = uuid_pos + 24;
-    if (base + 12 > data.size()) return false;
-    size_t a = base + 4;
-    uint32_t data_off_raw = (uint32_t(data[a]) << 24) | (uint32_t(data[a + 1]) << 16) |
-                            (uint32_t(data[a + 2]) << 8) | uint32_t(data[a + 3]);
-    out.data_offset = uuid_pos + data_off_raw; a += 4;
-    size_t iv_size = data[a++]; // usually 8
-    size_t frame_count = (size_t(data[a]) << 16) | (size_t(data[a + 1]) << 8) | size_t(data[a + 2]); a += 3;
-    size_t ent_sz = 4 + 2 + 2 + iv_size;
-    if (a + frame_count * ent_sz > data.size()) return false;
-    out.entries.clear();
-    out.entries.reserve(frame_count);
-    for (size_t i = 0; i < frame_count; ++i) {
-        CmafFrameEntry e;
-        e.size = (uint32_t(data[a]) << 24) | (uint32_t(data[a + 1]) << 16) |
-                 (uint32_t(data[a + 2]) << 8) | uint32_t(data[a + 3]); a += 4;
-        a += 2; // skip
-        e.flags = (uint16_t(data[a]) << 8) | uint16_t(data[a + 1]); a += 2;
-        size_t copy = std::min<size_t>(8, iv_size);
-        memcpy(e.iv, &data[a], copy);
-        a += iv_size;
-        out.entries.push_back(e);
-    }
-    out.mdat_end = std::min(mdat_end, data.size());
-    return true;
-}
-
-static bool deriveSessionKey(const std::string& infos, uint8_t out_key[16]) {
-    auto dot = infos.find('.');
-    if (dot == std::string::npos) return false;
-    std::vector<uint8_t> salt, info, ikm;
-    if (!base64urlDecodeBytes(infos.substr(0, dot), salt)) return false;
-    if (!base64urlDecodeBytes(infos.substr(dot + 1), info)) return false;
-    if (!hexDecode("abb21364945c0583309667d13ca3d93a", ikm)) return false;
-
-    EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
-    if (!pctx) return false;
-    bool ok = EVP_PKEY_derive_init(pctx) > 0 &&
-              EVP_PKEY_CTX_set_hkdf_md(pctx, EVP_sha256()) > 0 &&
-              EVP_PKEY_CTX_set1_hkdf_salt(pctx, salt.data(), salt.size()) > 0 &&
-              EVP_PKEY_CTX_set1_hkdf_key(pctx, ikm.data(), ikm.size()) > 0 &&
-              EVP_PKEY_CTX_add1_hkdf_info(pctx, info.data(), info.size()) > 0;
-    size_t outlen = 16;
-    if (ok) ok = EVP_PKEY_derive(pctx, out_key, &outlen) > 0 && outlen == 16;
-    EVP_PKEY_CTX_free(pctx);
-    return ok;
-}
-
-static bool unwrapContentKey(const uint8_t session_key[16], const std::string& keystr,
-                             uint8_t out_key[16]) {
-    auto p1 = keystr.find('.');
-    if (p1 == std::string::npos) return false;
-    auto p2 = keystr.find('.', p1 + 1);
-    if (p2 == std::string::npos) return false;
-    std::vector<uint8_t> wrapped, iv;
-    if (!base64urlDecodeBytes(keystr.substr(p1 + 1, p2 - p1 - 1), wrapped)) return false;
-    if (!base64urlDecodeBytes(keystr.substr(p2 + 1), iv)) return false;
-    if (iv.size() != 16) return false;
-
-    EVP_CIPHER_CTX* c = EVP_CIPHER_CTX_new();
-    if (!c) return false;
-    std::vector<uint8_t> out(wrapped.size() + 16);
-    int n1 = 0, n2 = 0;
-    bool ok = EVP_DecryptInit_ex(c, EVP_aes_128_cbc(), nullptr, session_key, iv.data()) > 0 &&
-              EVP_DecryptUpdate(c, out.data(), &n1, wrapped.data(), wrapped.size()) > 0 &&
-              EVP_DecryptFinal_ex(c, out.data() + n1, &n2) > 0;
-    EVP_CIPHER_CTX_free(c);
-    if (!ok || n1 + n2 != 16) return false;
-    memcpy(out_key, out.data(), 16);
-    return true;
-}
-
-static void decryptCtrFrame(const uint8_t content_key[16], const uint8_t iv8[8],
-                            uint8_t* data, size_t len) {
-    uint8_t nonce[16] = {0};
-    memcpy(nonce, iv8, 8);
-    EVP_CIPHER_CTX* c = EVP_CIPHER_CTX_new();
-    if (!c) return;
-    int outlen = 0;
-    EVP_EncryptInit_ex(c, EVP_aes_128_ctr(), nullptr, content_key, nonce);
-    EVP_EncryptUpdate(c, data, &outlen, data, len);
-    EVP_CIPHER_CTX_free(c);
-}
-
-static bool appendMaterializedSegment(std::ofstream& ofs,
-                                      const std::vector<uint8_t>& seg,
-                                      const uint8_t content_key[16]) {
-    CmafSegmentCrypto c;
-    if (!parseSegmentCrypto(seg, c)) return false;
-    size_t p = c.data_offset;
-    for (const auto& e : c.entries) {
-        if (p + e.size > seg.size()) break;
-        std::vector<uint8_t> frame(seg.begin() + p, seg.begin() + p + e.size);
-        if (e.flags != 0) decryptCtrFrame(content_key, e.iv, frame.data(), frame.size());
-        ofs.write(reinterpret_cast<const char*>(frame.data()), frame.size());
-        p += e.size;
-    }
-    if (p < c.mdat_end && c.mdat_end <= seg.size()) {
-        ofs.write(reinterpret_cast<const char*>(seg.data() + p), c.mdat_end - p);
-    }
-    ofs.flush();
-    return ofs.good();
-}
+// (Segment fetch/decrypt and per-track plan building live in segstream.cxx.
+//  This file no longer materializes anything to disk — it just constructs
+//  the plan and registers it with the SegmentedTrackRegistry.)
 
 // ---- QobuzApi implementation ------------------------------------------------
 
@@ -641,143 +332,71 @@ bool QobuzApi::tryFileUrl(uint32_t track_id, int format_id,
         return true;
     }
 
-    // Segmented stream path (url_template + key) needs decryption/reassembly
-    // proxy before MPD can consume it. Materialize now.
+    // Segmented stream path (url_template + key) — build a plan and register
+    // it with the proxy.  No disk I/O, no segment downloads here; the HTTP
+    // proxy will fetch+decrypt segments on demand as MPD reads from the URL.
     if (root.isMember("url_template")) {
-        return materializeSegmentedTrack(root, track_id, format_id, out);
+        return planSegmentedTrack(root, track_id, format_id, out);
     }
     return false;
 }
 
-bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track_id,
-                                         int format_id, TrackStreamInfo& out) {
-    namespace fs = std::filesystem;
-    if (m_local_proxy_base_url.empty()) return false;
+bool QobuzApi::planSegmentedTrack(const Json::Value& root, uint32_t track_id,
+                                   int format_id, TrackStreamInfo& out) {
+    if (m_local_proxy_base_url.empty()) {
+        LOGERR("QobuzApi: plan track " << track_id
+               << ": local proxy base URL not set\n");
+        return false;
+    }
+    if (!m_seg_registry) {
+        LOGERR("QobuzApi: plan track " << track_id
+               << ": SegmentedTrackRegistry not wired in\n");
+        return false;
+    }
     std::string urltpl = root.get("url_template", "").asString();
     std::string keystr = root.get("key", "").asString();
-    if (urltpl.empty() || keystr.empty() || m_stream_session_infos.empty())
+    if (urltpl.empty() || keystr.empty() || m_stream_session_infos.empty()) {
+        LOGERR("QobuzApi: plan track " << track_id
+               << ": missing url_template/key/session_infos\n");
         return false;
+    }
 
     std::vector<std::string> hdrs;
     if (!m_user_token.empty()) hdrs.push_back("X-User-Auth-Token: " + m_user_token);
     hdrs.push_back("X-App-Id: " + m_app_id);
     hdrs.push_back("X-Session-Id: " + m_stream_session_id);
 
-    std::vector<uint8_t> seg0;
-    if (!fetchBinaryUrl(std::regex_replace(urltpl, std::regex("\\$SEGMENT\\$"), "0"), hdrs, seg0))
+    double sr_raw = root.get("sampling_rate", 44.1).asDouble();
+    int sampling_rate = (sr_raw < 1000) ? static_cast<int>(sr_raw * 1000)
+                                         : static_cast<int>(sr_raw);
+    int bit_depth = root.isMember("bit_depth") ? root["bit_depth"].asInt() : -1;
+    uint32_t duration_ms =
+        static_cast<uint32_t>(root.get("duration", 0).asDouble() * 1000.0);
+    int n_seg_fallback = root.get("n_segments", 0).asInt();
+
+    auto plan = std::make_shared<SegmentedTrackPlan>();
+    std::string err;
+    if (!buildSegmentedTrackPlan(urltpl, hdrs, keystr, m_stream_session_infos,
+                                  track_id, format_id, n_seg_fallback,
+                                  sampling_rate, bit_depth, duration_ms,
+                                  *plan, &err)) {
+        LOGERR("QobuzApi: plan track " << track_id << " failed: " << err << "\n");
         return false;
-
-    CmafInitInfo init;
-    if (!parseInitSegment(seg0, init)) return false;
-
-    uint8_t session_key[16], content_key[16];
-    if (!deriveSessionKey(m_stream_session_infos, session_key)) return false;
-    if (!unwrapContentKey(session_key, keystr, content_key)) return false;
-
-    fs::create_directories("/tmp/qconnect2mpd-segmented");
-    std::string rel_path = std::to_string(track_id) + "_" +
-                           std::to_string(format_id) + "_" +
-                           std::to_string(unixTimestamp()) + ".flac";
-    std::string final_path = "/tmp/qconnect2mpd-segmented/" + rel_path;
-    std::string marker_path = final_path + ".inprogress";
-
-    std::ofstream marker(marker_path, std::ios::binary);
-    marker.close();
-
-    std::ofstream ofs(final_path, std::ios::binary | std::ios::trunc);
-    if (!ofs) return false;
-    ofs.write(reinterpret_cast<const char*>(init.flac_header.data()), init.flac_header.size());
-    ofs.flush();
-
-    size_t n_audio = init.segment_byte_lens.empty()
-                     ? static_cast<size_t>(root.get("n_segments", 1).asUInt()) - 1
-                     : init.segment_byte_lens.size();
-    if (n_audio == 0) {
-        ofs.close();
-        fs::remove(marker_path);
-    } else {
-        const size_t prefetched_segments =
-            std::min(n_audio, kInitialSegmentPrefetchCount);
-        for (size_t i = 1; i <= prefetched_segments; ++i) {
-            std::vector<uint8_t> seg;
-            if (!fetchBinaryUrl(std::regex_replace(urltpl, std::regex("\\$SEGMENT\\$"),
-                                                   std::to_string(i)), hdrs, seg) ||
-                !appendMaterializedSegment(ofs, seg, content_key)) {
-                ofs.close();
-                fs::remove(final_path);
-                fs::remove(marker_path);
-                return false;
-            }
-        }
-        ofs.close();
-
-        if (n_audio > prefetched_segments) {
-            const size_t next_segment = prefetched_segments + 1;
-            std::thread([urltpl, hdrs, final_path, marker_path,
-                         next_segment, n_audio, content_key]() {
-                namespace fs = std::filesystem;
-                BackgroundMaterializationSlot slot;
-                std::ofstream append(final_path, std::ios::binary | std::ios::app);
-                if (!append) {
-                    LOGERR("QobuzApi: cannot open for append: " << final_path << "\n");
-                    fs::remove(marker_path);
-                    return;
-                }
-                for (size_t i = next_segment; i <= n_audio; ++i) {
-                    const std::string seg_url = std::regex_replace(
-                        urltpl, std::regex("\\$SEGMENT\\$"), std::to_string(i));
-                    bool seg_ok = false;
-                    for (int attempt = 1;
-                         attempt <= kSegmentMaxAttempts && !seg_ok;
-                         ++attempt) {
-                        if (attempt > 1)
-                            std::this_thread::sleep_for(
-                                std::chrono::seconds(kSegmentRetryDelaySecs));
-                        std::vector<uint8_t> seg;
-                        std::string err;
-                        if (!fetchBinaryUrl(seg_url, hdrs, seg, &err)) {
-                            LOGERR("QobuzApi: segment " << i << "/" << n_audio
-                                   << " fetch failed (" << err << ") for "
-                                   << final_path
-                                   << (attempt < kSegmentMaxAttempts
-                                       ? " — retrying" : " — giving up") << "\n");
-                            continue;
-                        }
-                        if (!appendMaterializedSegment(append, seg, content_key)) {
-                            LOGERR("QobuzApi: segment " << i << "/" << n_audio
-                                   << " decrypt/write error for " << final_path
-                                   << " — aborting\n");
-                            goto mat_failed; // unrecoverable; don't retry
-                        }
-                        seg_ok = true;
-                    }
-                    if (!seg_ok) {
-                        LOGERR("QobuzApi: background materialization aborted at segment "
-                               << i << "/" << n_audio << " for " << final_path << "\n");
-                        goto mat_failed;
-                    }
-                }
-                append.close();
-                fs::remove(marker_path);
-                return;
-            mat_failed:
-                append.close();
-                fs::remove(marker_path);
-            }).detach();
-        } else {
-            fs::remove(marker_path);
-        }
     }
 
-    out.stream_url = m_local_proxy_base_url + "/" + rel_path;
-    out.local_path = final_path;
-    out.mime_type = "audio/flac";
-    out.format_id = root.get("format_id", format_id).asInt();
-    out.duration_ms = static_cast<uint32_t>(root.get("duration", 0).asDouble() * 1000.0);
-    double sr = root.get("sampling_rate", 44.1).asDouble();
-    out.sampling_rate = (sr < 1000) ? static_cast<int>(sr * 1000) : static_cast<int>(sr);
-    out.bit_depth = root.isMember("bit_depth") ? root["bit_depth"].asInt() : -1;
-    LOGSTD("QobuzApi: materializing " << n_audio << " segments -> " << final_path << "\n");
+    std::string token = SegmentedTrackRegistry::tokenForTrack(track_id, format_id);
+    m_seg_registry->registerPlan(token, plan);
+
+    out.stream_url   = m_local_proxy_base_url + "/" + token;
+    out.local_path.clear(); // nothing on disk
+    out.mime_type    = "audio/flac";
+    out.format_id    = root.get("format_id", format_id).asInt();
+    out.duration_ms  = duration_ms;
+    out.sampling_rate = sampling_rate;
+    out.bit_depth    = bit_depth;
+    LOGSTD("QobuzApi: track " << track_id
+           << ": planned " << plan->n_audio_segments() << " segments ("
+           << plan->total_bytes << " bytes) -> " << token << "\n");
     return true;
 }
 

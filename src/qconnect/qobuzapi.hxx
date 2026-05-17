@@ -24,6 +24,8 @@
 
 namespace QConnect {
 
+class SegmentedTrackRegistry;
+
 // Minimal Qobuz REST API client for qconnect2mpd.
 //
 // Authentication uses the JWT obtained from the Qobuz app during the
@@ -116,9 +118,13 @@ public:
     // and out_jwt, and returns true.  Requires a prior successful login().
     bool fetchQwsToken(std::string& out_endpoint, std::string& out_jwt);
 
-    // Configure local HTTP proxy base URL used when materializing segmented
-    // /file/url tracks (e.g. "http://127.0.0.1:9093/qobuz-segmented").
+    // Configure local HTTP proxy base URL used to serve segmented tracks
+    // (e.g. "http://127.0.0.1:9093/qobuz-segmented").
     void setLocalProxyBaseUrl(const std::string& v) { m_local_proxy_base_url = v; }
+
+    // Registry used by planSegmentedTrack to publish track plans for the
+    // HTTP proxy to stream from.  Must be set before calling getStreamUrl().
+    void setSegmentedRegistry(SegmentedTrackRegistry* r) { m_seg_registry = r; }
 
 private:
     bool ensureStreamSession();
@@ -127,8 +133,10 @@ private:
                     long* http_code = nullptr);
     bool tryGetStreamUrl(uint32_t track_id, int format_id, TrackStreamInfo& out,
                          long* http_code = nullptr);
-    bool materializeSegmentedTrack(const Json::Value& root, uint32_t track_id,
-                                   int format_id, TrackStreamInfo& out);
+    // Build a SegmentedTrackPlan, register it, and populate `out` with the
+    // proxy URL that MPD will request to stream the track on demand.
+    bool planSegmentedTrack(const Json::Value& root, uint32_t track_id,
+                             int format_id, TrackStreamInfo& out);
     std::string httpGet(const std::string& path,
                          long* http_code_out = nullptr);
     std::string httpPostForm(const std::string& path,
@@ -148,6 +156,7 @@ private:
     uint64_t    m_stream_session_expires_at{0}; // unix seconds
     std::string m_stream_session_infos;    // from /session/start
     std::string m_local_proxy_base_url;
+    SegmentedTrackRegistry* m_seg_registry{nullptr}; // not owned
 };
 
 } // namespace QConnect

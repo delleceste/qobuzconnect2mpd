@@ -23,6 +23,8 @@
 
 namespace QConnect {
 
+class SegmentedTrackRegistry;
+
 // Credentials delivered by the Qobuz app via POST connect-to-qconnect.
 struct ConnectCredentials {
     std::string session_id;
@@ -80,6 +82,11 @@ public:
     // Register the callback invoked when the browser completes OAuth login.
     void setOAuthCallback(OAuthCallback cb) { m_oauth_cb = std::move(cb); }
 
+    // Registry used to look up segmented-track plans on
+    // GET /qobuz-segmented/<token>.  Must be set before the Qobuz app starts
+    // requesting tracks.  Not owned.
+    void setSegmentedRegistry(SegmentedTrackRegistry* r) { m_seg_registry = r; }
+
 private:
     static MHD_Result requestCallback(void* cls,
                                        struct MHD_Connection* conn,
@@ -107,6 +114,7 @@ private:
     ConnectCallback  m_on_connect;
     std::string      m_session_id;
     OAuthCallback    m_oauth_cb;
+    SegmentedTrackRegistry* m_seg_registry{nullptr}; // not owned
     struct MHD_Daemon* m_daemon{nullptr};
 };
 

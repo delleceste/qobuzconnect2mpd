@@ -104,6 +104,7 @@ qc_sources = files(
   'src/qconnect/httphandler.cxx',
   'src/qconnect/wsession.cxx',
   'src/qconnect/qobuzapi.cxx',
+  'src/qconnect/segstream.cxx',
   'src/qconnect/mpdctl.cxx',
   'src/qconnect/qcmgr.cxx',
   'src/qconnect/proto.cxx',

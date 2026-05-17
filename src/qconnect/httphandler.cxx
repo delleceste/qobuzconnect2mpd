@@ -17,17 +17,19 @@
 
 #include "httphandler.hxx"
 #include "qclog.hxx"
+#include "segstream.hxx"
 
 #include <microhttpd.h>
 #include <json/json.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <fstream>
-#include <mutex>
+#include <memory>
 #include <string>
-#include <filesystem>
-#include <chrono>
 #include <thread>
+#include <filesystem>
 
 namespace QConnect {
 
@@ -193,51 +195,167 @@ static MHD_Result sendFileResponse(struct MHD_Connection* conn,
     return ret;
 }
 
-struct GrowingFileCtx {
-    std::string path;
-    std::string marker_path;
+// ---- Segmented stream-on-demand response -----------------------------------
+//
+// Each MPD request for /qobuz-segmented/<token> creates a SegStreamCtx that
+// owns a cursor into the (header + decrypted audio segments) logical stream.
+// The MHD callback fetches and decrypts the next segment from the network as
+// MPD reads.  Range requests are honoured by precomputing the start segment
+// from segment_byte_lens.
+
+struct SegStreamCtx {
+    std::shared_ptr<SegmentedTrackPlan> plan;
+    uint64_t range_start{0};          // absolute byte offset of the response's pos=0
+    uint64_t end_byte{0};             // inclusive last byte to serve
+    size_t   cached_seg{0};           // 1-based; 0 means "no segment cached"
+    std::vector<uint8_t> cached_seg_data;
 };
 
-static ssize_t growingFileReader(void* cls, uint64_t pos, char* buf, size_t max) {
-    namespace fs = std::filesystem;
-    auto* ctx = static_cast<GrowingFileCtx*>(cls);
-    for (;;) {
-        std::error_code ec;
-        uint64_t size = fs::exists(ctx->path, ec) ? fs::file_size(ctx->path, ec) : 0;
-        if (!ec && pos < size) {
-            std::ifstream ifs(ctx->path, std::ios::binary);
-            if (!ifs) return MHD_CONTENT_READER_END_WITH_ERROR;
-            ifs.seekg(static_cast<std::streamoff>(pos), std::ios::beg);
-            size_t want = static_cast<size_t>(std::min<uint64_t>(size - pos, max));
-            ifs.read(buf, static_cast<std::streamsize>(want));
-            auto got = static_cast<ssize_t>(ifs.gcount());
-            if (got > 0) return got;
-        }
-        if (!fs::exists(ctx->marker_path))
+static ssize_t segStreamReader(void* cls, uint64_t pos, char* buf, size_t max) {
+    auto* ctx = static_cast<SegStreamCtx*>(cls);
+    const auto& plan = *ctx->plan;
+    uint64_t cur = ctx->range_start + pos;
+    if (cur > ctx->end_byte) return MHD_CONTENT_READER_END_OF_STREAM;
+
+    // 1. Serve from FLAC header region
+    if (cur < plan.flac_header.size()) {
+        size_t avail = static_cast<size_t>(plan.flac_header.size() - cur);
+        size_t want = std::min<size_t>(max,
+                       static_cast<size_t>(std::min<uint64_t>(
+                           avail, ctx->end_byte - cur + 1)));
+        memcpy(buf, plan.flac_header.data() + cur, want);
+        return static_cast<ssize_t>(want);
+    }
+
+    // 2. Serve from audio segments
+    if (plan.total_bytes == 0) {
+        // Unknown total length (segment_byte_lens missing).  We can still
+        // stream sequentially: each call after exhausting the header advances
+        // through segments 1..n.  Use cached_seg as a 1-based cursor.
+        if (ctx->cached_seg == 0) ctx->cached_seg = 1;
+        size_t target_seg = ctx->cached_seg;
+        if (target_seg > plan.n_audio_segments())
             return MHD_CONTENT_READER_END_OF_STREAM;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // (no in-segment offset available without lengths — we just keep
+        //  copying out what's left of cached_seg_data, then move on)
+    } else {
+        uint64_t audio_off = cur - plan.flac_header.size();
+        size_t target_seg = 0, in_seg = 0;
+        if (!plan.mapAudioOffset(audio_off, target_seg, in_seg))
+            return MHD_CONTENT_READER_END_OF_STREAM;
+
+        if (ctx->cached_seg != target_seg) {
+            std::string err;
+            if (!fetchAndDecryptSegment(plan, target_seg,
+                                         ctx->cached_seg_data, &err)) {
+                LOGERR("HttpHandler: segstream track " << plan.track_id
+                       << " seg " << target_seg << "/" << plan.n_audio_segments()
+                       << " fetch failed: " << err << "\n");
+                return MHD_CONTENT_READER_END_WITH_ERROR;
+            }
+            ctx->cached_seg = target_seg;
+        }
+        if (in_seg >= ctx->cached_seg_data.size()) {
+            // Decrypted segment is shorter than expected — bump to next seg.
+            ctx->cached_seg = 0;
+            ctx->cached_seg_data.clear();
+            return MHD_CONTENT_READER_END_OF_STREAM;
+        }
+        size_t avail = ctx->cached_seg_data.size() - in_seg;
+        size_t want = std::min<size_t>(max,
+                       static_cast<size_t>(std::min<uint64_t>(
+                           avail, ctx->end_byte - cur + 1)));
+        memcpy(buf, ctx->cached_seg_data.data() + in_seg, want);
+        return static_cast<ssize_t>(want);
     }
+
+    // Unknown-length fallback: pump segments sequentially.
+    if (ctx->cached_seg_data.empty()) {
+        std::string err;
+        if (!fetchAndDecryptSegment(plan, ctx->cached_seg,
+                                     ctx->cached_seg_data, &err)) {
+            LOGERR("HttpHandler: segstream track " << plan.track_id
+                   << " seg " << ctx->cached_seg << " fetch failed: " << err << "\n");
+            return MHD_CONTENT_READER_END_WITH_ERROR;
+        }
+    }
+    size_t want = std::min<size_t>(max, ctx->cached_seg_data.size());
+    memcpy(buf, ctx->cached_seg_data.data(), want);
+    ctx->cached_seg_data.erase(ctx->cached_seg_data.begin(),
+                                ctx->cached_seg_data.begin() + want);
+    if (ctx->cached_seg_data.empty()) ++ctx->cached_seg;
+    return static_cast<ssize_t>(want);
 }
 
-static void freeGrowingFileCtx(void* cls) {
-    delete static_cast<GrowingFileCtx*>(cls);
+static void freeSegStreamCtx(void* cls) {
+    delete static_cast<SegStreamCtx*>(cls);
 }
 
-static MHD_Result sendGrowingFileResponse(struct MHD_Connection* conn,
-                                          const std::string& path,
-                                          const std::string& marker_path,
-                                          const std::string& content_type,
-                                          bool /*head_only*/) {
-    auto* ctx = new GrowingFileCtx{path, marker_path};
-    struct MHD_Response* resp = MHD_create_response_from_callback(
-        MHD_SIZE_UNKNOWN, 64 * 1024, &growingFileReader, ctx, &freeGrowingFileCtx);
-    if (!resp) {
-        delete ctx;
-        return sendResponse(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, R"({"error":"stream setup failed"})");
+static MHD_Result sendSegmentedStreamResponse(
+    struct MHD_Connection* conn,
+    std::shared_ptr<SegmentedTrackPlan> plan,
+    const char* method) {
+
+    const bool head_only = (strcmp(method, "HEAD") == 0);
+    const uint64_t total = plan->total_bytes;
+
+    // Parse Range (only meaningful when total is known).
+    uint64_t start = 0;
+    uint64_t end = (total > 0) ? total - 1 : 0;
+    bool partial = false;
+    if (total > 0) {
+        const char* range = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Range");
+        if (range && strncmp(range, "bytes=", 6) == 0) {
+            long long s = -1, e = -1;
+            if (sscanf(range + 6, "%lld-%lld", &s, &e) >= 1) {
+                if (s >= 0) start = static_cast<uint64_t>(s);
+                if (e >= 0) end = static_cast<uint64_t>(e);
+                if (end >= total) end = total - 1;
+                if (start >= total) {
+                    return MHD_queue_response(
+                        conn, MHD_HTTP_RANGE_NOT_SATISFIABLE,
+                        MHD_create_response_from_buffer(0, nullptr,
+                                                         MHD_RESPMEM_PERSISTENT));
+                }
+                partial = true;
+            }
+        }
     }
-    MHD_add_response_header(resp, "Content-Type", content_type.c_str());
+
+    const uint64_t body_len = (total > 0) ? (end - start + 1) : MHD_SIZE_UNKNOWN;
+
+    struct MHD_Response* resp = nullptr;
+    if (head_only) {
+        resp = MHD_create_response_from_buffer(0, nullptr, MHD_RESPMEM_PERSISTENT);
+    } else {
+        auto* ctx = new SegStreamCtx();
+        ctx->plan = std::move(plan);
+        ctx->range_start = start;
+        ctx->end_byte = (total > 0) ? end : UINT64_MAX;
+        resp = MHD_create_response_from_callback(
+            body_len, 64 * 1024, &segStreamReader, ctx, &freeSegStreamCtx);
+        if (!resp) {
+            delete ctx;
+            return sendResponse(conn, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                R"({"error":"stream setup failed"})");
+        }
+    }
+
+    MHD_add_response_header(resp, "Content-Type", "audio/flac");
+    if (total > 0) {
+        MHD_add_response_header(resp, "Content-Length",
+                                std::to_string(body_len).c_str());
+        MHD_add_response_header(resp, "Accept-Ranges", "bytes");
+    }
+    if (partial) {
+        std::string cr = "bytes " + std::to_string(start) + "-" +
+                         std::to_string(end) + "/" + std::to_string(total);
+        MHD_add_response_header(resp, "Content-Range", cr.c_str());
+    }
     MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
-    MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
+
+    MHD_Result ret = MHD_queue_response(
+        conn, partial ? MHD_HTTP_PARTIAL_CONTENT : MHD_HTTP_OK, resp);
     MHD_destroy_response(resp);
     return ret;
 }
@@ -253,30 +371,21 @@ MHD_Result HttpHandler::handleRequest(struct MHD_Connection* conn,
 
     if ((strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) &&
         std::string(url).rfind(seg_prefix, 0) == 0) {
-        std::string name = std::string(url).substr(seg_prefix.size());
-        if (name.empty() || name.find("..") != std::string::npos ||
-            name.front() == '/' || name.back() == '/') {
+        std::string token = std::string(url).substr(seg_prefix.size());
+        if (token.empty() || token.find("..") != std::string::npos ||
+            token.front() == '/' || token.back() == '/') {
             return sendResponse(conn, MHD_HTTP_BAD_REQUEST, R"({"error":"bad path"})");
         }
-        const std::string path = "/tmp/qconnect2mpd-segmented/" + name;
-        const std::string marker_path = path + ".inprogress";
-        if (std::filesystem::exists(marker_path)) {
-            // While materialization is still running, never return a fixed-size
-            // snapshot. Some MPD builds appear to probe with HEAD before GET; if
-            // we advertise the current partial Content-Length they can stop at
-            // that early boundary on slower machines.
-            if (strcmp(method, "HEAD") == 0)
-                return sendGrowingFileResponse(conn, path, marker_path,
-                                               "audio/flac", true);
-
-            const char* range = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Range");
-            if (range && *range) {
-                LOGDEB("HttpHandler: ignoring Range for growing segmented file "
-                       << name << "\n");
+        // Plan-based streaming path: fetch+decrypt segments on demand.
+        if (m_seg_registry) {
+            auto plan = m_seg_registry->get(token);
+            if (plan) {
+                return sendSegmentedStreamResponse(conn, std::move(plan), method);
             }
-            return sendGrowingFileResponse(conn, path, marker_path, "audio/flac",
-                                           false);
         }
+        // Backwards-compatible disk fallback (kept for any leftover materialised
+        // files from older releases — new tracks always go through the registry).
+        const std::string path = "/tmp/qconnect2mpd-segmented/" + token;
         return sendFileResponse(conn, path, "audio/flac",
                                 strcmp(method, "HEAD") == 0);
     }

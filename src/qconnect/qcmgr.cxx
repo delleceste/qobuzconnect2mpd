@@ -247,6 +247,7 @@ bool QcManager::start() {
     m_api = std::make_unique<QobuzApi>(m_cfg.api_base_url,
                                         m_cfg.app_id,
                                         m_cfg.app_secret);
+    m_api->setSegmentedRegistry(&m_seg_registry);
 
     // Auto-fetch app_id + secret from Qobuz bundle.js when not in config
     if (m_cfg.app_id.empty()) {
@@ -288,6 +289,7 @@ bool QcManager::start() {
         m_cfg.http_port, m_cfg.format_id,
         m_api->appId(),
         [this](ConnectCredentials c) { onConnect(std::move(c)); });
+    m_http->setSegmentedRegistry(&m_seg_registry);
     if (!m_http->start()) return false;
     m_api->setLocalProxyBaseUrl("http://127.0.0.1:" +
                                 std::to_string(m_cfg.http_port) +
@@ -478,14 +480,17 @@ void QcManager::onWsDisconnected() {
         m_pending_queue_load.tracks.clear();
     }
     m_queue_load_cv.notify_all();
+    m_pending_skip_qid.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
         cleanupMaterializedFiles(m_track_local_paths);
         m_queue_item_ids.clear();
+        m_all_queue_item_ids.clear();
         m_track_local_paths.clear();
         m_track_sample_rates.clear();
         m_track_titles.clear();
     }
+    m_seg_registry.clear();
     if (m_mpd) m_mpd->stop();
     notifyUpmpdcli("STOPPED\n");
     LOGINF("QcManager: WebSocket session ended\n");
@@ -499,50 +504,56 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
     // Clamp bogus positions (server can send unsigned-wrapped negatives)
     if (position_ms > 0x7FFFFFFF) position_ms = 0;
 
-    // Handle track change independently of play state
-    // (server sends state=UNKNOWN + qitem=N to mean "switch track, keep state")
+    LOGINF("QcManager: onSetState ps=" << static_cast<int>(ps)
+           << " has_pos=" << has_position << " pos_ms=" << position_ms
+           << " has_qitem=" << current_item.has_queue_item_id
+           << " qid=" << current_item.queue_item_id << "\n");
+
+    // Follow the same order as the qobine reference implementation:
+    //   1. apply play-state
+    //   2. apply seek (if explicit position supplied)
+    //   3. switch track (only when the track actually changed)
+    //
+    // Doing the track switch last (step 3) means the seek in step 2 fires on
+    // the *current* track, which is harmless when a switch follows.
+    // Doing the same-track check in step 3 ensures that a seek command that
+    // includes the current queue_item_id does NOT restart the track.
+
+    // 1. Play state
+    switch (ps) {
+    case PlayingState::PLAYING: m_mpd->pause(false); break;
+    case PlayingState::PAUSED:  m_mpd->pause(true);  break;
+    case PlayingState::STOPPED: m_mpd->stop();        break;
+    default: break; // UNKNOWN = no change
+    }
+
+    // 2. Seek — only when the server explicitly provides a position
+    if (has_position) {
+        m_mpd->seek(position_ms);
+    }
+
+    // 3. Track switch — only when the target track differs from the current one.
+    //    Compare by MPD position (not qid) to avoid the ambiguity when the
+    //    first track's queue_item_id happens to be 0 (Qobuz uses 0-based qids)
+    //    and queueItemIdAt's "not found" fallback also returns 0 — that
+    //    collision used to silently swallow taps on the first track.
     if (current_item.has_queue_item_id) {
         int target_pos = mpdPosForQueueItem(current_item.queue_item_id);
-        if (target_pos >= 0)
-            m_mpd->play(target_pos);
-    }
-
-    // Handle play state change
-    switch (ps) {
-    case PlayingState::PLAYING:
-        // If no track change above, just unpause (don't use play() —
-        // it can restart from wrong position after reconnection)
-        if (!current_item.has_queue_item_id)
-            m_mpd->pause(false);
-        break;
-    case PlayingState::PAUSED:
-        m_mpd->pause(true);
-        break;
-    case PlayingState::STOPPED:
-        m_mpd->stop();
-        break;
-    default:
-        // UNKNOWN = no state change requested
-        break;
-    }
-
-    // Handle seek independently of play state (has_position distinguishes
-    // "seek to 0" from "no seek requested")
-    if (has_position) {
-        // "Previous track" logic: the Qobuz app sends seek-to-0 for the back
-        // button and expects the renderer to skip to the previous track when
-        // already near the start of the current one.  Only applies when there
-        // is no explicit track switch in the same command (has_queue_item_id),
-        // so that normal track auto-advance (server sends position=0 + new
-        // queue_item_id) does not incorrectly go backwards.
-        if (position_ms == 0 && !current_item.has_queue_item_id) {
+        if (target_pos >= 0) {
             MpdState st = m_mpd->getState();
-            if (st.position_ms < 3000 && st.queue_pos > 0) {
-                m_mpd->previous();
-                return;
+            if (target_pos != st.queue_pos) {
+                m_mpd->play(target_pos);
+                // Any stale pending skip from a previous fast tap is superseded
+                m_pending_skip_qid.store(0, std::memory_order_relaxed);
             }
+        } else {
+            // Track URL not yet resolved (queue still loading).  Store the
+            // target; queueLoadLoop will call play() once the track is added.
+            LOGINF("QcManager: skip target qitem=" << current_item.queue_item_id
+                   << " not in MPD queue yet — storing pending skip\n");
+            m_pending_skip_qid.store(current_item.queue_item_id,
+                                     std::memory_order_relaxed);
         }
-        m_mpd->seek(position_ms);
     }
 }
 
@@ -568,10 +579,12 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
             std::lock_guard<std::mutex> lk(m_qmap_mutex);
             cleanupMaterializedFiles(m_track_local_paths);
             m_queue_item_ids.clear();
+            m_all_queue_item_ids.clear();
             m_track_local_paths.clear();
             m_track_sample_rates.clear();
             m_track_titles.clear();
         }
+        m_seg_registry.clear();
         if (m_mpd) m_mpd->stopAndClear();
         return;
     }
@@ -581,6 +594,19 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
     for (size_t i = 0; i < tracks.size(); ++i) {
         LOGINF("QcManager:   track[" << i << "] qitem=" << tracks[i].queue_item_id
                << " trackid=" << tracks[i].track_id << "\n");
+    }
+
+    // New queue supersedes any pending skip from the previous queue
+    m_pending_skip_qid.store(0, std::memory_order_relaxed);
+
+    // Capture the full ordered queue immediately so skip direction fallback
+    // has the complete list before any URL resolution starts.
+    {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        m_all_queue_item_ids.clear();
+        m_all_queue_item_ids.reserve(tracks.size());
+        for (const auto& t : tracks)
+            m_all_queue_item_ids.push_back(t.queue_item_id);
     }
 
     // Clear the current QConnect queue immediately so a user pressing play
@@ -598,6 +624,8 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
         m_track_sample_rates.clear();
         m_track_titles.clear();
     }
+    // Drop plans for the previous queue's tracks before resolving the new one.
+    m_seg_registry.clear();
     uint64_t generation = m_queue_load_generation.fetch_add(1, std::memory_order_relaxed) + 1;
     {
         std::lock_guard<std::mutex> lk(m_queue_load_mutex);
@@ -638,6 +666,22 @@ void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
         ins(m_track_sample_rates, sample_rates);
         ins(m_track_local_paths,  local_paths);
         ins(m_track_titles,       titles);
+
+        // Keep full queue in sync
+        {
+            auto it = std::find(m_all_queue_item_ids.begin(),
+                                m_all_queue_item_ids.end(),
+                                static_cast<uint64_t>(insert_after_item_id));
+            size_t ins_pos = (it != m_all_queue_item_ids.end())
+                ? static_cast<size_t>(it - m_all_queue_item_ids.begin()) + 1
+                : m_all_queue_item_ids.size();
+            std::vector<uint64_t> new_ids;
+            new_ids.reserve(tracks.size());
+            for (const auto& t : tracks) new_ids.push_back(t.queue_item_id);
+            m_all_queue_item_ids.insert(
+                m_all_queue_item_ids.begin() + ins_pos,
+                new_ids.begin(), new_ids.end());
+        }
     }
 
     int mpd_id = m_mpd->queueItemToMpdId(insert_after_item_id);
@@ -657,6 +701,8 @@ void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
         m_track_sample_rates.insert(m_track_sample_rates.end(), sample_rates.begin(), sample_rates.end());
         m_track_local_paths.insert(m_track_local_paths.end(), local_paths.begin(), local_paths.end());
         m_track_titles.insert(m_track_titles.end(), titles.begin(), titles.end());
+        for (const auto& t : tracks)
+            m_all_queue_item_ids.push_back(t.queue_item_id);
     }
     m_mpd->addTracks(urls);
 }
@@ -664,33 +710,58 @@ void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
 void QcManager::onTracksRemoved(const std::vector<uint64_t>& queue_item_ids) {
     if (!m_mpd) return;
     std::vector<std::string> stale_paths;
-    // Remove from our mapping
+    std::vector<int>         mpd_positions;
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        // Pass 1: collect MPD positions (== indices in our parallel vectors).
         for (uint64_t qid : queue_item_ids) {
             auto it = std::find(m_queue_item_ids.begin(),
                                 m_queue_item_ids.end(), qid);
-            if (it != m_queue_item_ids.end()) {
-                size_t idx = static_cast<size_t>(it - m_queue_item_ids.begin());
-                if (idx < m_track_local_paths.size() && !m_track_local_paths[idx].empty())
-                    stale_paths.push_back(m_track_local_paths[idx]);
-                m_queue_item_ids.erase(it);
-                if (idx < m_track_sample_rates.size())
-                    m_track_sample_rates.erase(m_track_sample_rates.begin() + idx);
-                if (idx < m_track_local_paths.size())
-                    m_track_local_paths.erase(m_track_local_paths.begin() + idx);
-                if (idx < m_track_titles.size())
-                    m_track_titles.erase(m_track_titles.begin() + idx);
-            }
+            if (it != m_queue_item_ids.end())
+                mpd_positions.push_back(
+                    static_cast<int>(it - m_queue_item_ids.begin()));
+        }
+        // Descending so earlier erases don't shift later indices.
+        std::sort(mpd_positions.begin(), mpd_positions.end(),
+                  std::greater<int>());
+
+        // Pass 2: erase from parallel vectors at those positions.
+        for (int pos : mpd_positions) {
+            size_t idx = static_cast<size_t>(pos);
+            if (idx < m_track_local_paths.size()
+                && !m_track_local_paths[idx].empty())
+                stale_paths.push_back(m_track_local_paths[idx]);
+            if (idx < m_queue_item_ids.size())
+                m_queue_item_ids.erase(m_queue_item_ids.begin() + idx);
+            if (idx < m_track_sample_rates.size())
+                m_track_sample_rates.erase(m_track_sample_rates.begin() + idx);
+            if (idx < m_track_local_paths.size())
+                m_track_local_paths.erase(m_track_local_paths.begin() + idx);
+            if (idx < m_track_titles.size())
+                m_track_titles.erase(m_track_titles.begin() + idx);
+        }
+        // m_all_queue_item_ids is the FULL planned queue (not necessarily
+        // 1:1 with MPD), so erase by qid lookup.
+        for (uint64_t qid : queue_item_ids) {
+            auto ait = std::find(m_all_queue_item_ids.begin(),
+                                 m_all_queue_item_ids.end(), qid);
+            if (ait != m_all_queue_item_ids.end())
+                m_all_queue_item_ids.erase(ait);
         }
     }
     cleanupMaterializedFiles(stale_paths);
-    std::vector<int> mpd_ids;
-    for (uint64_t qid : queue_item_ids) {
-        int mid = m_mpd->queueItemToMpdId(qid);
-        if (mid >= 0) mpd_ids.push_back(mid);
+    if (!mpd_positions.empty())
+        m_mpd->removeTracksByPos(mpd_positions);
+
+    // Adjust the memo of last seen MPD queue_pos: every removed position
+    // strictly below it shifts the current position down by one. Without
+    // this, the next onMpdState fires a spurious "track change" callback.
+    int cur = m_last_mpd_queue_pos.load();
+    if (cur >= 0) {
+        int adj = 0;
+        for (int p : mpd_positions) if (p < cur) ++adj;
+        if (adj > 0) m_last_mpd_queue_pos.store(cur - adj);
     }
-    if (!mpd_ids.empty()) m_mpd->removeTracks(mpd_ids);
 }
 
 // ---- MPD state callback ----------------------------------------------------
@@ -781,7 +852,6 @@ void QcManager::onMpdState(const MpdState& st) {
         if (static_cast<size_t>(st.queue_pos) < m_track_sample_rates.size())
             m_ws->reportFileQuality(m_track_sample_rates[st.queue_pos]);
     }
-    cleanupPlayedMaterializedFiles(st.queue_pos);
 
     m_last_mpd_status = st.status;
     m_last_mpd_queue_pos.store(st.queue_pos);
@@ -922,6 +992,9 @@ void QcManager::queueLoadLoop() {
                 m_ws->reportFileQuality(m_track_sample_rates[mpd_start]);
         }
 
+        // If the user tapped a track while URLs were still resolving, apply now
+        applyPendingSkip();
+
         // Fetch titles for initial tracks that don't have one yet (direct-URL tracks;
         // segmented tracks already got their title from materializeSegmentedTrack).
         // Runs after loadQueue so MPD is already playing.
@@ -984,6 +1057,9 @@ void QcManager::queueLoadLoop() {
             continue;
         }
 
+        // Check again: the pending skip target might now be in the queue
+        applyPendingSkip();
+
         // Fetch titles for tail tracks that don't have one yet.
         size_t tail_count = add_urls.size();
         for (size_t i = 0; i < tail_count; ++i) {
@@ -1031,22 +1107,6 @@ void QcManager::cleanupMaterializedFiles(const std::vector<std::string>& paths) 
         removeMaterializedFile(path);
 }
 
-void QcManager::cleanupPlayedMaterializedFiles(int queue_pos) {
-    if (queue_pos < 2) return;
-    std::vector<std::string> stale_paths;
-    {
-        std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        size_t keep_from = static_cast<size_t>(queue_pos - 1);
-        size_t limit = std::min(keep_from, m_track_local_paths.size());
-        for (size_t i = 0; i < limit; ++i) {
-            if (!m_track_local_paths[i].empty()) {
-                stale_paths.push_back(m_track_local_paths[i]);
-                m_track_local_paths[i].clear();
-            }
-        }
-    }
-    cleanupMaterializedFiles(stale_paths);
-}
 
 uint64_t QcManager::queueItemIdAt(int mpd_pos) const {
     std::lock_guard<std::mutex> lk(m_qmap_mutex);
@@ -1059,6 +1119,27 @@ int QcManager::mpdPosForQueueItem(uint64_t queue_item_id) const {
     std::lock_guard<std::mutex> lk(m_qmap_mutex);
     for (size_t i = 0; i < m_queue_item_ids.size(); ++i) {
         if (m_queue_item_ids[i] == queue_item_id)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+void QcManager::applyPendingSkip() {
+    uint64_t pending = m_pending_skip_qid.load(std::memory_order_relaxed);
+    if (!pending || !m_mpd) return;
+    int target = mpdPosForQueueItem(pending);
+    if (target >= 0) {
+        m_pending_skip_qid.store(0, std::memory_order_relaxed);
+        m_mpd->play(target);
+        LOGINF("QcManager: applied pending skip to qitem=" << pending
+               << " MPD pos=" << target << "\n");
+    }
+}
+
+int QcManager::posInFullQueue(uint64_t queue_item_id) const {
+    std::lock_guard<std::mutex> lk(m_qmap_mutex);
+    for (size_t i = 0; i < m_all_queue_item_ids.size(); ++i) {
+        if (m_all_queue_item_ids[i] == queue_item_id)
             return static_cast<int>(i);
     }
     return -1;

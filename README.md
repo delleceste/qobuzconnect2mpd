@@ -150,6 +150,198 @@ the daemon prints an OAuth URL at startup:
 Open the URL in a browser, log in with your Qobuz account, and the token is
 captured automatically via the local redirect handler.
 
+## Bit-perfect audio chain
+
+`qobuzconnect2mpd` is designed to be transparent: the samples your DAC receives
+are byte-identical to what Qobuz delivered.  This chapter is an end-to-end
+audit of the chain, the places it can silently degrade, and how to verify
+bit-perfectness on a running system.
+
+### Pipeline overview
+
+```
+Qobuz CDN
+    │  encrypted CMAF/FLAC segments (AES-CTR)
+    ▼
+[ qobuzconnect2mpd ]                       — segstream.cxx
+    │  1. AES-CTR decrypt   → byte-identical plaintext
+    │  2. Pull FLAC frames out of `mdat`
+    │  3. Prepend the STREAMINFO header from the init segment
+    ▼
+HTTP proxy on 127.0.0.1:9093              — httphandler.cxx
+    │  on-demand streaming, Range-aware,
+    │  no transcoding, no buffering tricks
+    ▼
+MPD (libFLAC decoder)                      — lossless PCM
+    ▼
+ALSA `hw:N,M` (direct kernel path)
+    ▼
+DAC
+```
+
+The qconnect side is verifiably lossless: AES-CTR is a stream cipher (its
+output is deterministic and byte-identical to the plaintext); FLAC frames are
+relayed unchanged; the proxy never alters bytes. `file -b` on any segment
+materialised during testing reports e.g. `FLAC audio bitstream data, 16 bit,
+stereo, 44.1 kHz, 11090856 samples` — i.e. a valid FLAC file with the
+expected sample count.
+
+Everything after MPD is **your hardware and MPD config**.  The rest of this
+chapter is about getting those right.
+
+### Things that silently break bit-perfectness
+
+| Stage | Risk | How to disable |
+|---|---|---|
+| MPD volume / replay-gain | rescales samples | `volume_normalization "no"`, `replay_gain_handler "none"` |
+| MPD software mixer | scales output | `mixer_type "none"` in audio_output |
+| ALSA `plughw:` / `default` | pulls in `dmix` + resampler | use `hw:N,M` directly |
+| `auto_resample "yes"` | libasound resamples behind MPD | `auto_resample "no"` |
+| `auto_format "yes"` | libasound converts bit-depth | `auto_format "no"` |
+| Hardware can't lock source rate | MPD falls back to its internal resampler | use a DAC that natively supports every rate in your library |
+| PulseAudio / PipeWire intercept | resampled by the audio server | use `hw:N,M`, not `pulse`/`pipewire` |
+
+### Recommended `mpd.conf`
+
+Global settings (top level):
+
+```
+volume_normalization "no"       # no software volume normalisation
+replay_gain_handler  "none"     # no replay gain (would alter samples)
+samplerate_converter "soxr very high"   # best algorithm for the unavoidable cases
+```
+
+`audio_output` block:
+
+```
+audio_output {
+    type                 "alsa"
+    name                 "DAC"
+    device               "hw:0,0"   # direct kernel path — no dmix / Pulse / PipeWire
+    mixer_type           "none"     # no mixer at all (hardware or software)
+    auto_resample        "no"       # do not let libasound resample
+    auto_format          "no"       # do not let libasound convert sample formats
+    replay_gain_handler  "none"     # redundant but explicit
+}
+```
+
+Find your card/device numbers with `aplay -l`.  Avoid `default` and
+`plughw:` — they route through ALSA's `dmix` which has a fixed sample rate
+and a low-quality resampler.
+
+Optional: restrict MPD to formats your DAC natively supports so it can't
+silently fall back to something less ideal:
+
+```
+allowed_formats "44100:24:2 48000:24:2 88200:24:2 96000:24:2 176400:24:2 192000:24:2"
+```
+
+Optional explicit resampler (only used when MPD has to resample):
+
+```
+resampler {
+    plugin   "soxr"
+    quality  "very high"
+    thread   "yes"
+}
+```
+
+### Audit your hardware ceiling
+
+Knowing what rates your DAC can actually lock is essential — anything else
+ends up resampled in MPD.
+
+```
+cat /proc/asound/card0/codec#0 | grep -E 'rates|bits'
+```
+
+A typical built-in Intel HDA codec (laptop) reports something like:
+
+```
+rates  [0x560]: 44100 48000 96000 192000
+bits   [0xe]:   16 20 24
+```
+
+Read that as: **rates supported = the ones listed, nothing else**.  Note in
+particular that 88.2 kHz and 176.4 kHz are absent on most built-in codecs;
+any Qobuz HiRes track at those rates (frequent in classical reissues from
+SACD / DXD masters) will be resampled by MPD before it reaches the DAC.
+
+ALSA's hardware-format probe is also informative:
+
+```
+aplay --dump-hw-params -D hw:0,0 /dev/zero
+```
+
+Output of interest:
+
+```
+RATE: [44100 192000]
+Available formats: S16_LE, S32_LE
+```
+
+The codec exposes 16-bit and 32-bit containers (Intel HDA carries 24-bit
+samples inside an S32_LE container with 8 padding bits — that is still
+bit-perfect for 24-bit content; the DAC extracts the 24 valid bits and
+ignores the rest).
+
+### Verify in real time
+
+While a track is playing, in another terminal:
+
+```
+watch -n 0.5 cat /proc/asound/card0/pcm0p/sub0/hw_params
+```
+
+Expected for a 24-bit / 96 kHz Qobuz track:
+
+```
+format: S32_LE         ← 24-bit payload, S32 container — bit-perfect
+rate: 96000            ← matches source rate
+channels: 2
+```
+
+If `rate:` doesn't match the source rate (visible on the now-playing line),
+MPD resampled.  If `format:` is `S16_LE` for a 24-bit source, MPD truncated.
+Either means the chain is not bit-perfect for that track on this hardware.
+
+### When the built-in codec is the bottleneck
+
+For absolute bit-perfectness across every rate Qobuz serves (44.1, 48, 88.2,
+96, 176.4, 192 kHz), use a DAC that natively locks all six.  Practically any
+modern USB DAC does.  After plugging it in:
+
+```
+aplay -l                       # find the new card number
+```
+
+then change `device "hw:N,0"` in `mpd.conf` to match.  Nothing else in this
+codebase or in MPD's pipeline has to move — the rest of the chain is already
+lossless.
+
+### MPD socket layout (independent of bit-perfect)
+
+`bind_to_address` and the music database are completely independent — a single
+MPD instance can scan a `music_directory` *and* expose a Unix domain socket
+for clients like `qobuzconnect2mpd`:
+
+```
+music_directory   "/path/to/music"
+db_file           "/var/lib/mpd/database"
+
+bind_to_address   "/run/mpd/socket"   # Unix domain socket
+bind_to_address   "127.0.0.1"         # also TCP on localhost (optional)
+port              "6600"
+```
+
+Multiple `bind_to_address` lines are allowed; each is bound independently. A
+value starting with `/` is treated as an absolute path and creates an
+`AF_LOCAL` socket. The database, the TCP listener and the Unix socket all
+coexist without conflict.
+
+Note: as soon as you set any `bind_to_address`, MPD stops auto-binding
+`$XDG_RUNTIME_DIR/mpd/socket` — only what you list is bound.
+
 ## systemd
 
 A sample unit file is at `build/qobuzconnect2mpd.service`.  Install it as

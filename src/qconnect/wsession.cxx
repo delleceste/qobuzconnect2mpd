@@ -139,7 +139,10 @@ bool WSession::connect(const ConnectCredentials& creds) {
 }
 
 void WSession::disconnect() {
-    if (!m_connected) return;
+    // Don't gate on m_connected: eventLoop clears it before exiting on
+    // recv error, after which m_thread is still joinable. Skipping the
+    // join here leaves a joinable thread for the destructor, which then
+    // calls std::terminate. Always join if there's a thread to join.
     m_stop = true;
     if (m_thread.joinable()) m_thread.join();
     if (m_curl) {
@@ -543,7 +546,7 @@ void WSession::dispatchMessage(const Message& msg) {
         break;
 
     case MsgType::SRVRC_QUEUE_CLEARED:
-        LOGDEB("WSession: QueueCleared\n");
+        LOGINF("WSession: QueueCleared\n");
         if (m_cbs.on_queue_load)
             m_cbs.on_queue_load({}, 0); // empty queue
         break;

@@ -84,6 +84,10 @@ public:
     // Remove queue entries by MPD song id.
     bool removeTracks(const std::vector<int>& mpd_song_ids);
 
+    // Remove queue entries by MPD queue position. Caller must pass positions
+    // sorted descending so that earlier removals don't shift later indices.
+    bool removeTracksByPos(const std::vector<int>& mpd_positions);
+
     // ---- Playback ----------------------------------------------------------
 
     bool play(int queue_pos = -1);

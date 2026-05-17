@@ -361,9 +361,19 @@ bool decodeMsgSetState(const uint8_t* d, size_t len, MsgSetState& out) {
         case 3: if (!readLenField(d,len,pos,fd,fl)) return false;
                 decodeQueueVersion(fd, fl, out.queue_version); break;
         case 4: if (!readLenField(d,len,pos,fd,fl)) return false;
-                decodeQueueTrackRef(fd, fl, out.current_queue_item); break;
+                decodeQueueTrackRef(fd, fl, out.current_queue_item);
+                // The presence of the parent field 4 carries information even
+                // when the inner queue_item_id (field 1) is omitted: Qobuz
+                // omits inner scalar fields whose value is the proto3 default
+                // (0).  So "field 4 present, field 1 absent" means qid=0 —
+                // i.e. the *first* track.  Force the has-flag on so the
+                // SetState handler treats it as a real qid.
+                out.current_queue_item.has_queue_item_id = true;
+                break;
         case 5: if (!readLenField(d,len,pos,fd,fl)) return false;
-                decodeQueueTrackRef(fd, fl, out.next_queue_item); break;
+                decodeQueueTrackRef(fd, fl, out.next_queue_item);
+                out.next_queue_item.has_queue_item_id = true;
+                break;
         default: if (!skipField(d, len, pos, wt)) return false; break;
         }
     }
@@ -562,6 +572,10 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
         case MsgType::SRVRC_QUEUE_STATE:
             decodeMsgQueueTracks(fd, fl, msg.queue_state.tracks,
                                   msg.queue_state.queue_version);
+            break;
+        case MsgType::SRVRC_QUEUE_CLEARED:
+            // body is just queue_version + action_uuid; we don't need either.
+            // The wsession handler only needs to know the message arrived.
             break;
         case MsgType::SRVRC_QUEUE_LOAD_TRACKS:
             decodeMsgQueueTracks(fd, fl, msg.queue_load_tracks.tracks,
