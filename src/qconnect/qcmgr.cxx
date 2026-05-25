@@ -454,7 +454,7 @@ void QcManager::onConnect(ConnectCredentials creds) {
         onTracksRemoved(ids);
     };
     cbs.on_connected    = [this]() { onWsConnected(); };
-    cbs.on_disconnected = [this]() { onWsDisconnected(); };
+    cbs.on_disconnected = [this](bool error) { onWsDisconnected(error); };
 
     m_ws = std::make_unique<WSession>(m_devinfo, cbs);
     if (!m_ws->connect(creds)) {
@@ -471,16 +471,16 @@ void QcManager::onWsConnected() {
     LOGINF("QcManager: WebSocket session active\n");
 }
 
-void QcManager::onWsDisconnected() {
+void QcManager::onWsDisconnected(bool error) {
     m_ws_active = false;
     m_queue_load_generation.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(m_queue_load_mutex);
-        m_pending_queue_load.pending = false;
-        m_pending_queue_load.tracks.clear();
+        m_async_tasks.clear();
     }
     m_queue_load_cv.notify_all();
     m_pending_skip_qid.store(0, std::memory_order_relaxed);
+    m_pending_play.store(false, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
         cleanupMaterializedFiles(m_track_local_paths);
@@ -493,7 +493,12 @@ void QcManager::onWsDisconnected() {
     m_seg_registry.clear();
     if (m_mpd) m_mpd->stop();
     notifyUpmpdcli("STOPPED\n");
-    LOGINF("QcManager: WebSocket session ended\n");
+    if (error) {
+        LOGERR("QcManager: WebSocket connection lost — exiting so systemd can restart the service\n");
+        m_fatal_error.store(true, std::memory_order_relaxed);
+    } else {
+        LOGINF("QcManager: WebSocket session ended (replaced or stopped)\n");
+    }
 }
 
 void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
@@ -521,9 +526,20 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
 
     // 1. Play state
     switch (ps) {
-    case PlayingState::PLAYING: m_mpd->pause(false); break;
-    case PlayingState::PAUSED:  m_mpd->pause(true);  break;
-    case PlayingState::STOPPED: m_mpd->stop();        break;
+    case PlayingState::PLAYING:
+        m_mpd->pause(false);
+        // If the queue is still loading, pause(false) is a no-op.  Remember
+        // the intent so queueLoadLoop can apply it after loadQueue completes.
+        m_pending_play.store(true, std::memory_order_relaxed);
+        break;
+    case PlayingState::PAUSED:
+        m_mpd->pause(true);
+        m_pending_play.store(false, std::memory_order_relaxed);
+        break;
+    case PlayingState::STOPPED:
+        m_mpd->stop();
+        m_pending_play.store(false, std::memory_order_relaxed);
+        break;
     default: break; // UNKNOWN = no change
     }
 
@@ -596,7 +612,9 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
                << " trackid=" << tracks[i].track_id << "\n");
     }
 
-    // New queue supersedes any pending skip from the previous queue
+    // New queue supersedes any pending skip from the previous queue.
+    // m_pending_play is intentionally NOT cleared: SetState(PLAYING) often
+    // arrives before QueueLoad; clearing here would lose the play intent.
     m_pending_skip_qid.store(0, std::memory_order_relaxed);
 
     // Capture the full ordered queue immediately so skip direction fallback
@@ -629,82 +647,47 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
     uint64_t generation = m_queue_load_generation.fetch_add(1, std::memory_order_relaxed) + 1;
     {
         std::lock_guard<std::mutex> lk(m_queue_load_mutex);
-        m_pending_queue_load.tracks = tracks;
-        m_pending_queue_load.start_idx = start_idx;
-        m_pending_queue_load.generation = generation;
-        m_pending_queue_load.pending = true;
+        // A new Load supersedes all pending Insert/Add ops for the old queue.
+        m_async_tasks.clear();
+        QueueOp op;
+        op.type       = QueueOp::Type::Load;
+        op.generation = generation;
+        op.tracks     = tracks;
+        op.start_idx  = start_idx;
+        m_async_tasks.push_back(std::move(op));
     }
     m_queue_load_cv.notify_one();
 }
 
 void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
                                    uint32_t insert_after_item_id) {
-    std::vector<uint64_t> item_ids;
-    std::vector<int> sample_rates;
-    std::vector<std::string> local_paths, titles;
-    auto urls = resolveStreamUrls(tracks, item_ids, sample_rates, local_paths, titles);
-    if (urls.empty() || !m_mpd) return;
-
-    // Find insert position in our mapping
-    int insert_pos = -1;
+    LOGINF("QcManager: TracksInserted " << tracks.size()
+           << " tracks after qitem=" << insert_after_item_id << " — queuing async\n");
+    uint64_t gen = m_queue_load_generation.load(std::memory_order_relaxed);
     {
-        std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        for (size_t i = 0; i < m_queue_item_ids.size(); ++i) {
-            if (m_queue_item_ids[i] == insert_after_item_id) {
-                insert_pos = static_cast<int>(i);
-                break;
-            }
-        }
-        auto ins = [&](auto& vec, const auto& src) {
-            int pos = insert_pos;
-            if (pos >= 0 && pos + 1 <= static_cast<int>(vec.size()))
-                vec.insert(vec.begin() + pos + 1, src.begin(), src.end());
-            else
-                vec.insert(vec.end(), src.begin(), src.end());
-        };
-        ins(m_queue_item_ids,     item_ids);
-        ins(m_track_sample_rates, sample_rates);
-        ins(m_track_local_paths,  local_paths);
-        ins(m_track_titles,       titles);
-
-        // Keep full queue in sync
-        {
-            auto it = std::find(m_all_queue_item_ids.begin(),
-                                m_all_queue_item_ids.end(),
-                                static_cast<uint64_t>(insert_after_item_id));
-            size_t ins_pos = (it != m_all_queue_item_ids.end())
-                ? static_cast<size_t>(it - m_all_queue_item_ids.begin()) + 1
-                : m_all_queue_item_ids.size();
-            std::vector<uint64_t> new_ids;
-            new_ids.reserve(tracks.size());
-            for (const auto& t : tracks) new_ids.push_back(t.queue_item_id);
-            m_all_queue_item_ids.insert(
-                m_all_queue_item_ids.begin() + ins_pos,
-                new_ids.begin(), new_ids.end());
-        }
+        std::lock_guard<std::mutex> lk(m_queue_load_mutex);
+        QueueOp op;
+        op.type                  = QueueOp::Type::Insert;
+        op.generation            = gen;
+        op.tracks                = tracks;
+        op.insert_after_item_id  = insert_after_item_id;
+        m_async_tasks.push_back(std::move(op));
     }
-
-    int mpd_id = m_mpd->queueItemToMpdId(insert_after_item_id);
-    m_mpd->insertTracks(urls, mpd_id);
+    m_queue_load_cv.notify_one();
 }
 
 void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
-    std::vector<uint64_t> item_ids;
-    std::vector<int> sample_rates;
-    std::vector<std::string> local_paths, titles;
-    auto urls = resolveStreamUrls(tracks, item_ids, sample_rates, local_paths, titles);
-    if (urls.empty() || !m_mpd) return;
-
+    LOGINF("QcManager: TracksAdded " << tracks.size() << " tracks — queuing async\n");
+    uint64_t gen = m_queue_load_generation.load(std::memory_order_relaxed);
     {
-        std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        m_queue_item_ids.insert(m_queue_item_ids.end(), item_ids.begin(), item_ids.end());
-        m_track_sample_rates.insert(m_track_sample_rates.end(), sample_rates.begin(), sample_rates.end());
-        m_track_local_paths.insert(m_track_local_paths.end(), local_paths.begin(), local_paths.end());
-        m_track_titles.insert(m_track_titles.end(), titles.begin(), titles.end());
-        for (const auto& t : tracks)
-            m_all_queue_item_ids.push_back(t.queue_item_id);
+        std::lock_guard<std::mutex> lk(m_queue_load_mutex);
+        QueueOp op;
+        op.type       = QueueOp::Type::Add;
+        op.generation = gen;
+        op.tracks     = tracks;
+        m_async_tasks.push_back(std::move(op));
     }
-    m_mpd->addTracks(urls);
+    m_queue_load_cv.notify_one();
 }
 
 void QcManager::onTracksRemoved(const std::vector<uint64_t>& queue_item_ids) {
@@ -925,34 +908,133 @@ bool QcManager::queueLoadAborted(uint64_t generation) const {
 
 void QcManager::queueLoadLoop() {
     while (!m_queue_load_stop.load(std::memory_order_relaxed)) {
-        PendingQueueLoad req;
+        QueueOp op;
         {
             std::unique_lock<std::mutex> lk(m_queue_load_mutex);
             m_queue_load_cv.wait(lk, [this] {
                 return m_queue_load_stop.load(std::memory_order_relaxed) ||
-                       m_pending_queue_load.pending;
+                       !m_async_tasks.empty();
             });
             if (m_queue_load_stop.load(std::memory_order_relaxed))
                 break;
-            req = m_pending_queue_load;
-            m_pending_queue_load.pending = false;
+            op = std::move(m_async_tasks.front());
+            m_async_tasks.pop_front();
         }
 
+        // ---- TracksInserted: insert resolved URLs at the right MPD position ----
+        if (op.type == QueueOp::Type::Insert) {
+            // Look up the MPD position NOW (processing time), so that earlier
+            // Insert ops in the FIFO have already updated m_queue_item_ids and
+            // the search sees the correct state.
+            int insert_pos = -1;
+            {
+                std::lock_guard<std::mutex> lk(m_qmap_mutex);
+                for (size_t i = 0; i < m_queue_item_ids.size(); ++i) {
+                    if (m_queue_item_ids[i] == op.insert_after_item_id) {
+                        insert_pos = static_cast<int>(i);
+                        break;
+                    }
+                }
+            }
+            LOGINF("QcManager: TracksInserted async: " << op.tracks.size()
+                   << " tracks after qitem=" << op.insert_after_item_id
+                   << " insert_pos=" << insert_pos << "\n");
+
+            std::vector<uint64_t> item_ids;
+            std::vector<int> sample_rates;
+            std::vector<std::string> local_paths, titles;
+            auto urls = resolveStreamUrls(op.tracks, item_ids, sample_rates,
+                                          local_paths, titles, op.generation);
+            if (queueLoadAborted(op.generation)) {
+                cleanupMaterializedFiles(local_paths);
+                LOGINF("QcManager: TracksInserted cancelled (new queue arrived)\n");
+                continue;
+            }
+            if (urls.empty() || !m_mpd) continue;
+
+            // MPD first, then local maps (keeps onMpdState view consistent)
+            m_mpd->insertTracks(urls, insert_pos);
+            {
+                std::lock_guard<std::mutex> lk(m_qmap_mutex);
+                auto ins = [&](auto& vec, const auto& src) {
+                    if (insert_pos >= 0 &&
+                        insert_pos + 1 <= static_cast<int>(vec.size()))
+                        vec.insert(vec.begin() + insert_pos + 1,
+                                   src.begin(), src.end());
+                    else
+                        vec.insert(vec.end(), src.begin(), src.end());
+                };
+                ins(m_queue_item_ids,     item_ids);
+                ins(m_track_sample_rates, sample_rates);
+                ins(m_track_local_paths,  local_paths);
+                ins(m_track_titles,       titles);
+
+                auto it = std::find(m_all_queue_item_ids.begin(),
+                                    m_all_queue_item_ids.end(),
+                                    static_cast<uint64_t>(op.insert_after_item_id));
+                size_t all_ins = (it != m_all_queue_item_ids.end())
+                    ? static_cast<size_t>(it - m_all_queue_item_ids.begin()) + 1
+                    : m_all_queue_item_ids.size();
+                std::vector<uint64_t> new_ids;
+                new_ids.reserve(op.tracks.size());
+                for (const auto& t : op.tracks) new_ids.push_back(t.queue_item_id);
+                m_all_queue_item_ids.insert(
+                    m_all_queue_item_ids.begin() + all_ins,
+                    new_ids.begin(), new_ids.end());
+            }
+            continue;
+        }
+
+        // ---- TracksAdded: append resolved URLs to the end of the MPD queue ----
+        if (op.type == QueueOp::Type::Add) {
+            LOGINF("QcManager: TracksAdded async: " << op.tracks.size() << " tracks\n");
+
+            std::vector<uint64_t> item_ids;
+            std::vector<int> sample_rates;
+            std::vector<std::string> local_paths, titles;
+            auto urls = resolveStreamUrls(op.tracks, item_ids, sample_rates,
+                                          local_paths, titles, op.generation);
+            if (queueLoadAborted(op.generation)) {
+                cleanupMaterializedFiles(local_paths);
+                LOGINF("QcManager: TracksAdded cancelled (new queue arrived)\n");
+                continue;
+            }
+            if (urls.empty() || !m_mpd) continue;
+
+            m_mpd->addTracks(urls);
+            {
+                std::lock_guard<std::mutex> lk(m_qmap_mutex);
+                m_queue_item_ids.insert(m_queue_item_ids.end(),
+                                        item_ids.begin(), item_ids.end());
+                m_track_sample_rates.insert(m_track_sample_rates.end(),
+                                            sample_rates.begin(), sample_rates.end());
+                m_track_local_paths.insert(m_track_local_paths.end(),
+                                           local_paths.begin(), local_paths.end());
+                m_track_titles.insert(m_track_titles.end(),
+                                      titles.begin(), titles.end());
+                for (const auto& t : op.tracks)
+                    m_all_queue_item_ids.push_back(t.queue_item_id);
+            }
+            continue;
+        }
+
+        // ---- QueueLoad: full two-phase load (head tracks first, tail deferred) ----
+        // (op.type == QueueOp::Type::Load)
         const size_t initial_track_count =
-            std::min(req.tracks.size(),
+            std::min(op.tracks.size(),
                      std::max<size_t>(kInitialQueuePrefetchTracks,
-                                      static_cast<size_t>(req.start_idx) + 1));
+                                      static_cast<size_t>(op.start_idx) + 1));
 
         std::vector<uint64_t> item_ids;
         std::vector<int> sample_rates;
         std::vector<std::string> local_paths, titles;
         auto urls = resolveStreamUrls(
-            std::vector<QueueTrack>(req.tracks.begin(),
-                                    req.tracks.begin() + initial_track_count),
-            item_ids, sample_rates, local_paths, titles, req.generation);
-        if (req.generation != m_queue_load_generation.load(std::memory_order_relaxed)) {
+            std::vector<QueueTrack>(op.tracks.begin(),
+                                    op.tracks.begin() + initial_track_count),
+            item_ids, sample_rates, local_paths, titles, op.generation);
+        if (op.generation != m_queue_load_generation.load(std::memory_order_relaxed)) {
             cleanupMaterializedFiles(local_paths);
-            LOGINF("QcManager: queue load superseded while resolving streams\n");
+            LOGINF("QcManager: queue load cancelled (WebSocket session ended or new queue arrived)\n");
             continue;
         }
         if (urls.empty()) {
@@ -962,8 +1044,8 @@ void QcManager::queueLoadLoop() {
         if (!m_mpd) continue;
 
         int mpd_start = 0;
-        if (req.start_idx > 0 && req.start_idx < req.tracks.size()) {
-            uint64_t target_item = req.tracks[req.start_idx].queue_item_id;
+        if (op.start_idx > 0 && op.start_idx < op.tracks.size()) {
+            uint64_t target_item = op.tracks[op.start_idx].queue_item_id;
             for (size_t i = 0; i < item_ids.size(); ++i) {
                 if (item_ids[i] == target_item) {
                     mpd_start = static_cast<int>(i);
@@ -999,7 +1081,7 @@ void QcManager::queueLoadLoop() {
         // segmented tracks already got their title from materializeSegmentedTrack).
         // Runs after loadQueue so MPD is already playing.
         for (size_t i = 0; i < initial_track_count; ++i) {
-            if (queueLoadAborted(req.generation)) break;
+            if (queueLoadAborted(op.generation)) break;
             bool need_title;
             {
                 std::lock_guard<std::mutex> lk(m_qmap_mutex);
@@ -1007,7 +1089,7 @@ void QcManager::queueLoadLoop() {
             }
             if (!need_title) continue;
             TrackMeta meta;
-            if (!m_api->getTrackMeta(req.tracks[i].track_id, meta)) continue;
+            if (!m_api->getTrackMeta(op.tracks[i].track_id, meta)) continue;
             std::string label = meta.artist.empty() ? meta.title
                                                     : meta.artist + " - " + meta.title;
             std::string local_path;
@@ -1026,19 +1108,19 @@ void QcManager::queueLoadLoop() {
                 printNowPlaying(label, local_path);
         }
 
-        if (initial_track_count >= req.tracks.size())
+        if (initial_track_count >= op.tracks.size())
             continue;
 
         std::vector<uint64_t> add_item_ids;
         std::vector<int> add_sample_rates;
         std::vector<std::string> add_local_paths, add_titles;
         auto add_urls = resolveStreamUrls(
-            std::vector<QueueTrack>(req.tracks.begin() + initial_track_count,
-                                    req.tracks.end()),
-            add_item_ids, add_sample_rates, add_local_paths, add_titles, req.generation);
-        if (req.generation != m_queue_load_generation.load(std::memory_order_relaxed)) {
+            std::vector<QueueTrack>(op.tracks.begin() + initial_track_count,
+                                    op.tracks.end()),
+            add_item_ids, add_sample_rates, add_local_paths, add_titles, op.generation);
+        if (op.generation != m_queue_load_generation.load(std::memory_order_relaxed)) {
             cleanupMaterializedFiles(add_local_paths);
-            LOGINF("QcManager: queue load superseded while resolving remaining streams\n");
+            LOGINF("QcManager: queue load cancelled (WebSocket session ended or new queue arrived, tail)\n");
             continue;
         }
         if (add_urls.empty())
@@ -1063,7 +1145,7 @@ void QcManager::queueLoadLoop() {
         // Fetch titles for tail tracks that don't have one yet.
         size_t tail_count = add_urls.size();
         for (size_t i = 0; i < tail_count; ++i) {
-            if (queueLoadAborted(req.generation)) break;
+            if (queueLoadAborted(op.generation)) break;
             size_t map_idx = initial_track_count + i;
             size_t track_idx = initial_track_count + i;
             bool need_title;
@@ -1073,7 +1155,7 @@ void QcManager::queueLoadLoop() {
             }
             if (!need_title) continue;
             TrackMeta meta;
-            if (!m_api->getTrackMeta(req.tracks[track_idx].track_id, meta)) continue;
+            if (!m_api->getTrackMeta(op.tracks[track_idx].track_id, meta)) continue;
             std::string label = meta.artist.empty() ? meta.title
                                                     : meta.artist + " - " + meta.title;
             std::string local_path;
@@ -1125,14 +1207,23 @@ int QcManager::mpdPosForQueueItem(uint64_t queue_item_id) const {
 }
 
 void QcManager::applyPendingSkip() {
-    uint64_t pending = m_pending_skip_qid.load(std::memory_order_relaxed);
-    if (!pending || !m_mpd) return;
-    int target = mpdPosForQueueItem(pending);
-    if (target >= 0) {
-        m_pending_skip_qid.store(0, std::memory_order_relaxed);
-        m_mpd->play(target);
-        LOGINF("QcManager: applied pending skip to qitem=" << pending
-               << " MPD pos=" << target << "\n");
+    if (!m_mpd) return;
+    uint64_t pending_skip = m_pending_skip_qid.load(std::memory_order_relaxed);
+    if (pending_skip) {
+        int target = mpdPosForQueueItem(pending_skip);
+        if (target >= 0) {
+            // play() both seeks to the target track and starts playback
+            m_pending_skip_qid.store(0, std::memory_order_relaxed);
+            m_pending_play.store(false, std::memory_order_relaxed);
+            m_mpd->play(target);
+            LOGINF("QcManager: applied pending skip to qitem=" << pending_skip
+                   << " MPD pos=" << target << "\n");
+        }
+        // If target not found yet, leave m_pending_play intact so a later
+        // applyPendingSkip call (after tail tracks are added) can still play.
+    } else if (m_pending_play.exchange(false, std::memory_order_relaxed)) {
+        m_mpd->pause(false);
+        LOGINF("QcManager: applied pending play\n");
     }
 }
 

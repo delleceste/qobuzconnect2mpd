@@ -268,7 +268,9 @@ void WSession::eventLoop() {
             r = select(static_cast<int>(sockfd) + 1,
                        &rfds, nullptr, nullptr, &tv);
             if (r < 0 && errno != EINTR) {
-                LOGERR("WSession: select error: " << strerror(errno) << "\n");
+                LOGERR("WSession: connection lost (select: " << strerror(errno)
+                       << ") — terminating session\n");
+                m_error_exit = true;
                 break;
             }
         }
@@ -285,16 +287,18 @@ void WSession::eventLoop() {
                                             &recvd, &meta);
                 if (rc == CURLE_AGAIN) break;
                 if (rc != CURLE_OK) {
-                    LOGERR("WSession: recv error: "
-                           << curl_easy_strerror(rc) << "\n");
+                    LOGERR("WSession: connection lost (recv: "
+                           << curl_easy_strerror(rc) << ") — terminating session\n");
+                    m_error_exit = true;
                     m_stop = true;
                     break;
                 }
                 if (!meta) break;
 
-                // CLOSE frame
+                // CLOSE frame — server-initiated close, treat as error exit
                 if (meta->flags & CURLWS_CLOSE) {
-                    LOGDEB("WSession: server sent CLOSE\n");
+                    LOGINF("WSession: server closed WebSocket connection — terminating session\n");
+                    m_error_exit = true;
                     m_stop = true;
                     break;
                 }
@@ -340,7 +344,7 @@ void WSession::eventLoop() {
     }
 
     m_connected = false;
-    if (m_cbs.on_disconnected) m_cbs.on_disconnected();
+    if (m_cbs.on_disconnected) m_cbs.on_disconnected(m_error_exit.load());
     LOGDEB("WSession: event loop exited\n");
 }
 
@@ -526,6 +530,10 @@ void WSession::dispatchMessage(const Message& msg) {
         break;
 
     case MsgType::SRVRC_TRACKS_INSERTED:
+        LOGDEB("WSession: TracksInserted tracks=" << msg.tracks_inserted.tracks.size()
+               << " insert_after=" << msg.tracks_inserted.insert_after
+               << " qver=" << msg.tracks_inserted.queue_version.major
+               << "." << msg.tracks_inserted.queue_version.minor << "\n");
         if (m_cbs.on_tracks_inserted) {
             m_cbs.on_tracks_inserted(
                 msg.tracks_inserted.tracks,

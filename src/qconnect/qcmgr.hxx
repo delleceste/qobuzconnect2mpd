@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include <deque>
 #include <memory>
 #include <string>
 #include <vector>
@@ -97,6 +98,10 @@ public:
 
     bool isRunning() const { return m_running.load(); }
 
+    // True when the WebSocket connection was lost unexpectedly.
+    // main() uses this to exit with code 1 so systemd can restart the service.
+    bool hasFatalError() const { return m_fatal_error.load(); }
+
     // Retrieve the UUID (may differ from config if it was generated at construction)
     const std::string& uuid() const { return m_cfg.uuid; }
 
@@ -115,7 +120,7 @@ private:
     void onTracksAdded(const std::vector<QueueTrack>& tracks);
     void onTracksRemoved(const std::vector<uint64_t>& queue_item_ids);
     void onWsConnected();
-    void onWsDisconnected();
+    void onWsDisconnected(bool error);
     void queueLoadLoop();
     void stopQueueLoadWorker();
     void cleanupMaterializedFiles(const std::vector<std::string>& paths);
@@ -169,6 +174,7 @@ private:
     std::mutex       m_session_mutex;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_ws_active{false};
+    std::atomic<bool> m_fatal_error{false};
     // Startup synchronization gate: only switch to buffer_state=OK once MPD
     // shows sustained position progression on the current track.
     MpdState::Status   m_last_mpd_status{MpdState::Status::UNKNOWN};
@@ -188,18 +194,24 @@ private:
     // before URL resolution completes.
     std::vector<uint64_t>     m_all_queue_item_ids;
 
-    struct PendingQueueLoad {
-        std::vector<QueueTrack> tracks;
-        uint32_t                start_idx{0};
+    // Async work queue shared by the worker thread and the WS event thread.
+    // A Load op clears the deque first (cancelling stale Insert/Add ops for the
+    // old queue). Insert and Add ops carry the generation at dispatch time so
+    // the worker can detect when a new Load has superseded them.
+    struct QueueOp {
+        enum class Type { Load, Insert, Add };
+        Type                    type{Type::Load};
         uint64_t                generation{0};
-        bool                    pending{false};
+        std::vector<QueueTrack> tracks;
+        uint32_t                start_idx{0};             // Load only
+        uint32_t                insert_after_item_id{0};  // Insert only
     };
     std::mutex                m_queue_load_mutex;
     std::condition_variable   m_queue_load_cv;
     std::thread               m_queue_load_thread;
     std::atomic<bool>         m_queue_load_stop{false};
     std::atomic<uint64_t>     m_queue_load_generation{0};
-    PendingQueueLoad          m_pending_queue_load;
+    std::deque<QueueOp>       m_async_tasks;
 
     // Status file
     std::string           m_status_title;
@@ -214,6 +226,9 @@ private:
     // Pending skip: set when a SetState names a track not yet in the MPD queue;
     // cleared + applied by queueLoadLoop once the track becomes available.
     std::atomic<uint64_t> m_pending_skip_qid{0};
+    // Pending play: set when SetState(PLAYING) arrives before the queue finishes
+    // loading; applied by applyPendingSkip after loadQueue completes.
+    std::atomic<bool> m_pending_play{false};
 
     // IPC
     int          m_ipc_sock{-1};

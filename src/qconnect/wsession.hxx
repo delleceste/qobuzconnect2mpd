@@ -44,8 +44,12 @@ struct WSessionCallbacks {
     std::function<void(uint32_t /*volume*/, int32_t /*delta*/)> on_set_volume;
 
     // Qobuz app connected/disconnected
+    // on_disconnected receives true when the session ended due to a network
+    // error (recv failure, server CLOSE) and the process should exit so that
+    // systemd can restart it.  It receives false when disconnect() was called
+    // deliberately (e.g. to replace the session with a new one).
     std::function<void()> on_connected;
-    std::function<void()> on_disconnected;
+    std::function<void(bool /*error*/)> on_disconnected;
     // Full queue received (e.g. user pressed Play Album).
     // tracks carry both queue_item_id and track_id for each entry.
     // start_index is the position within the queue to start playing.
@@ -125,6 +129,9 @@ private:
 
     std::atomic<bool>  m_connected{false};
     std::atomic<bool>  m_stop{false};
+    // Set true only when the event loop exits due to a network error or
+    // server-initiated CLOSE (not when disconnect() is called externally).
+    std::atomic<bool>  m_error_exit{false};
     std::mutex         m_send_mutex;
 
     // Session context received from server

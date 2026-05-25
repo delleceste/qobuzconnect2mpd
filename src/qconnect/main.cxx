@@ -215,10 +215,15 @@ int main(int argc, char* argv[]) {
     }
 
     // ---- Main loop ---------------------------------------------------------
-    while (!g_quit) {
+    while (!g_quit && !mgr.hasFatalError()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
+    if (mgr.hasFatalError()) {
+        LOGERR("qconnect2mpd: WebSocket connection lost — exiting (systemd will restart)\n");
+        mgr.stop();
+        return 1;
+    }
     LOGINF("qconnect2mpd: shutting down\n");
     mgr.stop();
     return 0;

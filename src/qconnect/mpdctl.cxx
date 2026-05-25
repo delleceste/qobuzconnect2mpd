@@ -84,7 +84,6 @@ void MpdCtl::disconnect() {
     if (m_idle_conn) mpd_send_noidle(m_idle_conn);
     if (m_event_thread.joinable()) m_event_thread.join();
     closeConnection();
-    clearQueueItemMap();
 }
 
 bool MpdCtl::ensureConnected() {
@@ -131,7 +130,6 @@ bool MpdCtl::loadQueue(const std::vector<std::string>& stream_urls,
     mpd_run_random(m_conn, false);
     mpd_run_repeat(m_conn, true);
     mpd_run_clearerror(m_conn);
-    clearQueueItemMap();
 
     // Add tracks
     for (const auto& uri : stream_urls) {
@@ -147,31 +145,23 @@ bool MpdCtl::loadQueue(const std::vector<std::string>& stream_urls,
                    << (emsg ? emsg : "?") << "\n");
             return false;
         }
+        // Pre-position at start_pos but don't start playing.
+        // Playback begins only when an explicit SetState(PLAYING) arrives.
+        mpd_run_pause(m_conn, true);
     }
     LOGDEB("MpdCtl::loadQueue: " << stream_urls.size()
-           << " tracks, starting at " << start_pos << "\n");
+           << " tracks, starting at " << start_pos << " (paused)\n");
     return true;
 }
 
 bool MpdCtl::insertTracks(const std::vector<std::string>& stream_urls,
-                            int insert_after_id) {
+                            int insert_after_pos) {
     std::lock_guard<std::mutex> lk(m_conn_mutex);
     if (!ensureConnected()) return false;
 
-    // Find position of insert_after_id in the queue
-    int insert_pos = -1;
-    if (insert_after_id >= 0) {
-        struct mpd_song* s = mpd_run_get_queue_song_id(
-            m_conn, static_cast<unsigned>(insert_after_id));
-        if (s) {
-            insert_pos = static_cast<int>(mpd_song_get_pos(s));
-            mpd_song_free(s);
-        }
-    }
-
     for (size_t i = 0; i < stream_urls.size(); ++i) {
-        int pos = (insert_pos >= 0)
-                  ? insert_pos + 1 + static_cast<int>(i)
+        int pos = (insert_after_pos >= 0)
+                  ? insert_after_pos + 1 + static_cast<int>(i)
                   : -1; // -1 = append
         if (pos >= 0)
             mpd_run_add_id_to(m_conn, stream_urls[i].c_str(),
@@ -262,7 +252,6 @@ bool MpdCtl::stop() {
         m_queue_saved = false;
         LOGDEB("MpdCtl: restored saved queue\n");
     }
-    clearQueueItemMap();
     return ok;
 }
 
@@ -273,7 +262,6 @@ bool MpdCtl::stopAndClear() {
     ok = mpd_run_clear(m_conn) && ok;
     m_saved_queue = SavedQueue{};
     m_queue_saved = false;
-    clearQueueItemMap();
     return ok;
 }
 
@@ -357,25 +345,6 @@ MpdState MpdCtl::getState() {
 void MpdCtl::setStateCallback(MpdStateCallback cb) {
     std::lock_guard<std::mutex> lk(m_cb_mutex);
     m_state_cb = std::move(cb);
-}
-
-// ---- Queue item mapping -----------------------------------------------------
-
-int MpdCtl::queueItemToMpdId(uint64_t queue_item_id) const {
-    std::lock_guard<std::mutex> lk(m_map_mutex);
-    for (const auto& p : m_item_map)
-        if (p.first == queue_item_id) return p.second;
-    return -1;
-}
-
-void MpdCtl::registerQueueItem(uint64_t queue_item_id, int mpd_id) {
-    std::lock_guard<std::mutex> lk(m_map_mutex);
-    m_item_map.emplace_back(queue_item_id, mpd_id);
-}
-
-void MpdCtl::clearQueueItemMap() {
-    std::lock_guard<std::mutex> lk(m_map_mutex);
-    m_item_map.clear();
 }
 
 // ---- Event loop -------------------------------------------------------------

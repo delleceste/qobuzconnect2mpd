@@ -74,9 +74,9 @@ public:
     bool loadQueue(const std::vector<std::string>& stream_urls,
                     int start_pos = 0);
 
-    // Insert stream_urls after queue entry with MPD id insert_after_id.
+    // Insert stream_urls after MPD queue position insert_after_pos (-1 = append).
     bool insertTracks(const std::vector<std::string>& stream_urls,
-                       int insert_after_id);
+                       int insert_after_pos);
 
     // Append stream_urls to the end of the queue.
     bool addTracks(const std::vector<std::string>& stream_urls);
@@ -108,20 +108,12 @@ public:
     // Register a callback that fires on every MPD event (player/queue/mixer).
     void setStateCallback(MpdStateCallback cb);
 
-    // Map a Qobuz queue_item_id to an MPD song id (maintained internally).
-    // Returns -1 if not found.
-    int queueItemToMpdId(uint64_t queue_item_id) const;
-
-    // Register a mapping from Qobuz queue_item_id to mpd song id.
-    void registerQueueItem(uint64_t queue_item_id, int mpd_id);
-
 private:
     bool openConnection();
     void closeConnection();
     bool ensureConnected();
     void eventLoop();
     MpdState fetchState();
-    void clearQueueItemMap();
 
     std::string m_host;
     int         m_port;
@@ -136,10 +128,6 @@ private:
     std::atomic<uint64_t>  m_last_seek_ms{0}; // steady_clock ms at last seek()
     MpdStateCallback       m_state_cb;
     std::mutex             m_cb_mutex;
-
-    // Map Qobuz queue_item_id -> MPD song id
-    std::vector<std::pair<uint64_t, int>> m_item_map;
-    mutable std::mutex                    m_map_mutex;
 
     // Saved queue for restoration on disconnect
     struct SavedQueue {
