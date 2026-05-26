@@ -1,0 +1,30 @@
+#!/bin/sh
+
+# PROVIDE: qobuzconnect2mpd
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="qobuzconnect2mpd"
+rcvar="qobuzconnect2mpd_enable"
+
+load_rc_config "$name"
+
+: ${qobuzconnect2mpd_enable:="NO"}
+: ${qobuzconnect2mpd_config:="@QOBUZCONNECT2MPD_CONFIG@"}
+: ${qobuzconnect2mpd_flags:="-c ${qobuzconnect2mpd_config}"}
+: ${qobuzconnect2mpd_runas:=""}
+
+pidfile="/var/run/${name}.pid"
+procname="@QOBUZCONNECT2MPD_BIN@"
+command="/usr/sbin/daemon"
+command_args="-f -p ${pidfile}"
+
+if [ -n "${qobuzconnect2mpd_runas}" ]; then
+	command_args="${command_args} -u ${qobuzconnect2mpd_runas}"
+fi
+
+command_args="${command_args} ${procname} ${qobuzconnect2mpd_flags}"
+
+run_rc_command "$1"

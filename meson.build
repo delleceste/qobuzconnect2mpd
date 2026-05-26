@@ -199,19 +199,58 @@ executable(
 
 ########################## Install data
 
+qobuzconnect2mpd_bin = join_paths(
+  get_option('prefix'),
+  get_option('bindir'),
+  'qobuzconnect2mpd',
+)
+qobuzconnect2mpd_config = join_paths(
+  get_option('prefix'),
+  get_option('sysconfdir'),
+  'qobuzconnect2mpd',
+  'qobuzconnect2mpd.conf',
+)
+
+init_system = get_option('init_system')
+if init_system == 'auto'
+  host_system = host_machine.system()
+  if host_system == 'freebsd'
+    init_system = 'freebsd'
+  elif host_system == 'linux'
+    init_system = 'systemd'
+  else
+    init_system = 'none'
+  endif
+endif
+
 systemd_conf = configuration_data()
-systemd_conf.set(
-  'QOBUZCONNECT2MPD_BIN',
-  join_paths(get_option('prefix'), get_option('bindir'), 'qobuzconnect2mpd'),
-)
+systemd_conf.set('QOBUZCONNECT2MPD_BIN', qobuzconnect2mpd_bin)
 
-systemd_unit = configure_file(
-  input: 'systemd/qobuzconnect2mpd.service.in',
-  output: 'qobuzconnect2mpd.service',
-  configuration: systemd_conf,
-)
+if init_system == 'systemd'
+  systemd_unit = configure_file(
+    input: 'systemd/qobuzconnect2mpd.service.in',
+    output: 'qobuzconnect2mpd.service',
+    configuration: systemd_conf,
+  )
 
-install_data(systemd_unit, install_dir: get_option('datadir') / 'systemd/user')
+  install_data(systemd_unit, install_dir: get_option('datadir') / 'systemd/user')
+elif init_system == 'freebsd'
+  freebsd_conf = configuration_data()
+  freebsd_conf.set('QOBUZCONNECT2MPD_BIN', qobuzconnect2mpd_bin)
+  freebsd_conf.set('QOBUZCONNECT2MPD_CONFIG', qobuzconnect2mpd_config)
+
+  freebsd_rc = configure_file(
+    input: 'freebsd/qobuzconnect2mpd.in',
+    output: 'qobuzconnect2mpd',
+    configuration: freebsd_conf,
+  )
+
+  install_data(
+    freebsd_rc,
+    install_dir: get_option('sysconfdir') / 'rc.d',
+    install_mode: 'rwxr-xr-x',
+  )
+endif
 install_data('conf/qobuzconnect2mpd.conf', install_dir: get_option('sysconfdir') / 'qobuzconnect2mpd')
 
 #upmpdcli_data = files(

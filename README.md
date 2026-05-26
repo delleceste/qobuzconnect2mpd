@@ -352,6 +352,22 @@ path and `-c` argument to match your setup.
 systemctl enable --now qobuzconnect2mpd
 ```
 
+## FreeBSD
+
+Meson can install a FreeBSD `rc.d` service script instead of the systemd unit.
+On FreeBSD this is selected automatically; it can also be forced manually:
+
+```sh
+meson setup build -Dinit_system=freebsd --prefix=/usr/local
+ninja -C build
+ninja -C build install
+sysrc qobuzconnect2mpd_enable=YES
+service qobuzconnect2mpd start
+```
+
+See [howto-Freebsd.md](howto-Freebsd.md) for the full FreeBSD installation,
+configuration, service management, and troubleshooting guide.
+
 ## License
 
 LGPL 2.1 or later.
