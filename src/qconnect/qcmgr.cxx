@@ -248,6 +248,26 @@ bool QcManager::start() {
                                         m_cfg.app_id,
                                         m_cfg.app_secret);
 
+    // Load any cached OAuth token first. As of April 2026 Qobuz's /user/login
+    // endpoint is broken for third-party clients (cloud migration); OAuth is the
+    // only reliable path. The token is cached so login is a one-time step.
+    std::string tok_file = tokenFilePath();
+    bool have_token = m_api->loadToken(tok_file);
+
+    // Refuse to start when there is no way to authenticate at all: no cached
+    // OAuth token and no user configured to bootstrap the OAuth login. Without
+    // either, the daemon could only advertise an unusable device, so fail fast
+    // (non-zero exit) rather than run not authenticated. Checked before the
+    // bundle.js fetch below so a misconfigured daemon makes no network calls.
+    // A configured user is enough — start() then prints the OAuth URL so login
+    // can complete the first time.
+    if (!have_token && m_cfg.qobuz_user.empty()) {
+        LOGERR("QcManager: no Qobuz credentials — set qconnectuser/qconnectpass "
+               "(or qobuzuser/qobuzpass) in the config, or provide a cached "
+               "OAuth token; refusing to start\n");
+        return false;
+    }
+
     // Auto-fetch app_id + secret from Qobuz bundle.js when not in config
     if (m_cfg.app_id.empty()) {
         LOGINF("QcManager: qobuzappid not configured — fetching from bundle.js\n");
@@ -255,30 +275,12 @@ bool QcManager::start() {
             LOGERR("QcManager: bundle.js fetch failed; streaming will not work\n");
     }
 
-    // Try loading a cached OAuth token first; fall back to classic login only
-    // if there is no cached token. As of April 2026 Qobuz's /user/login endpoint
-    // is broken for third-party clients (cloud migration); OAuth is the only
-    // reliable path. The token is cached so login is a one-time interactive step.
-    std::string tok_file = tokenFilePath();
-    bool have_token = m_api->loadToken(tok_file);
-
+    // Classic login fallback when there is no cached token (see note above).
     if (!have_token && !m_cfg.qobuz_user.empty()) {
         if (m_api->login(m_cfg.qobuz_user, m_cfg.qobuz_pass))
             LOGINF("QcManager: Qobuz API login OK (user=" << m_cfg.qobuz_user << ")\n");
         else
             LOGERR("QcManager: Qobuz API login FAILED\n");
-    }
-
-    // Refuse to start when there is no way to authenticate at all: no cached
-    // OAuth token and no user configured to bootstrap the OAuth login. Without
-    // either, the daemon could only advertise an unusable device, so fail fast
-    // (non-zero exit) rather than run not authenticated. A configured user is
-    // enough — start() then prints the OAuth URL below so login can complete.
-    if (m_api->userToken().empty() && m_cfg.qobuz_user.empty()) {
-        LOGERR("QcManager: no Qobuz credentials — set qconnectuser/qconnectpass "
-               "(or qobuzuser/qobuzpass) in the config, or provide a cached "
-               "OAuth token; refusing to start\n");
-        return false;
     }
 
     // ---- MPD controller ----------------------------------------------------
