@@ -44,22 +44,17 @@ export HOME="${qobuzconnect2mpd_homedir}"
 # Services start with a minimal PATH that omits /usr/local/bin on FreeBSD.
 export PATH="${BINDIR}:/usr/bin:/bin"
 
-# daemon(8) runs qobuzconnect2mpd in the foreground (without -d) and, with -r,
-# supervises it and restarts it on crash (matching the systemd unit's
-# Restart=on-failure).
-#
-# Because of that supervisor, rc must track and signal the *supervisor* pid
-# (-P), not the child (-p): SIGTERM to the supervisor stops the child and
-# exits without respawning. Tracking the child instead would let the
-# supervisor immediately restart it under a new pid on `service stop`.
-# Hence procname is the daemon(8) binary, since that is what `pidfile` holds.
+# daemon(8) backgrounds qobuzconnect2mpd (run in the foreground, without -d)
+# and writes its pidfile. No -r: the daemon process detaches the child and
+# exits, so there is no supervisor and `service stop` (or killall) terminates
+# the child directly and it stays down. The daemon is NOT restarted on crash.
 command="/usr/sbin/daemon"
-procname="/usr/sbin/daemon"
+procname="${BINDIR}/qobuzconnect2mpd"
 pidfile="${qobuzconnect2mpd_pidfile}"
 
 required_files="${qobuzconnect2mpd_config}"
 
-command_args="-f -r -P ${qobuzconnect2mpd_pidfile} -t ${name} -- ${BINDIR}/qobuzconnect2mpd -c ${qobuzconnect2mpd_config} ${qobuzconnect2mpd_flags}"
+command_args="-f -p ${qobuzconnect2mpd_pidfile} -t ${name} -- ${BINDIR}/qobuzconnect2mpd -c ${qobuzconnect2mpd_config} ${qobuzconnect2mpd_flags}"
 
 start_precmd="qobuzconnect2mpd_precmd"
 
