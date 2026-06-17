@@ -85,6 +85,11 @@ qconnect2mpd: MPD localhost:6600
 qconnect2mpd: MPD connected OK (localhost:6600)
 ```
 
+The daemon **refuses to start** (exits non-zero) when there is no way to
+authenticate with Qobuz — i.e. no cached OAuth token *and* no user configured
+(`qconnectuser`/`qobuzuser`). A configured user is enough: the daemon then
+prints the OAuth URL (see below) so login can complete the first time.
+
 ### Now-playing console output
 
 When a track starts playing the daemon prints to stdout:

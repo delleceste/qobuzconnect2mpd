@@ -269,6 +269,18 @@ bool QcManager::start() {
             LOGERR("QcManager: Qobuz API login FAILED\n");
     }
 
+    // Refuse to start when there is no way to authenticate at all: no cached
+    // OAuth token and no user configured to bootstrap the OAuth login. Without
+    // either, the daemon could only advertise an unusable device, so fail fast
+    // (non-zero exit) rather than run not authenticated. A configured user is
+    // enough — start() then prints the OAuth URL below so login can complete.
+    if (m_api->userToken().empty() && m_cfg.qobuz_user.empty()) {
+        LOGERR("QcManager: no Qobuz credentials — set qconnectuser/qconnectpass "
+               "(or qobuzuser/qobuzpass) in the config, or provide a cached "
+               "OAuth token; refusing to start\n");
+        return false;
+    }
+
     // ---- MPD controller ----------------------------------------------------
     m_mpd = std::make_unique<MpdCtl>(m_cfg.mpd_host, m_cfg.mpd_port,
                                       m_cfg.mpd_password);
