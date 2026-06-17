@@ -23,6 +23,7 @@
 #include <atomic>
 #include <thread>
 #include <condition_variable>
+#include <functional>
 
 #include "proto.hxx"
 #include "mpdctl.hxx"
@@ -86,7 +87,15 @@ public:
     ~QcManager();
 
     // Start all subsystems.  Returns false on fatal error (e.g. port conflict).
+    // Requires a cached OAuth token (see runLogin); refuses to start otherwise.
     bool start();
+
+    // One-shot interactive OAuth login. Brings up only the HTTP server, prints
+    // the Qobuz login URL, and blocks until the browser redirect caches a token
+    // (or `aborted()` returns true, e.g. on SIGINT). Returns true once a token
+    // is cached (including when one already exists). Used by the `-L` flag to
+    // bootstrap authentication before running as a service.
+    bool runLogin(const std::function<bool()>& aborted);
 
     // Stop all subsystems gracefully.
     void stop();

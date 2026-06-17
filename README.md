@@ -67,13 +67,34 @@ provided at `conf/qobuzconnect2mpd.conf`.
 ## Usage
 
 ```
-qconnect2mpd [-c configfile] [-d] [-o statusfile]
+qconnect2mpd [-c configfile] [-d] [-L] [-o statusfile]
 
   -c configfile   Path to configuration file (default: /etc/upmpdcli.conf)
   -d              Daemonise (fork to background)
+  -L, --login     Interactive OAuth login: print the Qobuz login URL, wait for
+                  the browser redirect, cache a token, then exit
   -o statusfile   Write now-playing status to this file (updated every second);
                   overrides qconnectstatusfile in the config file
 ```
+
+## Authentication
+
+Qobuz `user`/`password` no longer authenticate third-party clients (their
+`/user/login` endpoint was closed during the cloud migration). The only way in
+is **OAuth**, which yields a token that is cached and reused on every restart.
+
+Bootstrap it once, interactively:
+
+```sh
+qobuzconnect2mpd -c <configfile> -L
+```
+
+This prints a Qobuz login URL; open it in a browser, log in, and the daemon
+catches the redirect and caches the token (under
+`~/.local/share/qconnect2mpd/`). After that the service starts normally.
+
+In service mode the daemon **refuses to start** (exits non-zero) when there is
+no cached OAuth token — run `-L` first.
 
 ### Startup log
 
@@ -84,11 +105,6 @@ qconnect2mpd: config: /etc/upmpdcli.conf
 qconnect2mpd: MPD localhost:6600
 qconnect2mpd: MPD connected OK (localhost:6600)
 ```
-
-The daemon **refuses to start** (exits non-zero) when there is no way to
-authenticate with Qobuz — i.e. no cached OAuth token *and* no user configured
-(`qconnectuser`/`qobuzuser`). A configured user is enough: the daemon then
-prints the OAuth URL (see below) so login can complete the first time.
 
 ### Now-playing console output
 
@@ -133,27 +149,6 @@ When `qconnectlogfile` is set, timestamped entries are appended for:
 Log levels: `[OUT]` normal output, `[INF]` informational, `[ERR]` errors.
 The file is truncated (not appended) on each daemon restart, so the log always
 reflects the current session only.
-
-## Authentication
-
-Qobuz credentials (`qconnectuser` / `qconnectpass`) are used on the first run
-to obtain an OAuth token, which is cached at
-`~/.local/share/qconnect2mpd/user_token`.  Subsequent runs reuse the cached
-token without re-authenticating.
-
-If no credentials are in the config, or if the login endpoint is unavailable,
-the daemon prints an OAuth URL at startup:
-
-```
-  Not authenticated — open this URL in a browser to log in:
-
-  https://www.qobuz.com/oauth2/...
-
-  (after login this device will connect automatically)
-```
-
-Open the URL in a browser, log in with your Qobuz account, and the token is
-captured automatically via the local redirect handler.
 
 ## systemd
 

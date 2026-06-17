@@ -40,9 +40,12 @@
 //   mpdhost / mpdport / mpdpassword
 //
 // Usage:
-//   qconnect2mpd [-c configfile] [-d]
+//   qconnect2mpd [-c configfile] [-d] [-L] [-o statusfile]
 //     -c  path to upmpdcli config file
 //     -d  daemonise (fork to background)
+//     -L  interactive OAuth login: cache a token, then exit (bootstrap step;
+//         service mode refuses to start without a cached token)
+//     -o  now-playing status file path
 
 #include "qcmgr.hxx"
 #include "qclog.hxx"
@@ -94,19 +97,27 @@ int main(int argc, char* argv[]) {
     std::string config_file = "/etc/upmpdcli.conf";
     std::string status_file_arg;
     bool daemonise = false;
+    bool login_mode = false;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-c") && i + 1 < argc) {
             config_file = argv[++i];
         } else if (!strcmp(argv[i], "-d")) {
             daemonise = true;
+        } else if (!strcmp(argv[i], "-L") || !strcmp(argv[i], "--login")) {
+            login_mode = true;
         } else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
             status_file_arg = argv[++i];
         } else {
-            std::cerr << "Usage: " << argv[0] << " [-c configfile] [-d] [-o statusfile]\n";
+            std::cerr << "Usage: " << argv[0]
+                      << " [-c configfile] [-d] [-L] [-o statusfile]\n"
+                      << "  -L, --login  interactive OAuth login (cache a token), then exit\n";
             return 1;
         }
     }
+
+    // Login is interactive: never daemonise in that mode.
+    if (login_mode) daemonise = false;
 
     if (daemonise) {
         if (daemon(0, 0) < 0) {
@@ -194,6 +205,14 @@ int main(int argc, char* argv[]) {
 
     // ---- Start manager -----------------------------------------------------
     QcManager mgr(qcfg);
+
+    // -L: one-shot interactive OAuth login to cache a token, then exit. This is
+    // how authentication is bootstrapped, since service mode (below) refuses to
+    // start without a cached token.
+    if (login_mode) {
+        bool ok = mgr.runLogin([]{ return g_quit != 0; });
+        return ok ? 0 : 1;
+    }
 
     // Persist the (possibly new) UUID
     {

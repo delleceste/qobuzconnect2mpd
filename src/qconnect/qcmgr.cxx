@@ -34,6 +34,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <mutex>
 
@@ -248,39 +249,26 @@ bool QcManager::start() {
                                         m_cfg.app_id,
                                         m_cfg.app_secret);
 
-    // Load any cached OAuth token first. As of April 2026 Qobuz's /user/login
-    // endpoint is broken for third-party clients (cloud migration); OAuth is the
-    // only reliable path. The token is cached so login is a one-time step.
+    // Authentication is OAuth-only: as of April 2026 Qobuz's /user/login endpoint
+    // is closed to third-party clients (cloud migration), so qobuzuser/qobuzpass
+    // no longer authenticate. Service mode therefore requires a cached OAuth token
+    // — checked before any network call. The one-time token is obtained by running
+    // `qobuzconnect2mpd -L` interactively and completing the browser login (see
+    // runLogin); it is cached and reused on every subsequent start.
     std::string tok_file = tokenFilePath();
-    bool have_token = m_api->loadToken(tok_file);
-
-    // Refuse to start when there is no way to authenticate at all: no cached
-    // OAuth token and no user configured to bootstrap the OAuth login. Without
-    // either, the daemon could only advertise an unusable device, so fail fast
-    // (non-zero exit) rather than run not authenticated. Checked before the
-    // bundle.js fetch below so a misconfigured daemon makes no network calls.
-    // A configured user is enough — start() then prints the OAuth URL so login
-    // can complete the first time.
-    if (!have_token && m_cfg.qobuz_user.empty()) {
-        LOGERR("QcManager: no Qobuz credentials — set qconnectuser/qconnectpass "
-               "(or qobuzuser/qobuzpass) in the config, or provide a cached "
-               "OAuth token; refusing to start\n");
+    if (!m_api->loadToken(tok_file)) {
+        LOGERR("QcManager: not authenticated — no cached OAuth token at " << tok_file
+               << ". Run 'qobuzconnect2mpd -L' once and complete the browser "
+                  "login; refusing to start\n");
         return false;
     }
 
     // Auto-fetch app_id + secret from Qobuz bundle.js when not in config
+    // (needed to resolve stream URLs).
     if (m_cfg.app_id.empty()) {
         LOGINF("QcManager: qobuzappid not configured — fetching from bundle.js\n");
         if (!m_api->fetchAppCredentials())
             LOGERR("QcManager: bundle.js fetch failed; streaming will not work\n");
-    }
-
-    // Classic login fallback when there is no cached token (see note above).
-    if (!have_token && !m_cfg.qobuz_user.empty()) {
-        if (m_api->login(m_cfg.qobuz_user, m_cfg.qobuz_pass))
-            LOGINF("QcManager: Qobuz API login OK (user=" << m_cfg.qobuz_user << ")\n");
-        else
-            LOGERR("QcManager: Qobuz API login FAILED\n");
     }
 
     // ---- MPD controller ----------------------------------------------------
@@ -327,18 +315,6 @@ bool QcManager::start() {
         }
     });
 
-    // If not yet authenticated, print the OAuth URL so the user can log in.
-    if (m_api->userToken().empty() && !m_api->appId().empty()) {
-        std::string ip    = localIpAddr();
-        std::string redir = "http://" + ip + ":" + std::to_string(m_cfg.http_port)
-                            + "/oauth/callback";
-        std::string oauth_url = m_api->buildOAuthUrl(redir);
-        std::cout << "\n"
-                  << "  Not authenticated — open this URL in a browser to log in:\n\n"
-                  << "  \033[1;33m" << oauth_url << "\033[0m\n\n"
-                  << "  (after login this device will connect automatically)\n\n"
-                  << std::flush;
-    }
     m_queue_load_stop = false;
     m_queue_load_thread = std::thread(&QcManager::queueLoadLoop, this);
 
@@ -382,6 +358,80 @@ bool QcManager::start() {
     LOGINF("QcManager: ready — device '" << m_cfg.friendly_name
            << "' advertised as " << m_cfg.uuid << "\n");
     return true;
+}
+
+bool QcManager::runLogin(const std::function<bool()>& aborted) {
+    m_api = std::make_unique<QobuzApi>(m_cfg.api_base_url,
+                                        m_cfg.app_id,
+                                        m_cfg.app_secret);
+
+    std::string tok_file = tokenFilePath();
+    if (m_api->loadToken(tok_file)) {
+        LOGSTD("qconnect2mpd: already authenticated — cached OAuth token at "
+               << tok_file << "; nothing to do\n");
+        return true;
+    }
+
+    // app_id/secret are needed both to build the OAuth URL and to exchange the
+    // returned code for a token.
+    if (m_cfg.app_id.empty()) {
+        LOGINF("QcManager: fetching app credentials from bundle.js\n");
+        if (!m_api->fetchAppCredentials()) {
+            LOGERR("QcManager: bundle.js fetch failed; cannot start OAuth login\n");
+            return false;
+        }
+    }
+
+    // HTTP server brought up solely to receive the OAuth redirect callback.
+    m_http = std::make_unique<HttpHandler>(
+        m_cfg.uuid, m_cfg.friendly_name,
+        m_cfg.http_port, m_cfg.format_id,
+        m_api->appId(),
+        [](ConnectCredentials) {});
+    if (!m_http->start()) {
+        LOGERR("QcManager: HTTP server failed to start on port "
+               << m_cfg.http_port << "\n");
+        return false;
+    }
+
+    std::promise<bool> done;
+    std::future<bool>  fut = done.get_future();
+    std::atomic<bool>  fired{false};
+    m_http->setOAuthCallback(
+        [this, tok_file, &done, &fired](const std::string& code) {
+            if (fired.exchange(true)) return;   // first redirect wins
+            bool ok = m_api->oauthExchangeCode(code) && m_api->saveToken(tok_file);
+            done.set_value(ok);
+        });
+
+    std::string ip    = localIpAddr();
+    std::string redir = "http://" + ip + ":" + std::to_string(m_cfg.http_port)
+                        + "/oauth/callback";
+    std::string url   = m_api->buildOAuthUrl(redir);
+    std::cout << "\n"
+              << "  Open this URL in a browser to log in to Qobuz:\n\n"
+              << "  \033[1;33m" << url << "\033[0m\n\n"
+              << "  Waiting for login to complete (Ctrl-C to abort)…\n\n"
+              << std::flush;
+
+    // Block until the redirect fires (token cached) or the caller asks to abort.
+    bool ok = false;
+    while (!aborted()) {
+        if (fut.wait_for(std::chrono::milliseconds(200)) ==
+            std::future_status::ready) {
+            ok = fut.get();
+            break;
+        }
+    }
+    m_http->stop();
+
+    if (ok)
+        LOGSTD("qconnect2mpd: login OK — token cached at " << tok_file << "\n");
+    else if (aborted())
+        LOGSTD("qconnect2mpd: login aborted\n");
+    else
+        LOGERR("qconnect2mpd: login failed — OAuth code exchange did not succeed\n");
+    return ok;
 }
 
 void QcManager::stop() {
