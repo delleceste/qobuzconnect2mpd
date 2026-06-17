@@ -1,0 +1,67 @@
+#!/bin/sh
+
+# PROVIDE: qobuzconnect2mpd
+# REQUIRE: NETWORKING FILESYSTEMS musicpd
+# KEYWORD: shutdown
+#
+# Template — generated to qobuzconnect2mpd by meson (configure_file) using the
+# install prefix/bindir/sysconfdir.  Do not edit the generated copy; edit this
+# .in instead.
+#
+# FreeBSD rc.d service script for qobuzconnect2mpd
+# (Qobuz Connect receiver daemon that bridges the Qobuz app to MPD).
+#
+# Enable with:  sysrc qobuzconnect2mpd_enable=YES
+# The daemon runs as an unprivileged user; override qobuzconnect2mpd_user,
+# qobuzconnect2mpd_config, etc. in /etc/rc.conf.d/qobuzconnect2mpd if needed.
+
+PREFIX="@PREFIX@"
+BINDIR="@BINDIR@"
+
+qobuzconnect2mpd_user="giacomo"
+qobuzconnect2mpd_homedir="/home/giacomo"
+
+. /etc/rc.subr
+
+name="qobuzconnect2mpd"
+rcvar="qobuzconnect2mpd_enable"
+
+load_rc_config "$name"
+
+: ${qobuzconnect2mpd_enable:="NO"}
+: ${qobuzconnect2mpd_user:="giacomo"}
+: ${qobuzconnect2mpd_homedir:="/home/giacomo"}
+: ${qobuzconnect2mpd_flags:=""}
+# Default config is the copy installed by meson; pidfile in the user's cache
+# dir (/var/run is not writable by an unprivileged user).
+: ${qobuzconnect2mpd_config:="@QOBUZCONNECT2MPD_CONFIG@"}
+: ${qobuzconnect2mpd_pidfile:="${qobuzconnect2mpd_homedir}/.cache/qobuzconnect2mpd/qobuzconnect2mpd.pid"}
+
+# rc.subr's su -m does not update HOME; export it so the daemon resolves any
+# home-relative paths (cache, status/log files) correctly.
+export HOME="${qobuzconnect2mpd_homedir}"
+
+# Services start with a minimal PATH that omits /usr/local/bin on FreeBSD.
+export PATH="${BINDIR}:/usr/bin:/bin"
+
+# daemon(8) backgrounds qobuzconnect2mpd (run in the foreground, without -d),
+# manages the PID file, and restarts it on crash (-r), matching the systemd
+# unit's Restart=on-failure.
+command="/usr/sbin/daemon"
+procname="${BINDIR}/qobuzconnect2mpd"
+pidfile="${qobuzconnect2mpd_pidfile}"
+
+required_files="${qobuzconnect2mpd_config}"
+
+command_args="-f -r -p ${qobuzconnect2mpd_pidfile} -t ${name} -- ${BINDIR}/qobuzconnect2mpd -c ${qobuzconnect2mpd_config} ${qobuzconnect2mpd_flags}"
+
+start_precmd="qobuzconnect2mpd_precmd"
+
+qobuzconnect2mpd_precmd()
+{
+	# Ensure the pidfile/cache dir exists and is owned by the run user
+	# (created as root, before rc.subr drops privileges via su).
+	/usr/bin/install -d -o "${qobuzconnect2mpd_user}" -m 0755 "${qobuzconnect2mpd_pidfile%/*}"
+}
+
+run_rc_command "$1"

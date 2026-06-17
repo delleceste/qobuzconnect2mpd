@@ -198,20 +198,53 @@ executable(
 
 ########################## Install data
 
-systemd_conf = configuration_data()
-systemd_conf.set(
-  'QOBUZCONNECT2MPD_BIN',
-  join_paths(get_option('prefix'), get_option('bindir'), 'qobuzconnect2mpd'),
-)
-
-systemd_unit = configure_file(
-  input: 'systemd/qobuzconnect2mpd.service.in',
-  output: 'qobuzconnect2mpd.service',
-  configuration: systemd_conf,
-)
-
-install_data(systemd_unit, install_dir: get_option('datadir') / 'systemd/user')
 install_data('conf/qobuzconnect2mpd.conf', install_dir: get_option('sysconfdir') / 'qobuzconnect2mpd')
+
+host_os = host_machine.system()
+
+# Service integration: systemd on Linux, rc.d on FreeBSD. Install only the one
+# matching the target OS so we don't litter the other platform's init system.
+if host_os == 'linux'
+  systemd_conf = configuration_data()
+  systemd_conf.set(
+    'QOBUZCONNECT2MPD_BIN',
+    join_paths(get_option('prefix'), get_option('bindir'), 'qobuzconnect2mpd'),
+  )
+
+  systemd_unit = configure_file(
+    input: 'systemd/qobuzconnect2mpd.service.in',
+    output: 'qobuzconnect2mpd.service',
+    configuration: systemd_conf,
+  )
+
+  install_data(systemd_unit, install_dir: get_option('datadir') / 'systemd/user')
+elif host_os == 'freebsd'
+  rcd_conf = configuration_data()
+  rcd_conf.set('PREFIX', get_option('prefix'))
+  rcd_conf.set('BINDIR', join_paths(get_option('prefix'), get_option('bindir')))
+  rcd_conf.set(
+    'QOBUZCONNECT2MPD_CONFIG',
+    join_paths(
+      get_option('prefix'),
+      get_option('sysconfdir'),
+      'qobuzconnect2mpd',
+      'qobuzconnect2mpd.conf',
+    ),
+  )
+
+  rcd_script = configure_file(
+    input: 'freebsd/qobuzconnect2mpd.in',
+    output: 'qobuzconnect2mpd',
+    configuration: rcd_conf,
+  )
+
+  # rc.d scripts live under ${PREFIX}/etc/rc.d on FreeBSD and must be executable.
+  install_data(
+    rcd_script,
+    install_dir: get_option('sysconfdir') / 'rc.d',
+    install_mode: 'rwxr-xr-x',
+  )
+endif
 
 #upmpdcli_data = files(
 #  'src/AVTransport.xml',
