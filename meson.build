@@ -232,9 +232,11 @@ elif host_os == 'freebsd'
     ),
   )
 
+  # Output name must differ from the 'qobuzconnect2mpd' executable target to
+  # avoid clobbering it in the build dir; it is renamed back on install.
   rcd_script = configure_file(
     input: 'freebsd/qobuzconnect2mpd.in',
-    output: 'qobuzconnect2mpd',
+    output: 'qobuzconnect2mpd.rc',
     configuration: rcd_conf,
   )
 
@@ -242,6 +244,7 @@ elif host_os == 'freebsd'
   install_data(
     rcd_script,
     install_dir: get_option('sysconfdir') / 'rc.d',
+    rename: 'qobuzconnect2mpd',
     install_mode: 'rwxr-xr-x',
   )
 endif
