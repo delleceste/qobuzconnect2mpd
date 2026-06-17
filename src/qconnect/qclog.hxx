@@ -23,11 +23,13 @@
 #ifdef MDU_INCLUDE_LOG
 #  include MDU_INCLUDE_LOG
 #else
+#  include <cstdlib>
 #  include <ctime>
 #  include <fstream>
 #  include <iostream>
 #  include <mutex>
 #  include <sstream>
+#  include <string>
 
 // Global log file — defined in main.cxx, opened there if qconnectlogfile is set.
 extern std::ofstream g_qc_log_file;
@@ -42,6 +44,15 @@ inline std::string qcTimestamp() {
     if (tm_info) strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
     else          buf[0] = '\0';
     return buf;
+}
+// Debug logging is off by default (it is verbose); enable it for a session by
+// setting QC_DEBUG=1 in the environment. Evaluated once and cached.
+inline bool qcDebugEnabled() {
+    static const bool on = []{
+        const char* e = std::getenv("QC_DEBUG");
+        return e && *e && std::string(e) != "0";
+    }();
+    return on;
 }
 } // namespace QConnect
 
@@ -78,7 +89,14 @@ inline std::string qcTimestamp() {
      } while(0)
 #  endif
 
+// LOGDEB — log file only, and only when QC_DEBUG is set in the environment.
 #  ifndef LOGDEB
-#    define LOGDEB(X) do {} while(0)
+#    define LOGDEB(X) do { \
+         if (QConnect::qcDebugEnabled() && g_qc_log_file.is_open()) { \
+             std::ostringstream _s; _s << X; \
+             std::lock_guard<std::mutex> _lk(g_qc_log_mutex); \
+             g_qc_log_file << QConnect::qcTimestamp() << " [DEB] " << _s.str() << std::flush; \
+         } \
+     } while(0)
 #  endif
 #endif

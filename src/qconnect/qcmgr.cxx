@@ -606,7 +606,10 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
                 return;
             }
         }
-        m_mpd->seek(position_ms);
+        bool ok = m_mpd->seek(position_ms);
+        LOGINF("QcManager: seek to " << position_ms << " ms -> "
+               << (ok ? "OK" : "FAILED (MPD refused — stream may be non-seekable)")
+               << "\n");
     }
 }
 
