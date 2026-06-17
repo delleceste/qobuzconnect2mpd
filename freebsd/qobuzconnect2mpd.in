@@ -32,8 +32,9 @@ load_rc_config "$name"
 : ${qobuzconnect2mpd_user:="giacomo"}
 : ${qobuzconnect2mpd_homedir:="/home/giacomo"}
 : ${qobuzconnect2mpd_flags:=""}
-# Default config is the copy installed by meson; pidfile in the user's cache
-# dir (/var/run is not writable by an unprivileged user).
+# Config is read directly from the repo checkout (run-from-repo: a single file
+# to edit, nothing copied on update); pidfile in the user's cache dir
+# (/var/run is not writable by an unprivileged user).
 : ${qobuzconnect2mpd_config:="@QOBUZCONNECT2MPD_CONFIG@"}
 : ${qobuzconnect2mpd_pidfile:="${qobuzconnect2mpd_homedir}/.cache/qobuzconnect2mpd/qobuzconnect2mpd.pid"}
 

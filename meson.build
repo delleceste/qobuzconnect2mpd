@@ -198,7 +198,12 @@ executable(
 
 ########################## Install data
 
-install_data('conf/qobuzconnect2mpd.conf', install_dir: get_option('sysconfdir') / 'qobuzconnect2mpd')
+# Run-from-repo model (as in ../open-media-drc): the daemon reads its config
+# DIRECTLY from this checkout — nothing is copied to sysconfdir, so there is a
+# single config file to edit. conf/qobuzconnect2mpd.conf is gitignored and holds
+# the real (secret) credentials; conf/qobuzconnect2mpd.conf.example is the
+# tracked, credential-free template to copy from.
+qobuzconnect2mpd_config = meson.current_source_dir() / 'conf' / 'qobuzconnect2mpd.conf'
 
 host_os = host_machine.system()
 
@@ -222,15 +227,7 @@ elif host_os == 'freebsd'
   rcd_conf = configuration_data()
   rcd_conf.set('PREFIX', get_option('prefix'))
   rcd_conf.set('BINDIR', join_paths(get_option('prefix'), get_option('bindir')))
-  rcd_conf.set(
-    'QOBUZCONNECT2MPD_CONFIG',
-    join_paths(
-      get_option('prefix'),
-      get_option('sysconfdir'),
-      'qobuzconnect2mpd',
-      'qobuzconnect2mpd.conf',
-    ),
-  )
+  rcd_conf.set('QOBUZCONNECT2MPD_CONFIG', qobuzconnect2mpd_config)
 
   # Output name must differ from the 'qobuzconnect2mpd' executable target to
   # avoid clobbering it in the build dir; it is renamed back on install.

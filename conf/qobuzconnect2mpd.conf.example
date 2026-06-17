@@ -1,5 +1,3 @@
-
-
 # qobuzconnect2mpd configuration
 
 ###########################################################################
@@ -8,6 +6,12 @@
 # Run alongside upmpdcli to let the Qobuz mobile/desktop app cast audio
 # directly to this device (similar to Spotify Connect).
 # Start the daemon with:  qconnect2mpd [-c /etc/upmpdcli.conf]
+#
+# Run-from-repo: copy this template to qobuzconnect2mpd.conf in the same
+# directory and fill in your credentials. The real qobuzconnect2mpd.conf is
+# gitignored so secrets never land in version control:
+#
+#   cp conf/qobuzconnect2mpd.conf.example conf/qobuzconnect2mpd.conf
 ###########################################################################
 
 # Device name shown in the Qobuz app.
@@ -46,8 +50,7 @@ qconnectlogfile = /tmp/qconnect2mpd.log
 
 # Qobuz credentials for qconnect2mpd.  If not set, the values of
 # qobuzuser/qobuzpass/qobuzappid/qobuzcfvalue are used instead.
-qconnectuser = delleceste@gmail.com
-qconnectpass = calimeraB3ll4
+qconnectuser = your-qobuz-email@example.com
+qconnectpass = your-qobuz-password
 #qconnectappid =
 #qconnectcfvalue =
-
