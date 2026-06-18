@@ -138,8 +138,6 @@ private:
     void onWsDisconnected();
     void queueLoadLoop();
     void stopQueueLoadWorker();
-    void cleanupMaterializedFiles(const std::vector<std::string>& paths);
-    void cleanupPlayedMaterializedFiles(int queue_pos);
 
     // Called by MpdCtl's event thread
     void onMpdState(const MpdState& st);
@@ -151,7 +149,6 @@ private:
         const std::vector<QueueTrack>& tracks,
         std::vector<uint64_t>& out_item_ids,
         std::vector<int>& out_sample_rates,
-        std::vector<std::string>& out_local_paths,
         std::vector<std::string>& out_titles,
         uint64_t generation = 0);
     bool queueLoadAborted(uint64_t generation) const;
@@ -168,7 +165,7 @@ private:
     int mpdPosForQueueItem(uint64_t queue_item_id) const;
 
     // Console + status file
-    void printNowPlaying(const std::string& title, const std::string& local_path);
+    void printNowPlaying(const std::string& title);
     void writeStatusFile();
     void statusLoop();
 
@@ -202,7 +199,6 @@ private:
     mutable std::mutex        m_qmap_mutex;
     std::vector<uint64_t>     m_queue_item_ids;
     std::vector<int>          m_track_sample_rates; // Hz, parallel to m_queue_item_ids
-    std::vector<std::string>  m_track_local_paths;  // local materialized FLAC paths
     std::vector<std::string>  m_track_titles;        // "Artist - Title", parallel to m_queue_item_ids
 
     struct PendingQueueLoad {

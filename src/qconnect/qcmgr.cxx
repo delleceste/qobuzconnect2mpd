@@ -60,35 +60,14 @@ static std::string formatMs(uint32_t ms) {
     return buf;
 }
 
-void QcManager::printNowPlaying(const std::string& title, const std::string& local_path) {
-    std::cout << "\033[1;32m▶  " << title << "\033[0m\n";
+void QcManager::printNowPlaying(const std::string& title) {
+    std::cout << "\033[1;32m▶  " << title << "\033[0m\n" << std::flush;
     LOGINF("▶  " << title << "\n");
-    std::string fmt_info;
-    if (!local_path.empty()) {
-        std::string cmd = "file -b -- '";
-        for (char c : local_path) {
-            if (c == '\'') cmd += "'\\''";
-            else cmd += c;
-        }
-        cmd += "' 2>/dev/null";
-        FILE* fp = popen(cmd.c_str(), "r");
-        if (fp) {
-            char buf[512];
-            while (fgets(buf, sizeof(buf), fp)) fmt_info += buf;
-            pclose(fp);
-            while (!fmt_info.empty() && (fmt_info.back() == '\n' || fmt_info.back() == '\r'))
-                fmt_info.pop_back();
-            if (!fmt_info.empty())
-                std::cout << "   \033[2m" << fmt_info << "\033[0m\n";
-        }
-        std::cout << "   \033[2m" << local_path << "\033[0m\n";
-    }
-    std::cout << std::flush;
-    // Update status file state
+    // The audio-format line (m_status_format_info) is maintained by onMpdState
+    // from MPD's decoded format; we only update the title here.
     {
         std::lock_guard<std::mutex> lk(m_status_mutex);
         m_status_title = title;
-        m_status_format_info = fmt_info;
     }
     m_status_pos_ms.store(0);
     writeStatusFile();
@@ -125,27 +104,6 @@ void QcManager::statusLoop() {
     while (!m_status_stop.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         writeStatusFile();
-    }
-}
-
-static void removeMaterializedFile(const std::string& path) {
-    if (path.empty()) return;
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    fs::remove(path, ec);
-    fs::remove(path + ".inprogress", ec);
-}
-
-static void removeAllMaterializedFiles() {
-    namespace fs = std::filesystem;
-    const fs::path dir("/tmp/qconnect2mpd-segmented");
-    std::error_code ec;
-    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec))
-        return;
-    for (const auto& entry : fs::directory_iterator(dir, ec)) {
-        if (ec) break;
-        fs::remove_all(entry.path(), ec);
-        ec.clear();
     }
 }
 
@@ -453,13 +411,10 @@ void QcManager::stop() {
     if (m_mpd)  { m_mpd->disconnect(); m_mpd.reset(); }
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        cleanupMaterializedFiles(m_track_local_paths);
         m_queue_item_ids.clear();
-        m_track_local_paths.clear();
         m_track_sample_rates.clear();
         m_track_titles.clear();
     }
-    removeAllMaterializedFiles();
 
     LOGINF("QcManager: stopped\n");
 }
@@ -542,9 +497,7 @@ void QcManager::onWsDisconnected() {
     m_queue_load_cv.notify_all();
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        cleanupMaterializedFiles(m_track_local_paths);
         m_queue_item_ids.clear();
-        m_track_local_paths.clear();
         m_track_sample_rates.clear();
         m_track_titles.clear();
     }
@@ -643,9 +596,7 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
         LOGINF("QcManager: queue cleared — stopping playback\n");
         {
             std::lock_guard<std::mutex> lk(m_qmap_mutex);
-            cleanupMaterializedFiles(m_track_local_paths);
             m_queue_item_ids.clear();
-            m_track_local_paths.clear();
             m_track_sample_rates.clear();
             m_track_titles.clear();
         }
@@ -669,9 +620,7 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
     }
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        cleanupMaterializedFiles(m_track_local_paths);
         m_queue_item_ids.clear();
-        m_track_local_paths.clear();
         m_track_sample_rates.clear();
         m_track_titles.clear();
     }
@@ -702,8 +651,8 @@ void QcManager::doTracksInserted(const std::vector<QueueTrack>& tracks,
                                    uint32_t insert_after_item_id) {
     std::vector<uint64_t> item_ids;
     std::vector<int> sample_rates;
-    std::vector<std::string> local_paths, titles;
-    auto urls = resolveStreamUrls(tracks, item_ids, sample_rates, local_paths, titles);
+    std::vector<std::string> titles;
+    auto urls = resolveStreamUrls(tracks, item_ids, sample_rates, titles);
     if (urls.empty() || !m_mpd) return;
 
     // Find insert position in our mapping
@@ -725,7 +674,6 @@ void QcManager::doTracksInserted(const std::vector<QueueTrack>& tracks,
         };
         ins(m_queue_item_ids,     item_ids);
         ins(m_track_sample_rates, sample_rates);
-        ins(m_track_local_paths,  local_paths);
         ins(m_track_titles,       titles);
     }
 
@@ -744,15 +692,14 @@ void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
 void QcManager::doTracksAdded(const std::vector<QueueTrack>& tracks) {
     std::vector<uint64_t> item_ids;
     std::vector<int> sample_rates;
-    std::vector<std::string> local_paths, titles;
-    auto urls = resolveStreamUrls(tracks, item_ids, sample_rates, local_paths, titles);
+    std::vector<std::string> titles;
+    auto urls = resolveStreamUrls(tracks, item_ids, sample_rates, titles);
     if (urls.empty() || !m_mpd) return;
 
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
         m_queue_item_ids.insert(m_queue_item_ids.end(), item_ids.begin(), item_ids.end());
         m_track_sample_rates.insert(m_track_sample_rates.end(), sample_rates.begin(), sample_rates.end());
-        m_track_local_paths.insert(m_track_local_paths.end(), local_paths.begin(), local_paths.end());
         m_track_titles.insert(m_track_titles.end(), titles.begin(), titles.end());
     }
     m_mpd->addTracks(urls);
@@ -763,8 +710,7 @@ void QcManager::doTracksAdded(const std::vector<QueueTrack>& tracks) {
 
 void QcManager::onTracksRemoved(const std::vector<uint64_t>& queue_item_ids) {
     if (!m_mpd) return;
-    std::vector<std::string> stale_paths;
-    std::vector<int>         positions;   // MPD queue positions to delete
+    std::vector<int> positions;   // MPD queue positions to delete
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
         // Our parallel vectors mirror the MPD queue 1:1 by position, so a
@@ -776,8 +722,6 @@ void QcManager::onTracksRemoved(const std::vector<uint64_t>& queue_item_ids) {
             if (it == m_queue_item_ids.end()) continue;
             size_t idx = static_cast<size_t>(it - m_queue_item_ids.begin());
             positions.push_back(static_cast<int>(idx));
-            if (idx < m_track_local_paths.size() && !m_track_local_paths[idx].empty())
-                stale_paths.push_back(m_track_local_paths[idx]);
         }
         // Erase from the local vectors in descending index order so earlier
         // erases don't shift the indices still to be removed.
@@ -788,13 +732,10 @@ void QcManager::onTracksRemoved(const std::vector<uint64_t>& queue_item_ids) {
                 m_queue_item_ids.erase(m_queue_item_ids.begin() + idx);
             if (idx < m_track_sample_rates.size())
                 m_track_sample_rates.erase(m_track_sample_rates.begin() + idx);
-            if (idx < m_track_local_paths.size())
-                m_track_local_paths.erase(m_track_local_paths.begin() + idx);
             if (idx < m_track_titles.size())
                 m_track_titles.erase(m_track_titles.begin() + idx);
         }
     }
-    cleanupMaterializedFiles(stale_paths);
     if (!positions.empty()) {
         m_mpd->removeByQueuePositions(positions);
         LOGINF("QcManager: removed " << positions.size()
@@ -813,7 +754,7 @@ void QcManager::onMpdState(const MpdState& st) {
     qrs.state.duration_ms          = st.duration_ms;
 
     // Map MPD queue position to Qobuz queue_item_id; collect display info on track change.
-    std::string track_title, track_local_path;
+    std::string track_title;
     if (st.queue_pos >= 0) {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
         if (static_cast<size_t>(st.queue_pos) < m_queue_item_ids.size()) {
@@ -824,13 +765,11 @@ void QcManager::onMpdState(const MpdState& st) {
             st.status == MpdState::Status::PLAY) {
             if (static_cast<size_t>(st.queue_pos) < m_track_titles.size())
                 track_title = m_track_titles[st.queue_pos];
-            if (static_cast<size_t>(st.queue_pos) < m_track_local_paths.size())
-                track_local_path = m_track_local_paths[st.queue_pos];
         }
     }
-    // Print now-playing outside the lock (popen/cout can be slow)
+    // Print now-playing outside the lock (cout can be slow)
     if (!track_title.empty())
-        printNowPlaying(track_title, track_local_path);
+        printNowPlaying(track_title);
 
     switch (st.status) {
     case MpdState::Status::PLAY:
@@ -890,7 +829,6 @@ void QcManager::onMpdState(const MpdState& st) {
         if (static_cast<size_t>(st.queue_pos) < m_track_sample_rates.size())
             m_ws->reportFileQuality(m_track_sample_rates[st.queue_pos]);
     }
-    cleanupPlayedMaterializedFiles(st.queue_pos);
 
     m_last_mpd_status = st.status;
     m_last_mpd_queue_pos.store(st.queue_pos);
@@ -931,7 +869,6 @@ std::vector<std::string> QcManager::resolveStreamUrls(
     const std::vector<QueueTrack>& tracks,
     std::vector<uint64_t>& out_item_ids,
     std::vector<int>& out_sample_rates,
-    std::vector<std::string>& out_local_paths,
     std::vector<std::string>& out_titles,
     uint64_t generation) {
     std::vector<std::string> urls;
@@ -940,8 +877,6 @@ std::vector<std::string> QcManager::resolveStreamUrls(
     out_item_ids.reserve(tracks.size());
     out_sample_rates.clear();
     out_sample_rates.reserve(tracks.size());
-    out_local_paths.clear();
-    out_local_paths.reserve(tracks.size());
     out_titles.clear();
     out_titles.reserve(tracks.size());
     for (const auto& t : tracks) {
@@ -950,16 +885,13 @@ std::vector<std::string> QcManager::resolveStreamUrls(
         TrackStreamInfo info;
         if (m_api->getStreamUrl(t.track_id, m_cfg.format_id, info) &&
             !info.stream_url.empty()) {
-            if (queueLoadAborted(generation)) {
-                removeMaterializedFile(info.local_path);
+            if (queueLoadAborted(generation))
                 break;
-            }
             urls.push_back(info.stream_url);
             out_item_ids.push_back(t.queue_item_id);
             out_sample_rates.push_back(info.sampling_rate);
-            out_local_paths.push_back(info.local_path);
-            // Title is set by materializeSegmentedTrack for segmented tracks;
-            // empty for direct-URL tracks (filled later in queueLoadLoop).
+            // Title is empty for direct-URL tracks (filled later in
+            // queueLoadLoop / fetchMissingTitles).
             std::string label;
             if (!info.artist.empty() || !info.title.empty()) {
                 label = info.artist.empty() ? info.title
@@ -993,7 +925,6 @@ void QcManager::fetchMissingTitles(const std::vector<QueueTrack>& tracks) {
                             : meta.artist + " - " + meta.title;
         if (label.empty()) continue;
         // Re-resolve the position (it may have shifted) and store the title.
-        std::string local_path;
         bool print_now = false;
         {
             std::lock_guard<std::mutex> lk(m_qmap_mutex);
@@ -1005,11 +936,9 @@ void QcManager::fetchMissingTitles(const std::vector<QueueTrack>& tracks) {
                 continue;
             m_track_titles[idx] = label;
             print_now = (m_last_mpd_queue_pos.load() == static_cast<int>(idx));
-            if (print_now && idx < m_track_local_paths.size())
-                local_path = m_track_local_paths[idx];
         }
         if (print_now)
-            printNowPlaying(label, local_path);
+            printNowPlaying(label);
     }
 }
 
@@ -1058,13 +987,12 @@ void QcManager::queueLoadLoop() {
 
         std::vector<uint64_t> item_ids;
         std::vector<int> sample_rates;
-        std::vector<std::string> local_paths, titles;
+        std::vector<std::string> titles;
         auto urls = resolveStreamUrls(
             std::vector<QueueTrack>(req.tracks.begin(),
                                     req.tracks.begin() + initial_track_count),
-            item_ids, sample_rates, local_paths, titles, req.generation);
+            item_ids, sample_rates, titles, req.generation);
         if (req.generation != m_queue_load_generation.load(std::memory_order_relaxed)) {
-            cleanupMaterializedFiles(local_paths);
             LOGINF("QcManager: queue load superseded while resolving streams\n");
             continue;
         }
@@ -1087,10 +1015,8 @@ void QcManager::queueLoadLoop() {
 
         {
             std::lock_guard<std::mutex> lk(m_qmap_mutex);
-            cleanupMaterializedFiles(m_track_local_paths);
             m_queue_item_ids    = item_ids;
             m_track_sample_rates = sample_rates;
-            m_track_local_paths  = local_paths;
             m_track_titles       = titles;
         }
 
@@ -1120,7 +1046,6 @@ void QcManager::queueLoadLoop() {
             if (!m_api->getTrackMeta(req.tracks[i].track_id, meta)) continue;
             std::string label = meta.artist.empty() ? meta.title
                                                     : meta.artist + " - " + meta.title;
-            std::string local_path;
             bool print_now = false;
             {
                 std::lock_guard<std::mutex> lk(m_qmap_mutex);
@@ -1128,12 +1053,10 @@ void QcManager::queueLoadLoop() {
                     m_track_titles[i] = label;
                     print_now = (m_last_mpd_queue_pos.load() == static_cast<int>(i))
                                 && !label.empty();
-                    if (print_now && i < m_track_local_paths.size())
-                        local_path = m_track_local_paths[i];
                 }
             }
             if (print_now)
-                printNowPlaying(label, local_path);
+                printNowPlaying(label);
         }
 
         if (initial_track_count >= req.tracks.size())
@@ -1141,13 +1064,12 @@ void QcManager::queueLoadLoop() {
 
         std::vector<uint64_t> add_item_ids;
         std::vector<int> add_sample_rates;
-        std::vector<std::string> add_local_paths, add_titles;
+        std::vector<std::string> add_titles;
         auto add_urls = resolveStreamUrls(
             std::vector<QueueTrack>(req.tracks.begin() + initial_track_count,
                                     req.tracks.end()),
-            add_item_ids, add_sample_rates, add_local_paths, add_titles, req.generation);
+            add_item_ids, add_sample_rates, add_titles, req.generation);
         if (req.generation != m_queue_load_generation.load(std::memory_order_relaxed)) {
-            cleanupMaterializedFiles(add_local_paths);
             LOGINF("QcManager: queue load superseded while resolving remaining streams\n");
             continue;
         }
@@ -1158,12 +1080,10 @@ void QcManager::queueLoadLoop() {
             std::lock_guard<std::mutex> lk(m_qmap_mutex);
             m_queue_item_ids.insert(m_queue_item_ids.end(), add_item_ids.begin(), add_item_ids.end());
             m_track_sample_rates.insert(m_track_sample_rates.end(), add_sample_rates.begin(), add_sample_rates.end());
-            m_track_local_paths.insert(m_track_local_paths.end(), add_local_paths.begin(), add_local_paths.end());
             m_track_titles.insert(m_track_titles.end(), add_titles.begin(), add_titles.end());
         }
         if (!m_mpd->addTracks(add_urls)) {
             LOGERR("QcManager: MPD addTracks failed for deferred queue tail\n");
-            cleanupMaterializedFiles(add_local_paths);
             continue;
         }
 
@@ -1183,7 +1103,6 @@ void QcManager::queueLoadLoop() {
             if (!m_api->getTrackMeta(req.tracks[track_idx].track_id, meta)) continue;
             std::string label = meta.artist.empty() ? meta.title
                                                     : meta.artist + " - " + meta.title;
-            std::string local_path;
             bool print_now = false;
             {
                 std::lock_guard<std::mutex> lk(m_qmap_mutex);
@@ -1191,12 +1110,10 @@ void QcManager::queueLoadLoop() {
                     m_track_titles[map_idx] = label;
                     print_now = (m_last_mpd_queue_pos.load() == static_cast<int>(map_idx))
                                 && !label.empty();
-                    if (print_now && map_idx < m_track_local_paths.size())
-                        local_path = m_track_local_paths[map_idx];
                 }
             }
             if (print_now)
-                printNowPlaying(label, local_path);
+                printNowPlaying(label);
         }
     }
 }
@@ -1207,28 +1124,6 @@ void QcManager::stopQueueLoadWorker() {
     m_queue_load_cv.notify_all();
     if (m_queue_load_thread.joinable())
         m_queue_load_thread.join();
-}
-
-void QcManager::cleanupMaterializedFiles(const std::vector<std::string>& paths) {
-    for (const auto& path : paths)
-        removeMaterializedFile(path);
-}
-
-void QcManager::cleanupPlayedMaterializedFiles(int queue_pos) {
-    if (queue_pos < 2) return;
-    std::vector<std::string> stale_paths;
-    {
-        std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        size_t keep_from = static_cast<size_t>(queue_pos - 1);
-        size_t limit = std::min(keep_from, m_track_local_paths.size());
-        for (size_t i = 0; i < limit; ++i) {
-            if (!m_track_local_paths[i].empty()) {
-                stale_paths.push_back(m_track_local_paths[i]);
-                m_track_local_paths[i].clear();
-            }
-        }
-    }
-    cleanupMaterializedFiles(stale_paths);
 }
 
 uint64_t QcManager::queueItemIdAt(int mpd_pos) const {

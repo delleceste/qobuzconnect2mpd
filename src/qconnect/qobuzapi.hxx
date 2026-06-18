@@ -36,7 +36,6 @@ namespace QConnect {
 
 struct TrackStreamInfo {
     std::string stream_url;  // signed HTTPS URL, valid for ~10 min
-    std::string local_path;  // set for locally materialized segmented streams
     std::string mime_type;   // e.g. "audio/flac"
     int         format_id{6};
     uint32_t    duration_ms{0};
