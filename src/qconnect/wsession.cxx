@@ -441,6 +441,12 @@ void WSession::dispatchMessage(const Message& msg) {
             if (msg.set_state.has_position) {
                 ack.state.current_position_ms = msg.set_state.current_position_ms;
                 ack.state.position_timestamp_ms = nowAlignedMs();
+                // Freeze the bar at the seeked position: mark BUFFERING so
+                // neither the phone's local interpolation nor our own
+                // sendHeartbeat advances it while MpdCtl::seek() blocks
+                // re-opening the HTTP stream. The MpdCtl event loop restores
+                // OK at the real MPD position once the seek completes.
+                ack.state.buffer_state = BufferState::BUFFERING;
             }
             if (msg.set_state.current_queue_item.has_queue_item_id) {
                 bool item_changed =
@@ -537,15 +543,23 @@ void WSession::dispatchMessage(const Message& msg) {
         break;
 
     case MsgType::SRVRC_TRACKS_REMOVED:
+        LOGDEB("WSession: TracksRemoved count="
+               << msg.tracks_removed.queue_item_ids.size() << "\n");
         if (m_cbs.on_tracks_removed) {
             m_cbs.on_tracks_removed(msg.tracks_removed.queue_item_ids);
         }
         break;
 
     case MsgType::SRVRC_QUEUE_CLEARED:
-        LOGDEB("WSession: QueueCleared\n");
+        LOGDEB("WSession: QueueCleared qver="
+               << msg.queue_state.queue_version.major << "."
+               << msg.queue_state.queue_version.minor << "\n");
+        {
+            std::lock_guard<std::mutex> lk(m_state_mutex);
+            m_last_state.queue_version = msg.queue_state.queue_version;
+        }
         if (m_cbs.on_queue_load)
-            m_cbs.on_queue_load({}, 0); // empty queue
+            m_cbs.on_queue_load({}, 0); // empty queue -> stop + clear MPD
         break;
 
     case MsgType::SRVRC_QUEUE_VERSION_CHANGED:

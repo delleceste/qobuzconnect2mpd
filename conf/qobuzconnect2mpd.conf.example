@@ -43,6 +43,13 @@ qconnectstatusfile = /tmp/qconnect2mpd-status.txt
 # /tmp is writable by any user; change to a persistent location if preferred.
 qconnectlogfile = /tmp/qconnect2mpd.log
 
+# Log verbosity. Default is minimal (errors only).
+#   error  only errors                       (default)
+#   info   + connection/queue/seek events and now-playing
+#   debug  + full protocol/MPD trace (very verbose)
+# Overridable at runtime with the QC_LOGLEVEL env var; QC_DEBUG=1 forces debug.
+#qconnectloglevel = error
+
 # Unix socket path for IPC coordination with upmpdcli.
 # When upmpdcli starts playing via UPnP it sends STOP to this socket;
 # qconnect2mpd notifies upmpdcli with PLAYING/STOPPED events.

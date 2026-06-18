@@ -63,6 +63,7 @@ provided at `conf/qobuzconnect2mpd.conf`.
 | `qconnectcfvalue` | value of `qobuzcfvalue` | Qobuz app secret (auto-fetched if empty) |
 | `qconnectstatusfile` | `/tmp/qconnect2mpd-status.txt` | Path for the now-playing status file (see `-o` below) |
 | `qconnectlogfile` | `/tmp/qconnect2mpd.log` | Path for the log file (errors, retries, now-playing, startup events) |
+| `qconnectloglevel` | `error` | Log verbosity: `error` (minimal, default), `info`, or `debug`. Env `QC_LOGLEVEL` overrides; `QC_DEBUG=1` forces `debug`. |
 
 ## Usage
 

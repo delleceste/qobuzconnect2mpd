@@ -50,6 +50,7 @@
 #include "qcmgr.hxx"
 #include "qclog.hxx"
 
+#include <cctype>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -64,6 +65,7 @@
 // Definitions for globals declared in qclog.hxx
 std::ofstream g_qc_log_file;
 std::mutex    g_qc_log_mutex;
+int           g_qc_log_level = QConnect::QC_LOG_ERROR; // default: errors only
 
 // ---- Minimal config-file reader --------------------------------------------
 // We cannot link against libupnpp's conftree directly here (it carries the
@@ -134,6 +136,29 @@ int main(int argc, char* argv[]) {
     ConfSimple cfg(config_file.c_str(), 1 /* readonly */);
 
     using namespace QConnect;
+
+    // Log verbosity. Default is minimal (errors only). Config key
+    // qconnectloglevel (error|info|debug, or 0|1|2); env QC_LOGLEVEL overrides
+    // the config; legacy QC_DEBUG=1 forces full debug. Set before the log file
+    // is opened so the very first messages honour it.
+    {
+        auto parseLevel = [](std::string v, int dflt) -> int {
+            for (char& c : v)
+                c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+            if (v == "0" || v == "error" || v == "err") return QC_LOG_ERROR;
+            if (v == "1" || v == "info"  || v == "inf") return QC_LOG_INFO;
+            if (v == "2" || v == "debug" || v == "deb") return QC_LOG_DEBUG;
+            return dflt;
+        };
+        int lvl = parseLevel(cfgGet(cfg, "qconnectloglevel", "error"),
+                             QC_LOG_ERROR);
+        if (const char* e = std::getenv("QC_LOGLEVEL"); e && *e)
+            lvl = parseLevel(e, lvl);
+        if (const char* e = std::getenv("QC_DEBUG"); e && *e &&
+            std::string(e) != "0")
+            lvl = QC_LOG_DEBUG;
+        g_qc_log_level = lvl;
+    }
 
     QcConfig qcfg;
 

@@ -36,7 +36,17 @@ extern std::ofstream g_qc_log_file;
 // Serialises writes from multiple threads (MPD event, background materializer, etc.)
 extern std::mutex    g_qc_log_mutex;
 
+// Verbosity level, defined in main.cxx (default QC_LOG_ERROR). Higher levels
+// include all lower ones. Set from the qconnectloglevel config key / QC_DEBUG
+// or QC_LOGLEVEL environment variables.
+//   0 = errors only (LOGERR)         — the default, minimal output
+//   1 = + info/normal (LOGINF/LOGSTD)
+//   2 = + debug trace (LOGDEB)
+extern int g_qc_log_level;
+
 namespace QConnect {
+enum { QC_LOG_ERROR = 0, QC_LOG_INFO = 1, QC_LOG_DEBUG = 2 };
+
 inline std::string qcTimestamp() {
     time_t t = time(nullptr);
     char buf[20];
@@ -44,15 +54,6 @@ inline std::string qcTimestamp() {
     if (tm_info) strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
     else          buf[0] = '\0';
     return buf;
-}
-// Debug logging is off by default (it is verbose); enable it for a session by
-// setting QC_DEBUG=1 in the environment. Evaluated once and cached.
-inline bool qcDebugEnabled() {
-    static const bool on = []{
-        const char* e = std::getenv("QC_DEBUG");
-        return e && *e && std::string(e) != "0";
-    }();
-    return on;
 }
 } // namespace QConnect
 
@@ -67,10 +68,11 @@ inline bool qcDebugEnabled() {
      } while(0)
 #  endif
 
-// LOGINF — log file only, silent on terminal (informational events)
+// LOGINF — log file only, silent on terminal (informational events).
+// Emitted at log level >= QC_LOG_INFO (1).
 #  ifndef LOGINF
 #    define LOGINF(X) do { \
-         if (g_qc_log_file.is_open()) { \
+         if (g_qc_log_level >= QConnect::QC_LOG_INFO && g_qc_log_file.is_open()) { \
              std::ostringstream _s; _s << X; \
              std::lock_guard<std::mutex> _lk(g_qc_log_mutex); \
              g_qc_log_file << QConnect::qcTimestamp() << " [INF] " << _s.str() << std::flush; \
@@ -89,10 +91,10 @@ inline bool qcDebugEnabled() {
      } while(0)
 #  endif
 
-// LOGDEB — log file only, and only when QC_DEBUG is set in the environment.
+// LOGDEB — log file only, emitted at log level >= QC_LOG_DEBUG (2).
 #  ifndef LOGDEB
 #    define LOGDEB(X) do { \
-         if (QConnect::qcDebugEnabled() && g_qc_log_file.is_open()) { \
+         if (g_qc_log_level >= QConnect::QC_LOG_DEBUG && g_qc_log_file.is_open()) { \
              std::ostringstream _s; _s << X; \
              std::lock_guard<std::mutex> _lk(g_qc_log_mutex); \
              g_qc_log_file << QConnect::qcTimestamp() << " [DEB] " << _s.str() << std::flush; \

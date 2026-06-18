@@ -731,33 +731,42 @@ void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
 void QcManager::onTracksRemoved(const std::vector<uint64_t>& queue_item_ids) {
     if (!m_mpd) return;
     std::vector<std::string> stale_paths;
-    // Remove from our mapping
+    std::vector<int>         positions;   // MPD queue positions to delete
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        // Our parallel vectors mirror the MPD queue 1:1 by position, so a
+        // queue_item_id's index IS its MPD queue position. (The qid->mpd-id
+        // map is unused/empty, which is why removal silently did nothing.)
         for (uint64_t qid : queue_item_ids) {
             auto it = std::find(m_queue_item_ids.begin(),
                                 m_queue_item_ids.end(), qid);
-            if (it != m_queue_item_ids.end()) {
-                size_t idx = static_cast<size_t>(it - m_queue_item_ids.begin());
-                if (idx < m_track_local_paths.size() && !m_track_local_paths[idx].empty())
-                    stale_paths.push_back(m_track_local_paths[idx]);
-                m_queue_item_ids.erase(it);
-                if (idx < m_track_sample_rates.size())
-                    m_track_sample_rates.erase(m_track_sample_rates.begin() + idx);
-                if (idx < m_track_local_paths.size())
-                    m_track_local_paths.erase(m_track_local_paths.begin() + idx);
-                if (idx < m_track_titles.size())
-                    m_track_titles.erase(m_track_titles.begin() + idx);
-            }
+            if (it == m_queue_item_ids.end()) continue;
+            size_t idx = static_cast<size_t>(it - m_queue_item_ids.begin());
+            positions.push_back(static_cast<int>(idx));
+            if (idx < m_track_local_paths.size() && !m_track_local_paths[idx].empty())
+                stale_paths.push_back(m_track_local_paths[idx]);
+        }
+        // Erase from the local vectors in descending index order so earlier
+        // erases don't shift the indices still to be removed.
+        std::sort(positions.begin(), positions.end(), std::greater<int>());
+        for (int pos : positions) {
+            size_t idx = static_cast<size_t>(pos);
+            if (idx < m_queue_item_ids.size())
+                m_queue_item_ids.erase(m_queue_item_ids.begin() + idx);
+            if (idx < m_track_sample_rates.size())
+                m_track_sample_rates.erase(m_track_sample_rates.begin() + idx);
+            if (idx < m_track_local_paths.size())
+                m_track_local_paths.erase(m_track_local_paths.begin() + idx);
+            if (idx < m_track_titles.size())
+                m_track_titles.erase(m_track_titles.begin() + idx);
         }
     }
     cleanupMaterializedFiles(stale_paths);
-    std::vector<int> mpd_ids;
-    for (uint64_t qid : queue_item_ids) {
-        int mid = m_mpd->queueItemToMpdId(qid);
-        if (mid >= 0) mpd_ids.push_back(mid);
+    if (!positions.empty()) {
+        m_mpd->removeByQueuePositions(positions);
+        LOGINF("QcManager: removed " << positions.size()
+               << " track(s) from queue\n");
     }
-    if (!mpd_ids.empty()) m_mpd->removeTracks(mpd_ids);
 }
 
 // ---- MPD state callback ----------------------------------------------------

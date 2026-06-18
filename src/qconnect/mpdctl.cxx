@@ -198,6 +198,29 @@ bool MpdCtl::removeTracks(const std::vector<int>& mpd_song_ids) {
     return true;
 }
 
+bool MpdCtl::removeByQueuePositions(const std::vector<int>& positions) {
+    std::lock_guard<std::mutex> lk(m_conn_mutex);
+    if (!ensureConnected()) return false;
+    // Resolve positions to stable song ids first; deleting by id is immune to
+    // the position shifts that each delete causes.
+    std::vector<unsigned> ids;
+    ids.reserve(positions.size());
+    for (int pos : positions) {
+        if (pos < 0) continue;
+        struct mpd_song* s =
+            mpd_run_get_queue_song_pos(m_conn, static_cast<unsigned>(pos));
+        if (s) {
+            ids.push_back(mpd_song_get_id(s));
+            mpd_song_free(s);
+        }
+    }
+    bool ok = true;
+    for (unsigned id : ids)
+        ok = mpd_run_delete_id(m_conn, id) && ok;
+    // When the last songs go, MPD empties the queue and stops on its own.
+    return ok;
+}
+
 // ---- Playback ---------------------------------------------------------------
 
 bool MpdCtl::play(int queue_pos) {

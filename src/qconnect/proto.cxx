@@ -16,6 +16,7 @@
  */
 
 #include "proto.hxx"
+#include "qclog.hxx"
 
 #include <chrono>
 #include <cstring>
@@ -239,7 +240,13 @@ bool decodeQueueTrackRef(const uint8_t* d, size_t len, QueueTrackRef& out) {
         switch (fn) {
         case 1: readVarint(d, len, pos, v); out.queue_item_id = v; out.has_queue_item_id = true; break;
         case 2: // track_id is fixed32 (wire type 5, 4 bytes LE)
-            { uint32_t fv = 0; readFixed32(d, len, pos, fv); out.track_id = fv; } break;
+            // A referenced track always carries a track_id. proto3 omits a
+            // zero-valued queue_item_id from the wire, so the very first queue
+            // item (id 0) would otherwise look like "no item referenced" and a
+            // tap on it would be ignored. Treat the track_id's presence as
+            // presence of the ref; queue_item_id keeps its default (0).
+            { uint32_t fv = 0; readFixed32(d, len, pos, fv); out.track_id = fv;
+              out.has_queue_item_id = true; } break;
         case 3:
             if (!readLenField(d, len, pos, fd, fl)) return false;
             out.context_uuid.assign(fd, fd + fl); break;
@@ -580,6 +587,26 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
             break;
         case MsgType::SRVRC_TRACKS_REMOVED:
             decodeMsgQueueRemoved(fd, fl, msg.tracks_removed); break;
+        case MsgType::SRVRC_QUEUE_CLEARED:
+            // No tracks; the payload carries the new queue_version (field 1).
+            // Parse it best-effort so our reports stay in sync; the important
+            // part is that this type is now *handled* and reaches the dispatch
+            // (which stops MPD and clears the queue).
+            {
+                size_t p = 0;
+                while (p < fl) {
+                    int fn2; uint8_t wt2;
+                    if (!readTag(fd, fl, p, fn2, wt2)) break;
+                    const uint8_t* fd2; size_t fl2;
+                    if (fn2 == 1 && wt2 == WT_LEN &&
+                        readLenField(fd, fl, p, fd2, fl2)) {
+                        decodeQueueVersion(fd2, fl2, msg.queue_state.queue_version);
+                    } else {
+                        skipField(fd, fl, p, wt2);
+                    }
+                }
+            }
+            break;
         case MsgType::SRVRC_QUEUE_VERSION_CHANGED:
             {
                 size_t p = 0;
@@ -598,6 +625,11 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
             }
             break;
         default:
+            // Unknown/unmapped message type. Several SRVRC_* numbers in
+            // proto.hxx are reverse-engineered guesses; log dropped types so
+            // we can identify e.g. the real queue-clear/track-remove message.
+            LOGDEB("decodeQConnectMessage: UNHANDLED msg type=" << fn
+                   << " len=" << fl << "\n");
             handled = false; break;
         }
 

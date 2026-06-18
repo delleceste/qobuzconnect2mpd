@@ -443,14 +443,15 @@ bool QobuzApi::login(const std::string& user, const std::string& pass) {
 
 std::string QobuzApi::buildRequestSignature(const std::string& method_prefix,
                                             const std::map<std::string, std::string>& args,
-                                            uint64_t ts) const {
+                                            uint64_t ts,
+                                            const std::string& secret_override) const {
     std::string plain = method_prefix;
     for (const auto& kv : args) {
         plain += kv.first;
         plain += kv.second;
     }
     plain += std::to_string(ts);
-    plain += m_app_secret;
+    plain += secret_override.empty() ? m_app_secret : secret_override;
     uint8_t digest[EVP_MAX_MD_SIZE];
     unsigned int digest_len = 0;
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
@@ -465,22 +466,44 @@ bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
                               TrackStreamInfo& out) {
     bool refreshed_credentials = false;
 retry_after_refresh:
-    bool have_stream_session = ensureStreamSession();
-    if (!have_stream_session) {
-        LOGERR("QobuzApi: unable to establish stream session for /file/url, will try legacy endpoint\n");
-    }
-
-    // Try requested format, then fall back to lower qualities. Prefer the new
-    // /file/url API, but keep the legacy endpoint as a fallback because Qobuz
-    // changes this flow often and the renderer is useless if no URL reaches MPD.
+    // Try requested format, then fall back to lower qualities.
     static const int fallback_fmts[] = {27, 7, 6, 5};
     for (int fmt : fallback_fmts) {
         if (fmt > format_id) continue;
 
-        long file_code = 0;
-        if (have_stream_session) {
-            if (tryFileUrl(track_id, fmt, out, &file_code))
+        // Preferred path: the legacy /track/getFileUrl endpoint returns a
+        // direct, complete, byte-range-seekable CDN file URL. This is exactly
+        // what upmpdcli's Qobuz plugin uses, and why seeking works flawlessly
+        // there: MPD pulls one seekable file and the CDN honours Range — no
+        // decryption, no local reassembly, no growing file. Hand it straight
+        // to MPD (out.local_path stays empty -> served directly, not proxied).
+        long legacy_code = 0;
+        if (tryGetStreamUrl(track_id, fmt, out, &legacy_code)) {
+            LOGINF("QobuzApi: using direct getFileUrl stream (fmt=" << fmt
+                   << ", seekable)\n");
+            return true;
+        }
+        if (legacy_code == 400 && !refreshed_credentials) {
+            LOGINF("QobuzApi: legacy getFileUrl signature rejected; refreshing app credentials and retrying\n");
+            if (fetchAppCredentials()) {
+                m_app_secret.clear();
+                m_stream_session_id.clear();
+                m_stream_session_expires_at = 0;
+                refreshed_credentials = true;
+                goto retry_after_refresh;
+            }
+        }
+
+        // Fallback: the encrypted CMAF /file/url path. It needs a stream
+        // session, decryption and local reassembly, and produces a growing,
+        // non-seekable file — used only when no direct URL is available.
+        if (ensureStreamSession()) {
+            long file_code = 0;
+            if (tryFileUrl(track_id, fmt, out, &file_code)) {
+                LOGINF("QobuzApi: falling back to CMAF /file/url stream (fmt="
+                       << fmt << ", not seekable until fully downloaded)\n");
                 return true;
+            }
             if (file_code == 400 && !refreshed_credentials) {
                 LOGINF("QobuzApi: /file/url signature rejected; refreshing app credentials and retrying\n");
                 if (fetchAppCredentials()) {
@@ -490,20 +513,6 @@ retry_after_refresh:
                     refreshed_credentials = true;
                     goto retry_after_refresh;
                 }
-            }
-        }
-
-        long legacy_code = 0;
-        if (tryGetStreamUrl(track_id, fmt, out, &legacy_code))
-            return true;
-        if (legacy_code == 400 && !refreshed_credentials) {
-            LOGINF("QobuzApi: legacy getFileUrl signature rejected; refreshing app credentials and retrying\n");
-            if (fetchAppCredentials()) {
-                m_app_secret.clear();
-                m_stream_session_id.clear();
-                m_stream_session_expires_at = 0;
-                refreshed_credentials = true;
-                goto retry_after_refresh;
             }
         }
     }
@@ -783,18 +792,17 @@ bool QobuzApi::materializeSegmentedTrack(const Json::Value& root, uint32_t track
 
 bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
                                 TrackStreamInfo& out, long* http_code) {
-    auto do_call = [&](uint64_t ts, long* code_out) {
-        static const std::string method_prefix = "trackgetFileUrl";
-        LOGDEB("QobuzApi: getFileUrl signing method=" << method_prefix
-               << " track_id=" << track_id
-               << " fmt=" << format_id
-               << " ts=" << ts << "\n");
-
+    // The legacy /track/getFileUrl is the *classic* Qobuz API. It needs the
+    // classic app secret, which is a different bundle.js candidate than the
+    // session/file secret in m_app_secret. Sign with a given secret.
+    auto do_call = [&](const std::string& secret, long* code_out) {
+        uint64_t ts = unixTimestamp();
         std::map<std::string, std::string> sigargs;
         sigargs["format_id"] = std::to_string(format_id);
         sigargs["intent"] = "stream";
         sigargs["track_id"] = std::to_string(track_id);
-        std::string sig = buildRequestSignature(method_prefix, sigargs, ts);
+        std::string sig = buildRequestSignature("trackgetFileUrl", sigargs, ts,
+                                                secret);
 
         std::string path = "/track/getFileUrl"
                            "?track_id="  + std::to_string(track_id)
@@ -803,15 +811,31 @@ bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
                          + "&request_ts="  + std::to_string(ts)
                          + "&request_sig=" + sig
                          + "&app_id="    + m_app_id;
-        return httpGet(path, code_out);
+        return httpGet(path, code_out, /*quiet=*/true);
     };
 
+    // Build the list of secrets to try: the cached classic secret first (if
+    // known), then every bundle.js candidate, then the active secret as a last
+    // resort. The first that yields a non-error response is cached.
+    std::vector<std::string> to_try;
+    if (!m_classic_secret.empty()) to_try.push_back(m_classic_secret);
+    for (const auto& s : m_bundle_secrets)
+        if (s != m_classic_secret) to_try.push_back(s);
+    if (to_try.empty() && !m_app_secret.empty()) to_try.push_back(m_app_secret);
+
     long code = 0;
-    uint64_t ts = unixTimestamp();
-    std::string resp = do_call(ts, &code);
-    if (!resp.empty()) {
-        LOGDEB("QobuzApi: getFileUrl succeeded with method=trackgetFileUrl"
-               << " (HTTP " << code << ")\n");
+    std::string resp;
+    std::string used_secret;
+    for (const auto& secret : to_try) {
+        long c = 0;
+        std::string r = do_call(secret, &c);
+        code = c;
+        if (!r.empty()) {           // HTTP 200 (httpGet clears body on non-200)
+            resp = std::move(r);
+            used_secret = secret;
+            break;
+        }
+        if (c != 400) break;        // a non-signature error: stop probing secrets
     }
     if (http_code) *http_code = code;
     if (resp.empty()) return false;
@@ -837,6 +861,11 @@ bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
         LOGERR("QobuzApi::getStreamUrl: no url in response for track "
                << track_id << "\n");
         return false;
+    }
+    // Cache the classic secret that worked so later tracks sign in one shot.
+    if (m_classic_secret != used_secret) {
+        m_classic_secret = used_secret;
+        LOGINF("QobuzApi: classic getFileUrl secret confirmed\n");
     }
     return true;
 }
@@ -1089,6 +1118,12 @@ bool QobuzApi::fetchAppCredentials() {
         LOGERR("QobuzApi: fetchAppCredentials: no secrets decoded from bundle.js\n");
         return false;
     }
+
+    // Keep a persistent copy: m_secret_candidates is cleared once the session
+    // secret is confirmed, but the classic /track/getFileUrl secret (a possibly
+    // different candidate) is found lazily and needs the full list.
+    m_bundle_secrets = m_secret_candidates;
+    m_classic_secret.clear();
     LOGINF("QobuzApi: fetchAppCredentials: "
            << m_secret_candidates.size() << " secret candidate(s) ready\n");
     return true;
@@ -1232,7 +1267,8 @@ std::string QobuzApi::httpPostForm(const std::string& path,
     return result;
 }
 
-std::string QobuzApi::httpGet(const std::string& path, long* http_code_out) {
+std::string QobuzApi::httpGet(const std::string& path, long* http_code_out,
+                              bool quiet) {
     std::string url = m_base_url + path;
     LOGDEB("QobuzApi: GET " << url << "\n");
 
@@ -1275,9 +1311,13 @@ std::string QobuzApi::httpGet(const std::string& path, long* http_code_out) {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
         if (http_code_out) *http_code_out = http_code;
         if (http_code != 200) {
-            LOGERR("QobuzApi: HTTP " << http_code << " for " << path << "\n");
-            if (!result.empty())
-                LOGERR("QobuzApi: response body: " << result.substr(0, 500) << "\n");
+            if (quiet) {
+                LOGDEB("QobuzApi: HTTP " << http_code << " for " << path << "\n");
+            } else {
+                LOGERR("QobuzApi: HTTP " << http_code << " for " << path << "\n");
+                if (!result.empty())
+                    LOGERR("QobuzApi: response body: " << result.substr(0, 500) << "\n");
+            }
             result.clear();
         }
     }
