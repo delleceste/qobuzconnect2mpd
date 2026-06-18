@@ -39,6 +39,10 @@ struct MpdState {
     int      queue_pos{-1};     // current song position in queue
     int      queue_id{-1};      // current song MPD id
     int      queue_len{0};
+    // Decoded audio format of the current song (0 when unknown / not playing).
+    uint32_t sample_rate{0};    // Hz
+    uint8_t  bits{0};           // bit depth (0 or 32 = float/DSD/unknown)
+    uint8_t  channels{0};
 };
 
 // Called from MpdCtl's event thread on every MPD state change.

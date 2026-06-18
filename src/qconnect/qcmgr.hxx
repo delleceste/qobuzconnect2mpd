@@ -117,6 +117,12 @@ private:
     void onSetState(PlayingState ps, uint32_t position_ms,
                     bool has_position,
                     const QueueTrackRef& current_item);
+    // The seek part of onSetState, run on the worker thread because
+    // MpdCtl::seek() blocks for seconds repositioning a remote stream and must
+    // not stall the WS eventLoop (server pings).
+    void doSeek(uint32_t position_ms, bool has_queue_item);
+    // Enqueue a job on the queue-load worker thread and wake it.
+    void postBgTask(std::function<void()> fn);
     void onSetVolume(uint32_t volume, int32_t delta);
     void onQueueLoad(const std::vector<QueueTrack>& tracks, uint32_t start_idx);
     void onTracksInserted(const std::vector<QueueTrack>& tracks,

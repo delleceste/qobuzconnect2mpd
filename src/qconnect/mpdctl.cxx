@@ -360,6 +360,12 @@ MpdState MpdCtl::fetchState() {
     out.queue_pos   = mpd_status_get_song_pos(st);
     out.queue_id    = mpd_status_get_song_id(st);
     out.queue_len   = mpd_status_get_queue_length(st);
+    // Real decoded audio format of the current song (valid while playing).
+    if (const struct mpd_audio_format* af = mpd_status_get_audio_format(st)) {
+        out.sample_rate = af->sample_rate;
+        out.bits        = af->bits;
+        out.channels    = af->channels;
+    }
     mpd_status_free(st);
     return out;
 }

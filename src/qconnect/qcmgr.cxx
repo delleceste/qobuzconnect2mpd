@@ -37,6 +37,7 @@
 #include <future>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 
 static uint64_t nowMs() {
     using namespace std::chrono;
@@ -591,26 +592,38 @@ void QcManager::onSetState(PlayingState ps, uint32_t position_ms,
     }
 
     // Handle seek independently of play state (has_position distinguishes
-    // "seek to 0" from "no seek requested")
+    // "seek to 0" from "no seek requested"). Seek can block for seconds
+    // repositioning the remote stream, so run it (and the back-button "previous
+    // track" heuristic it carries) on the worker thread, off the WS eventLoop.
     if (has_position) {
-        // "Previous track" logic: the Qobuz app sends seek-to-0 for the back
-        // button and expects the renderer to skip to the previous track when
-        // already near the start of the current one.  Only applies when there
-        // is no explicit track switch in the same command (has_queue_item_id),
-        // so that normal track auto-advance (server sends position=0 + new
-        // queue_item_id) does not incorrectly go backwards.
-        if (position_ms == 0 && !current_item.has_queue_item_id) {
-            MpdState st = m_mpd->getState();
-            if (st.position_ms < 3000 && st.queue_pos > 0) {
-                m_mpd->previous();
-                return;
-            }
-        }
-        bool ok = m_mpd->seek(position_ms);
-        LOGINF("QcManager: seek to " << position_ms << " ms -> "
-               << (ok ? "OK" : "FAILED (MPD refused — stream may be non-seekable)")
-               << "\n");
+        bool has_q = current_item.has_queue_item_id;
+        postBgTask([this, position_ms, has_q] { doSeek(position_ms, has_q); });
     }
+}
+
+void QcManager::doSeek(uint32_t position_ms, bool has_queue_item) {
+    if (!m_mpd) return;
+    // "Previous track" logic: the Qobuz app sends seek-to-0 for the back button
+    // and expects a skip to the previous track when already near the start.
+    if (position_ms == 0 && !has_queue_item) {
+        MpdState st = m_mpd->getState();
+        if (st.position_ms < 3000 && st.queue_pos > 0) {
+            m_mpd->previous();
+            return;
+        }
+    }
+    bool ok = m_mpd->seek(position_ms);
+    LOGINF("QcManager: seek to " << position_ms << " ms -> "
+           << (ok ? "OK" : "FAILED (MPD refused — stream may be non-seekable)")
+           << "\n");
+}
+
+void QcManager::postBgTask(std::function<void()> fn) {
+    {
+        std::lock_guard<std::mutex> lk(m_queue_load_mutex);
+        m_bg_tasks.emplace_back(std::move(fn));
+    }
+    m_queue_load_cv.notify_one();
 }
 
 void QcManager::onSetVolume(uint32_t volume, int32_t delta) {
@@ -683,13 +696,9 @@ void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
                                    uint32_t insert_after_item_id) {
     // Offload to the queue-load worker: resolveStreamUrls + getTrackMeta do
     // blocking network per track, which must not run on the WS eventLoop thread.
-    {
-        std::lock_guard<std::mutex> lk(m_queue_load_mutex);
-        m_bg_tasks.emplace_back([this, tracks, insert_after_item_id] {
-            doTracksInserted(tracks, insert_after_item_id);
-        });
-    }
-    m_queue_load_cv.notify_one();
+    postBgTask([this, tracks, insert_after_item_id] {
+        doTracksInserted(tracks, insert_after_item_id);
+    });
 }
 
 void QcManager::doTracksInserted(const std::vector<QueueTrack>& tracks,
@@ -732,11 +741,7 @@ void QcManager::doTracksInserted(const std::vector<QueueTrack>& tracks,
 
 void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
     // Offload to the queue-load worker (see onTracksInserted).
-    {
-        std::lock_guard<std::mutex> lk(m_queue_load_mutex);
-        m_bg_tasks.emplace_back([this, tracks] { doTracksAdded(tracks); });
-    }
-    m_queue_load_cv.notify_one();
+    postBgTask([this, tracks] { doTracksAdded(tracks); });
 }
 
 void QcManager::doTracksAdded(const std::vector<QueueTrack>& tracks) {
@@ -900,6 +905,26 @@ void QcManager::onMpdState(const MpdState& st) {
     case MpdState::Status::PAUSE: m_status_play_state.store(3); break;
     case MpdState::Status::STOP:  m_status_play_state.store(1); break;
     default:                      m_status_play_state.store(0); break;
+    }
+
+    // Audio-format line for the status file, taken from MPD's real decoded
+    // format (works for direct-streamed tracks too, which have no local file).
+    std::string fmt_info;
+    if (st.status != MpdState::Status::STOP && st.sample_rate > 0) {
+        std::ostringstream os;
+        if (st.bits > 0 && st.bits < 32)      os << static_cast<int>(st.bits) << " bit / ";
+        else if (st.bits == 32)               os << "float / ";
+        if (st.sample_rate % 1000 == 0)       os << (st.sample_rate / 1000) << " kHz";
+        else { char b[16]; snprintf(b, sizeof(b), "%.1f", st.sample_rate / 1000.0);
+               os << b << " kHz"; }
+        if (st.channels == 1)      os << " / mono";
+        else if (st.channels == 2) os << " / stereo";
+        else if (st.channels > 2)  os << " / " << static_cast<int>(st.channels) << "ch";
+        fmt_info = os.str();
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_status_mutex);
+        m_status_format_info = fmt_info;
     }
 }
 
