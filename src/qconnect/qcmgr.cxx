@@ -292,9 +292,6 @@ bool QcManager::start() {
         m_api->appId(),
         [this](ConnectCredentials c) { onConnect(std::move(c)); });
     if (!m_http->start()) return false;
-    m_api->setLocalProxyBaseUrl("http://127.0.0.1:" +
-                                std::to_string(m_cfg.http_port) +
-                                "/qobuz-segmented");
 
     // Register the OAuth redirect handler.  The browser is sent to a Qobuz login
     // page; after login Qobuz redirects to http://<device>:<port>/oauth/callback

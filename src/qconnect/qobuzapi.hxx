@@ -116,30 +116,17 @@ public:
     // and out_jwt, and returns true.  Requires a prior successful login().
     bool fetchQwsToken(std::string& out_endpoint, std::string& out_jwt);
 
-    // Configure local HTTP proxy base URL used when materializing segmented
-    // /file/url tracks (e.g. "http://127.0.0.1:9093/qobuz-segmented").
-    void setLocalProxyBaseUrl(const std::string& v) { m_local_proxy_base_url = v; }
-
 private:
-    bool ensureStreamSession();
-    bool startStreamSession();
-    bool tryFileUrl(uint32_t track_id, int format_id, TrackStreamInfo& out,
-                    long* http_code = nullptr);
     bool tryGetStreamUrl(uint32_t track_id, int format_id, TrackStreamInfo& out,
                          long* http_code = nullptr);
-    bool materializeSegmentedTrack(const Json::Value& root, uint32_t track_id,
-                                   int format_id, TrackStreamInfo& out);
     // quiet: downgrade non-200 logging to debug (used while probing candidate
     // secrets, where a 400 is expected and not a real error).
     std::string httpGet(const std::string& path,
                          long* http_code_out = nullptr,
                          bool  quiet = false);
-    std::string httpPostForm(const std::string& path,
-                             const std::map<std::string, std::string>& form,
-                             long* http_code_out = nullptr);
-    // Sign a request. With secret_override empty, signs with m_app_secret (the
-    // active session/file secret); pass a secret to sign with a different one
-    // (e.g. the classic secret for the legacy /track/getFileUrl endpoint).
+    // Sign a request with the classic getFileUrl secret. With secret_override
+    // empty, signs with m_app_secret; pass a secret to sign with a different
+    // one (e.g. the classic secret for the legacy /track/getFileUrl endpoint).
     std::string buildRequestSignature(const std::string& method_prefix,
                                       const std::map<std::string, std::string>& args,
                                       uint64_t ts,
@@ -157,10 +144,6 @@ private:
     std::string m_classic_secret;
     std::string m_user_token;              // from /user/login
     std::string m_jwt;                     // from Qobuz app JWT (preferred)
-    std::string m_stream_session_id;       // from /session/start
-    uint64_t    m_stream_session_expires_at{0}; // unix seconds
-    std::string m_stream_session_infos;    // from /session/start
-    std::string m_local_proxy_base_url;
 };
 
 } // namespace QConnect

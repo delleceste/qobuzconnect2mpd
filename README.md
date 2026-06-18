@@ -15,8 +15,9 @@ mDNS), you cast a track or queue to it, and the audio plays through MPD.
 4. Playback state (play/pause/seek/volume/track change) is kept in sync between
    the app and MPD in both directions.
 
-HiRes and lossless CMAF/FLAC streams are downloaded, assembled locally, and
-served to MPD via a lightweight built-in HTTP proxy.
+Stream URLs are resolved from Qobuz's `track/getFileUrl` endpoint as direct,
+byte-range-seekable CDN file URLs and handed straight to MPD, so MPD streams
+the original FLAC and seeking works natively (bit-perfect, no transcoding).
 
 ## Dependencies
 
@@ -113,9 +114,10 @@ When a track starts playing the daemon prints to stdout:
 
 ```
 ▶  Artist Name - Track Title
-   FLAC audio bitstream data, 16 bit, stereo, 44.1 kHz
-   /tmp/qconnect2mpd-segmented/12345_27_1234567890.flac
 ```
+
+The decoded audio format (e.g. `24 bit / 96 kHz / stereo`, from
+`mpd_status_get_audio_format`) is written to the status file described below.
 
 ### Status file (`-o`)
 
@@ -137,14 +139,13 @@ When `qconnectlogfile` is set, timestamped entries are appended for:
 
 - Startup events (config path, MPD connection result)
 - Now-playing track changes
-- Segment fetch errors and retries (with error reason and segment N/total)
+- Stream URL resolution / seek results
 - Qobuz API / WebSocket connection events
 
 ```
 2026-05-15 14:32:01 [OUT] qconnect2mpd: MPD connected OK (localhost:6600)
 2026-05-15 14:32:15 [INF] ▶  Aphex Twin - Xtal
-2026-05-15 14:35:02 [ERR] QobuzApi: segment 18/72 fetch failed (HTTP 503) for ... — retrying
-2026-05-15 14:35:07 [ERR] QobuzApi: segment 18/72 fetch failed (HTTP 503) for ... — giving up
+2026-05-15 14:35:02 [ERR] WSession: recv error: ...
 ```
 
 Log levels: `[OUT]` normal output, `[INF]` informational, `[ERR]` errors.

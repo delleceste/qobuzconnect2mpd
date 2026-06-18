@@ -49,9 +49,8 @@ HttpHandler::HttpHandler(const std::string& uuid,
 HttpHandler::~HttpHandler() { stop(); }
 
 bool HttpHandler::start() {
-    // MHD_USE_THREAD_PER_CONNECTION: each connection (including the blocking
-    // growingFileReader for audio streaming) runs in its own thread, so a slow
-    // or stalled audio response never blocks the accept loop or other requests.
+    // MHD_USE_THREAD_PER_CONNECTION: each connection runs in its own thread, so
+    // a slow or stalled response never blocks the accept loop or other requests.
     m_daemon = MHD_start_daemon(
         MHD_USE_SELECT_INTERNALLY | MHD_USE_THREAD_PER_CONNECTION | MHD_USE_DUAL_STACK,
         static_cast<uint16_t>(m_port),
@@ -117,130 +116,6 @@ static MHD_Result sendResponse(struct MHD_Connection* conn,
     return ret;
 }
 
-static MHD_Result sendFileResponse(struct MHD_Connection* conn,
-                                   const std::string& path,
-                                   const std::string& content_type,
-                                   bool head_only,
-                                   const std::string& marker_path = {}) {
-    namespace fs = std::filesystem;
-    if (!fs::exists(path) || !fs::is_regular_file(path))
-        return sendResponse(conn, MHD_HTTP_NOT_FOUND, R"({"error":"not found"})");
-
-    long long start = 0;
-    long long end = -1;
-    bool partial = false;
-
-    const char* range = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Range");
-    if (range && strncmp(range, "bytes=", 6) == 0) {
-        long long s = -1, e = -1;
-        if (sscanf(range + 6, "%lld-%lld", &s, &e) >= 1) {
-            if (s >= 0) start = s;
-            if (e >= 0) end = e;
-            partial = true;
-        }
-    }
-
-    long long total = 0;
-    for (;;) {
-        std::error_code ec;
-        if (!fs::exists(path, ec) || !fs::is_regular_file(path, ec))
-            return sendResponse(conn, MHD_HTTP_NOT_FOUND, R"({"error":"not found"})");
-        total = static_cast<long long>(fs::file_size(path, ec));
-        if (ec) total = 0;
-        bool growing = !marker_path.empty() && fs::exists(marker_path);
-        if (!partial || start < total || !growing)
-            break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    if (total < 0) total = 0;
-    if (end < 0 || end >= total) end = total > 0 ? total - 1 : 0;
-    if (partial && start >= total) {
-        return sendResponse(conn, MHD_HTTP_RANGE_NOT_SATISFIABLE,
-                            R"({"error":"range not satisfiable"})");
-    }
-    if (start < 0) start = 0;
-
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs)
-        return sendResponse(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, R"({"error":"open failed"})");
-
-    long long len = (end >= start) ? (end - start + 1) : 0;
-
-    std::string data;
-    if (!head_only) {
-        data.resize(static_cast<size_t>(len));
-        ifs.seekg(start, std::ios::beg);
-        if (len > 0) ifs.read(data.data(), len);
-    }
-
-    struct MHD_Response* resp = MHD_create_response_from_buffer(
-        data.size(),
-        data.empty() ? nullptr : const_cast<char*>(data.data()),
-        MHD_RESPMEM_MUST_COPY);
-    MHD_add_response_header(resp, "Content-Type", content_type.c_str());
-    MHD_add_response_header(resp, "Content-Length", std::to_string(len).c_str());
-    MHD_add_response_header(resp, "Accept-Ranges", "bytes");
-    MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
-    if (partial) {
-        std::string cr = "bytes " + std::to_string(start) + "-" +
-                         std::to_string(end) + "/" + std::to_string(total);
-        MHD_add_response_header(resp, "Content-Range", cr.c_str());
-    }
-    MHD_Result ret = MHD_queue_response(conn,
-                                        partial ? MHD_HTTP_PARTIAL_CONTENT : MHD_HTTP_OK,
-                                        resp);
-    MHD_destroy_response(resp);
-    return ret;
-}
-
-struct GrowingFileCtx {
-    std::string path;
-    std::string marker_path;
-};
-
-static ssize_t growingFileReader(void* cls, uint64_t pos, char* buf, size_t max) {
-    namespace fs = std::filesystem;
-    auto* ctx = static_cast<GrowingFileCtx*>(cls);
-    for (;;) {
-        std::error_code ec;
-        uint64_t size = fs::exists(ctx->path, ec) ? fs::file_size(ctx->path, ec) : 0;
-        if (!ec && pos < size) {
-            std::ifstream ifs(ctx->path, std::ios::binary);
-            if (!ifs) return MHD_CONTENT_READER_END_WITH_ERROR;
-            ifs.seekg(static_cast<std::streamoff>(pos), std::ios::beg);
-            size_t want = static_cast<size_t>(std::min<uint64_t>(size - pos, max));
-            ifs.read(buf, static_cast<std::streamsize>(want));
-            auto got = static_cast<ssize_t>(ifs.gcount());
-            if (got > 0) return got;
-        }
-        if (!fs::exists(ctx->marker_path))
-            return MHD_CONTENT_READER_END_OF_STREAM;
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-}
-
-static void freeGrowingFileCtx(void* cls) {
-    delete static_cast<GrowingFileCtx*>(cls);
-}
-
-static MHD_Result sendGrowingFileResponse(struct MHD_Connection* conn,
-                                          const std::string& path,
-                                          const std::string& marker_path,
-                                          const std::string& content_type,
-                                          bool /*head_only*/) {
-    auto* ctx = new GrowingFileCtx{path, marker_path};
-    struct MHD_Response* resp = MHD_create_response_from_callback(
-        MHD_SIZE_UNKNOWN, 64 * 1024, &growingFileReader, ctx, &freeGrowingFileCtx);
-    if (!resp) {
-        delete ctx;
-        return sendResponse(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, R"({"error":"stream setup failed"})");
-    }
-    MHD_add_response_header(resp, "Content-Type", content_type.c_str());
-    MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
-    MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
-    MHD_destroy_response(resp);
-    return ret;
-}
 
 MHD_Result HttpHandler::handleRequest(struct MHD_Connection* conn,
                                  const char*            url,
@@ -249,37 +124,6 @@ MHD_Result HttpHandler::handleRequest(struct MHD_Connection* conn,
                                  size_t*                upload_data_size,
                                  void**                 con_cls) {
     const std::string prefix = "/devices/" + m_uuid;
-    const std::string seg_prefix = "/qobuz-segmented/";
-
-    if ((strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) &&
-        std::string(url).rfind(seg_prefix, 0) == 0) {
-        std::string name = std::string(url).substr(seg_prefix.size());
-        if (name.empty() || name.find("..") != std::string::npos ||
-            name.front() == '/' || name.back() == '/') {
-            return sendResponse(conn, MHD_HTTP_BAD_REQUEST, R"({"error":"bad path"})");
-        }
-        const std::string path = "/tmp/qconnect2mpd-segmented/" + name;
-        const std::string marker_path = path + ".inprogress";
-        if (std::filesystem::exists(marker_path)) {
-            // While materialization is still running, never return a fixed-size
-            // snapshot. Some MPD builds appear to probe with HEAD before GET; if
-            // we advertise the current partial Content-Length they can stop at
-            // that early boundary on slower machines.
-            if (strcmp(method, "HEAD") == 0)
-                return sendGrowingFileResponse(conn, path, marker_path,
-                                               "audio/flac", true);
-
-            const char* range = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "Range");
-            if (range && *range) {
-                LOGDEB("HttpHandler: ignoring Range for growing segmented file "
-                       << name << "\n");
-            }
-            return sendGrowingFileResponse(conn, path, marker_path, "audio/flac",
-                                           false);
-        }
-        return sendFileResponse(conn, path, "audio/flac",
-                                strcmp(method, "HEAD") == 0);
-    }
 
     // ---- OPTIONS (CORS pre-flight) ----------------------------------------
     if (strcmp(method, "OPTIONS") == 0) {
