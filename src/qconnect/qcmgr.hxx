@@ -144,6 +144,12 @@ private:
         uint64_t generation = 0);
     bool queueLoadAborted(uint64_t generation) const;
 
+    // Fetch and store display titles for queue items whose title is still empty
+    // (direct-URL tracks don't carry a title from resolveStreamUrls). Matches by
+    // queue_item_id so it is robust to position shifts. Updates now-playing if a
+    // fetched track is the one currently playing.
+    void fetchMissingTitles(const std::vector<QueueTrack>& tracks);
+
     // Look up Qobuz queue_item_id from MPD queue position.
     uint64_t queueItemIdAt(int mpd_pos) const;
     // Look up MPD queue position from Qobuz queue_item_id. Returns -1 if not found.

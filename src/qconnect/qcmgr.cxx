@@ -709,6 +709,9 @@ void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
 
     int mpd_id = m_mpd->queueItemToMpdId(insert_after_item_id);
     m_mpd->insertTracks(urls, mpd_id);
+
+    // Backfill display titles for direct-URL tracks (empty from resolve).
+    fetchMissingTitles(tracks);
 }
 
 void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
@@ -726,6 +729,9 @@ void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
         m_track_titles.insert(m_track_titles.end(), titles.begin(), titles.end());
     }
     m_mpd->addTracks(urls);
+
+    // Backfill display titles for direct-URL tracks (empty from resolve).
+    fetchMissingTitles(tracks);
 }
 
 void QcManager::onTracksRemoved(const std::vector<uint64_t>& queue_item_ids) {
@@ -919,6 +925,45 @@ std::vector<std::string> QcManager::resolveStreamUrls(
         }
     }
     return urls;
+}
+
+void QcManager::fetchMissingTitles(const std::vector<QueueTrack>& tracks) {
+    for (const auto& t : tracks) {
+        // Skip if this queue item already has a title.
+        {
+            std::lock_guard<std::mutex> lk(m_qmap_mutex);
+            auto it = std::find(m_queue_item_ids.begin(),
+                                m_queue_item_ids.end(), t.queue_item_id);
+            if (it == m_queue_item_ids.end()) continue;
+            size_t idx = static_cast<size_t>(it - m_queue_item_ids.begin());
+            if (idx >= m_track_titles.size() || !m_track_titles[idx].empty())
+                continue;
+        }
+        TrackMeta meta;
+        if (!m_api->getTrackMeta(t.track_id, meta)) continue;
+        std::string label = meta.artist.empty()
+                            ? meta.title
+                            : meta.artist + " - " + meta.title;
+        if (label.empty()) continue;
+        // Re-resolve the position (it may have shifted) and store the title.
+        std::string local_path;
+        bool print_now = false;
+        {
+            std::lock_guard<std::mutex> lk(m_qmap_mutex);
+            auto it = std::find(m_queue_item_ids.begin(),
+                                m_queue_item_ids.end(), t.queue_item_id);
+            if (it == m_queue_item_ids.end()) continue;
+            size_t idx = static_cast<size_t>(it - m_queue_item_ids.begin());
+            if (idx >= m_track_titles.size() || !m_track_titles[idx].empty())
+                continue;
+            m_track_titles[idx] = label;
+            print_now = (m_last_mpd_queue_pos.load() == static_cast<int>(idx));
+            if (print_now && idx < m_track_local_paths.size())
+                local_path = m_track_local_paths[idx];
+        }
+        if (print_now)
+            printNowPlaying(label, local_path);
+    }
 }
 
 bool QcManager::queueLoadAborted(uint64_t generation) const {
