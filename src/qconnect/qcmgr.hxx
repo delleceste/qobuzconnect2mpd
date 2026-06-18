@@ -24,6 +24,7 @@
 #include <thread>
 #include <condition_variable>
 #include <functional>
+#include <deque>
 
 #include "proto.hxx"
 #include "mpdctl.hxx"
@@ -121,6 +122,11 @@ private:
     void onTracksInserted(const std::vector<QueueTrack>& tracks,
                            uint32_t insert_after_item_id);
     void onTracksAdded(const std::vector<QueueTrack>& tracks);
+    // Real work for the above, run on the queue-load worker thread (not the WS
+    // eventLoop) because they do blocking per-track network calls.
+    void doTracksInserted(const std::vector<QueueTrack>& tracks,
+                           uint32_t insert_after_item_id);
+    void doTracksAdded(const std::vector<QueueTrack>& tracks);
     void onTracksRemoved(const std::vector<uint64_t>& queue_item_ids);
     void onWsConnected();
     void onWsDisconnected();
@@ -205,6 +211,9 @@ private:
     std::atomic<bool>         m_queue_load_stop{false};
     std::atomic<uint64_t>     m_queue_load_generation{0};
     PendingQueueLoad          m_pending_queue_load;
+    // Misc background jobs (track add/insert) run on the same worker thread,
+    // guarded by m_queue_load_mutex.
+    std::deque<std::function<void()>> m_bg_tasks;
 
     // Status file
     std::string           m_status_title;

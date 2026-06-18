@@ -668,6 +668,9 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
     uint64_t generation = m_queue_load_generation.fetch_add(1, std::memory_order_relaxed) + 1;
     {
         std::lock_guard<std::mutex> lk(m_queue_load_mutex);
+        // A full queue (re)load replaces everything; drop any add/insert tasks
+        // queued against the old queue so they don't append stale tracks.
+        m_bg_tasks.clear();
         m_pending_queue_load.tracks = tracks;
         m_pending_queue_load.start_idx = start_idx;
         m_pending_queue_load.generation = generation;
@@ -677,6 +680,19 @@ void QcManager::onQueueLoad(const std::vector<QueueTrack>& tracks,
 }
 
 void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
+                                   uint32_t insert_after_item_id) {
+    // Offload to the queue-load worker: resolveStreamUrls + getTrackMeta do
+    // blocking network per track, which must not run on the WS eventLoop thread.
+    {
+        std::lock_guard<std::mutex> lk(m_queue_load_mutex);
+        m_bg_tasks.emplace_back([this, tracks, insert_after_item_id] {
+            doTracksInserted(tracks, insert_after_item_id);
+        });
+    }
+    m_queue_load_cv.notify_one();
+}
+
+void QcManager::doTracksInserted(const std::vector<QueueTrack>& tracks,
                                    uint32_t insert_after_item_id) {
     std::vector<uint64_t> item_ids;
     std::vector<int> sample_rates;
@@ -715,6 +731,15 @@ void QcManager::onTracksInserted(const std::vector<QueueTrack>& tracks,
 }
 
 void QcManager::onTracksAdded(const std::vector<QueueTrack>& tracks) {
+    // Offload to the queue-load worker (see onTracksInserted).
+    {
+        std::lock_guard<std::mutex> lk(m_queue_load_mutex);
+        m_bg_tasks.emplace_back([this, tracks] { doTracksAdded(tracks); });
+    }
+    m_queue_load_cv.notify_one();
+}
+
+void QcManager::doTracksAdded(const std::vector<QueueTrack>& tracks) {
     std::vector<uint64_t> item_ids;
     std::vector<int> sample_rates;
     std::vector<std::string> local_paths, titles;
@@ -977,16 +1002,31 @@ bool QcManager::queueLoadAborted(uint64_t generation) const {
 void QcManager::queueLoadLoop() {
     while (!m_queue_load_stop.load(std::memory_order_relaxed)) {
         PendingQueueLoad req;
+        bool have_req = false;
+        std::function<void()> task;
         {
             std::unique_lock<std::mutex> lk(m_queue_load_mutex);
             m_queue_load_cv.wait(lk, [this] {
                 return m_queue_load_stop.load(std::memory_order_relaxed) ||
-                       m_pending_queue_load.pending;
+                       m_pending_queue_load.pending ||
+                       !m_bg_tasks.empty();
             });
             if (m_queue_load_stop.load(std::memory_order_relaxed))
                 break;
-            req = m_pending_queue_load;
-            m_pending_queue_load.pending = false;
+            if (m_pending_queue_load.pending) {
+                req = m_pending_queue_load;
+                m_pending_queue_load.pending = false;
+                have_req = true;
+            } else if (!m_bg_tasks.empty()) {
+                task = std::move(m_bg_tasks.front());
+                m_bg_tasks.pop_front();
+            }
+        }
+        // Background task (track add/insert): runs off the WebSocket eventLoop
+        // thread so its per-track network calls can't stall ping handling.
+        if (!have_req) {
+            if (task) task();
+            continue;
         }
 
         const size_t initial_track_count =
