@@ -1,2 +1,8 @@
 # option('qconnect2mpd', type : 'boolean', value : true,  description: 'Build qconnect2mpd: Qobuz Connect receiver daemon')
-
+option(
+  'init_system',
+  type: 'combo',
+  choices: ['auto', 'systemd', 'freebsd', 'none'],
+  value: 'auto',
+  description: 'Install init integration: auto-detect, force systemd, force FreeBSD rc.d, or install none',
+)

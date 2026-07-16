@@ -104,6 +104,7 @@ qc_sources = files(
   'src/qconnect/httphandler.cxx',
   'src/qconnect/wsession.cxx',
   'src/qconnect/qobuzapi.cxx',
+  'src/qconnect/segstream.cxx',
   'src/qconnect/mpdctl.cxx',
   'src/qconnect/qcmgr.cxx',
   'src/qconnect/proto.cxx',
@@ -117,6 +118,57 @@ executable(
   install: true,
   cpp_args: [],
 )
+
+qc_proto_test = executable(
+  'qconnect-proto-test',
+  files('tests/qconnect_proto_test.cxx', 'src/qconnect/proto.cxx'),
+  include_directories: include_directories('src/qconnect'),
+  dependencies: dependency('threads'),
+)
+test('qconnect-proto', qc_proto_test)
+
+qc_segstream_test = executable(
+  'qconnect-segstream-test',
+  files('tests/segstream_test.cxx', 'src/qconnect/segstream.cxx'),
+  include_directories: include_directories('src/qconnect'),
+  dependencies: [dependency('libcurl'), dependency('openssl'), dependency('threads')],
+)
+test('qconnect-segstream', qc_segstream_test)
+
+qc_http_stream_test = executable(
+  'qconnect-http-stream-test',
+  files(
+    'tests/httphandler_stream_test.cxx',
+    'src/qconnect/httphandler.cxx',
+    'src/qconnect/segstream.cxx',
+  ),
+  include_directories: include_directories('src/qconnect'),
+  dependencies: [
+    dependency('libcurl'),
+    dependency('libmicrohttpd'),
+    dependency('jsoncpp'),
+    dependency('openssl'),
+    dependency('threads'),
+  ],
+)
+test('qconnect-http-stream', qc_http_stream_test)
+
+qc_qobuz_token_test = executable(
+  'qconnect-qobuz-token-test',
+  files(
+    'tests/qobuzapi_token_test.cxx',
+    'src/qconnect/qobuzapi.cxx',
+    'src/qconnect/segstream.cxx',
+  ),
+  include_directories: include_directories('src/qconnect'),
+  dependencies: [
+    dependency('libcurl'),
+    dependency('jsoncpp'),
+    dependency('openssl'),
+    dependency('threads'),
+  ],
+)
+test('qconnect-qobuz-token', qc_qobuz_token_test)
 #### End qconnect2mpd
 
 ########################### Optional Configuration GUI
@@ -198,24 +250,31 @@ executable(
 
 ########################## Install data
 
-# Run-from-repo model (as in ../open-media-drc): the daemon reads its config
-# DIRECTLY from this checkout — nothing is copied to sysconfdir, so there is a
-# single config file to edit. conf/qobuzconnect2mpd.conf is gitignored and holds
-# the real (secret) credentials; conf/qobuzconnect2mpd.conf.example is the
-# tracked, credential-free template to copy from.
+qobuzconnect2mpd_bin = join_paths(
+  get_option('prefix'),
+  get_option('bindir'),
+  'qobuzconnect2mpd',
+)
+# Continuous-development layout: the real config is ignored by Git and read
+# directly from the checkout beside its tracked .example template.
 qobuzconnect2mpd_config = meson.current_source_dir() / 'conf' / 'qobuzconnect2mpd.conf'
 
-host_os = host_machine.system()
+init_system = get_option('init_system')
+if init_system == 'auto'
+  host_system = host_machine.system()
+  if host_system == 'freebsd'
+    init_system = 'freebsd'
+  elif host_system == 'linux'
+    init_system = 'systemd'
+  else
+    init_system = 'none'
+  endif
+endif
 
-# Service integration: systemd on Linux, rc.d on FreeBSD. Install only the one
-# matching the target OS so we don't litter the other platform's init system.
-if host_os == 'linux'
-  systemd_conf = configuration_data()
-  systemd_conf.set(
-    'QOBUZCONNECT2MPD_BIN',
-    join_paths(get_option('prefix'), get_option('bindir'), 'qobuzconnect2mpd'),
-  )
+systemd_conf = configuration_data()
+systemd_conf.set('QOBUZCONNECT2MPD_BIN', qobuzconnect2mpd_bin)
 
+if init_system == 'systemd'
   systemd_unit = configure_file(
     input: 'systemd/qobuzconnect2mpd.service.in',
     output: 'qobuzconnect2mpd.service',
@@ -223,23 +282,20 @@ if host_os == 'linux'
   )
 
   install_data(systemd_unit, install_dir: get_option('datadir') / 'systemd/user')
-elif host_os == 'freebsd'
-  rcd_conf = configuration_data()
-  rcd_conf.set('PREFIX', get_option('prefix'))
-  rcd_conf.set('BINDIR', join_paths(get_option('prefix'), get_option('bindir')))
-  rcd_conf.set('QOBUZCONNECT2MPD_CONFIG', qobuzconnect2mpd_config)
+elif init_system == 'freebsd'
+  freebsd_conf = configuration_data()
+  freebsd_conf.set('PREFIX', get_option('prefix'))
+  freebsd_conf.set('BINDIR', join_paths(get_option('prefix'), get_option('bindir')))
+  freebsd_conf.set('QOBUZCONNECT2MPD_CONFIG', qobuzconnect2mpd_config)
 
-  # Output name must differ from the 'qobuzconnect2mpd' executable target to
-  # avoid clobbering it in the build dir; it is renamed back on install.
-  rcd_script = configure_file(
+  freebsd_rc = configure_file(
     input: 'freebsd/qobuzconnect2mpd.in',
     output: 'qobuzconnect2mpd.rc',
-    configuration: rcd_conf,
+    configuration: freebsd_conf,
   )
 
-  # rc.d scripts live under ${PREFIX}/etc/rc.d on FreeBSD and must be executable.
   install_data(
-    rcd_script,
+    freebsd_rc,
     install_dir: get_option('sysconfdir') / 'rc.d',
     rename: 'qobuzconnect2mpd',
     install_mode: 'rwxr-xr-x',

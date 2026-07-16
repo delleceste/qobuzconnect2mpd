@@ -38,10 +38,10 @@ struct MpdState {
     uint32_t volume{0};         // 0-100
     int      queue_pos{-1};     // current song position in queue
     int      queue_id{-1};      // current song MPD id
+    int      next_queue_pos{-1}; // MPD's actual next song (honours random)
     int      queue_len{0};
-    // Decoded audio format of the current song (0 when unknown / not playing).
-    uint32_t sample_rate{0};    // Hz
-    uint8_t  bits{0};           // bit depth (0 or 32 = float/DSD/unknown)
+    uint32_t sample_rate{0};    // decoded format, Hz
+    uint8_t  bits{0};           // 0 when unknown
     uint8_t  channels{0};
 };
 
@@ -70,17 +70,32 @@ public:
     // Disconnect and stop the event thread.
     void disconnect();
 
+    // Capture the pre-QConnect queue/state without changing playback. Safe to
+    // call repeatedly; only the first call in a session has an effect.
+    bool beginSession();
+
     // ---- Queue management --------------------------------------------------
 
     // Replace the entire MPD queue with the given stream URLs (in order),
     // then start playing from start_pos.
     // On first call, saves the existing queue so it can be restored later.
     bool loadQueue(const std::vector<std::string>& stream_urls,
-                    int start_pos = 0);
+                   int start_pos = 0,
+                   bool repeat = false,
+                   bool random = false,
+                   bool single = false);
 
-    // Insert stream_urls after queue entry with MPD id insert_after_id.
+    // Insert stream_urls after MPD queue position insert_after_pos (-1 = append).
     bool insertTracks(const std::vector<std::string>& stream_urls,
-                       int insert_after_id);
+                       int insert_after_pos);
+
+    // Insert at an exact queue position (-1 = append).
+    bool insertTracksAt(const std::vector<std::string>& stream_urls,
+                        int position);
+
+    // Insert one resolved continuation with a single atomic MPD command. This
+    // avoids an O(queue length) metadata snapshot for every prefetched item.
+    bool insertTrackAt(const std::string& stream_url, int position);
 
     // Append stream_urls to the end of the queue.
     bool addTracks(const std::vector<std::string>& stream_urls);
@@ -88,23 +103,41 @@ public:
     // Remove queue entries by MPD song id.
     bool removeTracks(const std::vector<int>& mpd_song_ids);
 
-    // Remove queue entries by their queue position (0-based). Positions are
-    // resolved to stable MPD song ids first, then deleted, so the order of
-    // positions and intervening shifts don't matter.
-    bool removeByQueuePositions(const std::vector<int>& positions);
+    // Remove queue entries by MPD queue position. Caller must pass positions
+    // sorted descending so that earlier removals don't shift later indices.
+    bool removeTracksByPos(const std::vector<int>& mpd_positions);
+
+    // Reorder the whole queue. Each entry is an index in the current queue;
+    // the vector must contain every current index exactly once.
+    bool reorderTracks(const std::vector<size_t>& old_positions);
 
     // ---- Playback ----------------------------------------------------------
 
     bool play(int queue_pos = -1);
     bool pause(bool on);
     bool stop();
+    // Stop and clear only the active QConnect queue.  The saved pre-session
+    // queue is retained for restoreSavedQueue().
     bool stopAndClear();
+    // Restore the queue, playback state and modes captured by the first
+    // loadQueue() in this QConnect session.
+    bool restoreSavedQueue();
     bool seek(uint32_t position_ms);
+    // Apply track selection, seek, and final state under one connection lock
+    // so observers never see an intermediate PLAY state.
+    bool applyPlayback(int queue_pos, bool select_track,
+                       bool has_position, uint32_t position_ms,
+                       MpdState::Status final_state,
+                       bool restart_track = false);
     bool next();
     bool previous();
 
     // Set MPD volume (0-100).
     bool setVolume(uint32_t vol);
+
+    bool setRepeat(bool on);
+    bool setRandom(bool on);
+    bool setLoopMode(bool repeat, bool single);
 
     // ---- State -------------------------------------------------------------
 
@@ -113,20 +146,12 @@ public:
     // Register a callback that fires on every MPD event (player/queue/mixer).
     void setStateCallback(MpdStateCallback cb);
 
-    // Map a Qobuz queue_item_id to an MPD song id (maintained internally).
-    // Returns -1 if not found.
-    int queueItemToMpdId(uint64_t queue_item_id) const;
-
-    // Register a mapping from Qobuz queue_item_id to mpd song id.
-    void registerQueueItem(uint64_t queue_item_id, int mpd_id);
-
 private:
     bool openConnection();
     void closeConnection();
     bool ensureConnected();
     void eventLoop();
     MpdState fetchState();
-    void clearQueueItemMap();
 
     std::string m_host;
     int         m_port;
@@ -142,17 +167,45 @@ private:
     MpdStateCallback       m_state_cb;
     std::mutex             m_cb_mutex;
 
-    // Map Qobuz queue_item_id -> MPD song id
-    std::vector<std::pair<uint64_t, int>> m_item_map;
-    mutable std::mutex                    m_map_mutex;
+    struct SongSnapshot {
+        struct Tag {
+            int         type{0};
+            std::string value;
+        };
 
-    // Saved queue for restoration on disconnect
-    struct SavedQueue {
-        std::vector<std::string> uris;
+        std::string      uri;
+        unsigned         id{0};
+        unsigned         priority{0};
+        std::vector<Tag> tags;
+    };
+
+    struct QueueSnapshot {
+        std::vector<SongSnapshot> songs;
         int                      current_pos{-1};
         uint32_t                 current_elapsed_ms{0};
+        int                      playback_state{0};
+        bool                     repeat{false};
+        bool                     random{false};
+        int                      single_state{0};
+        int                      consume_state{0};
     };
-    SavedQueue m_saved_queue;
+    bool captureSnapshotLocked(QueueSnapshot& snapshot);
+    bool restoreSnapshotLocked(const QueueSnapshot& snapshot);
+    bool rollbackLocked(const char* operation,
+                        const QueueSnapshot& snapshot);
+
+    struct PlaybackSnapshot {
+        int      current_pos{-1};
+        uint32_t elapsed_ms{0};
+        int      state{0};
+    };
+    bool capturePlaybackLocked(PlaybackSnapshot& snapshot);
+    bool restorePlaybackLocked(const PlaybackSnapshot& snapshot);
+    bool rollbackPlaybackLocked(const char* operation,
+                                const PlaybackSnapshot& snapshot);
+
+    // Saved queue for restoration on disconnect.
+    QueueSnapshot m_saved_queue;
     bool       m_queue_saved{false};
 };
 

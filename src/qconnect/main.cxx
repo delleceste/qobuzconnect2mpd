@@ -30,22 +30,18 @@
 //   qconnectsockpath       Unix socket for IPC with upmpdcli
 //                          (default: /var/run/upmpdcli-qconnect.sock)
 //
-//   # Qobuz credentials — reused from qobuz plugin if not set here:
-//   qconnectuser           Qobuz username  (falls back to qobuzuser)
-//   qconnectpass           Qobuz password  (falls back to qobuzpass)
+//   # Qobuz API configuration (authentication uses browser OAuth):
 //   qconnectappid          App ID          (falls back to qobuzappid)
 //   qconnectcfvalue        App secret      (falls back to qobuzcfvalue)
+//   qconnecttokenfile      OAuth token cache path (default: XDG/HOME data dir)
 //
 //   # MPD connection (reused from main upmpdcli config):
 //   mpdhost / mpdport / mpdpassword
 //
 // Usage:
-//   qconnect2mpd [-c configfile] [-d] [-L] [-o statusfile]
+//   qconnect2mpd [-c configfile] [-d]
 //     -c  path to upmpdcli config file
 //     -d  daemonise (fork to background)
-//     -L  interactive OAuth login: cache a token, then exit (bootstrap step;
-//         service mode refuses to start without a cached token)
-//     -o  now-playing status file path
 
 #include "qcmgr.hxx"
 #include "qclog.hxx"
@@ -65,7 +61,7 @@
 // Definitions for globals declared in qclog.hxx
 std::ofstream g_qc_log_file;
 std::mutex    g_qc_log_mutex;
-int           g_qc_log_level = QConnect::QC_LOG_ERROR; // default: errors only
+int           g_qc_log_level = QConnect::QC_LOG_ERROR;
 
 // ---- Minimal config-file reader --------------------------------------------
 // We cannot link against libupnpp's conftree directly here (it carries the
@@ -99,27 +95,19 @@ int main(int argc, char* argv[]) {
     std::string config_file = "/etc/upmpdcli.conf";
     std::string status_file_arg;
     bool daemonise = false;
-    bool login_mode = false;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-c") && i + 1 < argc) {
             config_file = argv[++i];
         } else if (!strcmp(argv[i], "-d")) {
             daemonise = true;
-        } else if (!strcmp(argv[i], "-L") || !strcmp(argv[i], "--login")) {
-            login_mode = true;
         } else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
             status_file_arg = argv[++i];
         } else {
-            std::cerr << "Usage: " << argv[0]
-                      << " [-c configfile] [-d] [-L] [-o statusfile]\n"
-                      << "  -L, --login  interactive OAuth login (cache a token), then exit\n";
+            std::cerr << "Usage: " << argv[0] << " [-c configfile] [-d] [-o statusfile]\n";
             return 1;
         }
     }
-
-    // Login is interactive: never daemonise in that mode.
-    if (login_mode) daemonise = false;
 
     if (daemonise) {
         if (daemon(0, 0) < 0) {
@@ -137,27 +125,26 @@ int main(int argc, char* argv[]) {
 
     using namespace QConnect;
 
-    // Log verbosity. Default is minimal (errors only). Config key
-    // qconnectloglevel (error|info|debug, or 0|1|2); env QC_LOGLEVEL overrides
-    // the config; legacy QC_DEBUG=1 forces full debug. Set before the log file
-    // is opened so the very first messages honour it.
-    {
-        auto parseLevel = [](std::string v, int dflt) -> int {
-            for (char& c : v)
-                c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
-            if (v == "0" || v == "error" || v == "err") return QC_LOG_ERROR;
-            if (v == "1" || v == "info"  || v == "inf") return QC_LOG_INFO;
-            if (v == "2" || v == "debug" || v == "deb") return QC_LOG_DEBUG;
-            return dflt;
-        };
-        int lvl = parseLevel(cfgGet(cfg, "qconnectloglevel", "error"),
-                             QC_LOG_ERROR);
-        if (const char* e = std::getenv("QC_LOGLEVEL"); e && *e)
-            lvl = parseLevel(e, lvl);
-        if (const char* e = std::getenv("QC_DEBUG"); e && *e &&
-            std::string(e) != "0")
-            lvl = QC_LOG_DEBUG;
-        g_qc_log_level = lvl;
+    auto parseLogLevel = [](std::string value, int fallback) -> int {
+        for (char& c : value) {
+            c = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (value == "0" || value == "error" || value == "err")
+            return QC_LOG_ERROR;
+        if (value == "1" || value == "info" || value == "inf")
+            return QC_LOG_INFO;
+        if (value == "2" || value == "debug" || value == "deb")
+            return QC_LOG_DEBUG;
+        return fallback;
+    };
+    g_qc_log_level = parseLogLevel(
+        cfgGet(cfg, "qconnectloglevel", "error"), QC_LOG_ERROR);
+    if (const char* level = std::getenv("QC_LOGLEVEL"); level && *level)
+        g_qc_log_level = parseLogLevel(level, g_qc_log_level);
+    if (const char* debug = std::getenv("QC_DEBUG");
+        debug && *debug && std::string(debug) != "0") {
+        g_qc_log_level = QC_LOG_DEBUG;
     }
 
     QcConfig qcfg;
@@ -208,15 +195,12 @@ int main(int argc, char* argv[]) {
     if (!qcfg.status_file.empty())
         LOGSTD("qconnect2mpd: status file: " << qcfg.status_file << "\n");
 
-    // Qobuz credentials — prefer qconnect-specific, fall back to qobuz plugin
-    qcfg.qobuz_user   = cfgGet(cfg, "qconnectuser",
-                                 cfgGet(cfg, "qobuzuser"));
-    qcfg.qobuz_pass   = cfgGet(cfg, "qconnectpass",
-                                 cfgGet(cfg, "qobuzpass"));
+    // Qobuz API identity. User authentication is OAuth-only.
     qcfg.app_id       = cfgGet(cfg, "qconnectappid",
                                  cfgGet(cfg, "qobuzappid"));
     qcfg.app_secret   = cfgGet(cfg, "qconnectcfvalue",
                                  cfgGet(cfg, "qobuzcfvalue"));
+    qcfg.token_file   = cfgGet(cfg, "qconnecttokenfile");
 
     // UUID: persist across restarts by reading/writing a state file
     std::string state_path = cfgGet(cfg, "cachedir",
@@ -230,14 +214,6 @@ int main(int argc, char* argv[]) {
 
     // ---- Start manager -----------------------------------------------------
     QcManager mgr(qcfg);
-
-    // -L: one-shot interactive OAuth login to cache a token, then exit. This is
-    // how authentication is bootstrapped, since service mode (below) refuses to
-    // start without a cached token.
-    if (login_mode) {
-        bool ok = mgr.runLogin([]{ return g_quit != 0; });
-        return ok ? 0 : 1;
-    }
 
     // Persist the (possibly new) UUID
     {
@@ -259,10 +235,15 @@ int main(int argc, char* argv[]) {
     }
 
     // ---- Main loop ---------------------------------------------------------
-    while (!g_quit) {
+    while (!g_quit && !mgr.hasFatalError()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
+    if (mgr.hasFatalError()) {
+        LOGERR("qconnect2mpd: WebSocket connection lost — exiting (systemd will restart)\n");
+        mgr.stop();
+        return 1;
+    }
     LOGINF("qconnect2mpd: shutting down\n");
     mgr.stop();
     return 0;

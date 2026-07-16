@@ -1,132 +1,107 @@
-# Bit-Perfect Parity with the upmpdcli / MPD Reference
+# Bit-Perfect Parity with upmpdcli and MusicPD
 
-**Question.** Does `qobuzconnect2mpd` reproduce audio at exactly the same
-quality (bit depth, sample rate, and the actual samples) as the classical
-`upmpdcli` + MPD pair? Or does it subtly degrade the stream?
+## Scope
 
-**Answer.** It is bit-perfect — the audio delivered to the DAC is byte-for-byte
-identical to what upmpdcli delivers. This document explains *why* by
-construction, and records the empirical procedure and result that *prove* it.
+`qobuzconnect2mpd` does not transcode, resample, normalize, or otherwise apply
+DSP before handing a FLAC stream to MusicPD. That makes a bit-perfect path
+possible, but it is not by itself proof that the samples reaching a DAC are
+identical to a reference setup.
 
----
+There are two separate questions:
 
-## Why it is bit-perfect by construction
+1. Does the Qobuz receiver deliver the same decoded PCM for a given track and
+   format?
+2. Does MusicPD and the configured audio output deliver that PCM without
+   mixing, resampling, format conversion, or DSP?
 
-The playback chain has three stages. Two of them are provably neutral, so the
-whole question reduces to one thing: is the source file identical?
+This receiver can be tested for the first property. The second property depends
+on the local MusicPD and operating-system audio configuration. Volume behavior
+is outside the scope of this document.
 
-### 1. Source file (Qobuz)
+## Current Qobuz stream paths
 
-Both clients resolve a track the same way — the classic
-`track/getFileUrl?track_id=…&format_id=…` endpoint — which returns a direct,
-signed CDN URL to a single FLAC file:
+The receiver does not assume that every track is a direct FLAC URL:
 
-```
-https://streaming-qobuz-std.akamaized.net/file?...&eid=<id>&fmt=<n>&...
-```
+1. It establishes a signed stream session with `/session/start`.
+2. It prefers `/file/url` for the requested format.
+3. When Qobuz returns `url_template`, `key`, and session information, it fetches
+   the init fragment and encrypted media fragments, decrypts them with AES-CTR,
+   and reconstructs a FLAC stream in a bounded growing cache.
+4. The loopback HTTP proxy serves that stream to MusicPD. After reconstruction
+   completes, it can report the measured length and satisfy byte ranges.
+5. A direct URL returned by `/file/url` is passed through. The classic
+   `track/getFileUrl` endpoint is a compatibility fallback.
 
-The `eid` is Qobuz's **content identifier** for a given (track, format). Two
-clients requesting the same track at the same format get the **same `eid`** and
-therefore the **same file**; the URLs differ only in the throwaway signing
-params (`hmac`, `etsp`, `cid`), which are query string, not file body.
+OAuth is the only user-authentication path. The OAuth token is sent to Qobuz
+API requests, not to the signed CDN fragment URLs.
 
-`qobuzconnect2mpd` hands MPD that URL directly. `upmpdcli` serves it through its
-`StreamProxy`, which (for a plain GET) `302`-redirects to the very same CDN URL.
-Either way MPD fetches the identical bytes. **Neither client transcodes.**
-
-### 2. Transport to MPD
-
-No re-encoding on either path — the original FLAC bytes reach MPD's FLAC
-decoder unchanged.
-
-### 3. Decode → DAC (the same MPD)
-
-Both clients drive the **same MPD instance** (`localhost:6600`). Its config
-(see `../open-media-drc/mpd/mpd.conf`) alters nothing:
-
-| MPD setting | Effect |
-|---|---|
-| `mixer_type "disabled"` / output `mixer_type "none"` | volume commands never rescale samples |
-| `volume_normalization "no"` | no ReplayGain |
-| `OKTO-DAC` = ALSA `hw:0,0`, no forced `format` | no resampling; native rate straight to the DAC |
-
-Because it is literally the same process with the same output config, the PCM
-handed to the DAC is identical for both clients given identical input. (Digital
-room correction via BruteFIR, if enabled, sits downstream of MPD and applies
-equally to both — it is irrelevant to the comparison.)
-
-So bit-perfectness reduces to **stage 1: is the source file identical?** — which
-we verify empirically below.
-
----
+The segmented reconstruction copies FLAC frames without re-encoding, but it
+builds a new FLAC container from the init metadata and media fragments.
+Consequently, a whole-file hash does not have to match a classic direct FLAC.
+The decoded PCM, sample rate, bit depth, channel count, duration, and total
+sample count are the meaningful parity checks.
 
 ## Verification procedure
 
-Both fingerprints are computed because Qobuz **zeroes the FLAC STREAMINFO MD5**
-(`metaflac --show-md5sum` returns all zeros), so that field cannot be used:
-
-- **container sha256** — hash of the whole downloaded file (proves byte
-  identity).
-- **decoded-PCM sha256** — hash of the raw decoded samples (the true audio
-  fingerprint; immune to any difference in tags / padding / seektable).
-
-Play the **same track** under each client in turn. While it plays, capture what
-MPD is actually streaming and fingerprint it:
+Use the same track and effective Qobuz format for both receivers. Signed URLs
+expire, so make the two captures close together. First capture the stream
+MusicPD is playing through `qobuzconnect2mpd`:
 
 ```sh
-# Grab the URL MPD is currently playing (works for both clients):
-URL=$(mpc -h 127.0.0.1 current -f '%file%')
-
-# qobuzconnect2mpd gives a direct CDN URL; upmpdcli gives a proxy URL that
-# 302-redirects to the CDN, so follow redirects with -L:
-curl -sL -o /tmp/sample.flac "$URL"
-
-# Sanity: same track => same format + same total_samples
-metaflac --show-sample-rate --show-bps --show-channels --show-total-samples /tmp/sample.flac
-
-# Container hash (byte identity):
-sha256sum /tmp/sample.flac
-
-# Decoded-PCM hash (the verdict — bit-identical audio):
-flac -s -d --force-raw-format --endian=little --sign=signed -c /tmp/sample.flac | sha256sum
+QCONNECT_URL=$(mpc -h 127.0.0.1 current -f '%file%')
+curl -fsSL "$QCONNECT_URL" -o /tmp/qconnect.flac
+flac -t /tmp/qconnect.flac
+metaflac --show-sample-rate --show-bps --show-channels \
+  --show-total-samples /tmp/qconnect.flac
+flac -s -d --force-raw-format --endian=little --sign=signed \
+  -c /tmp/qconnect.flac | sha256sum
 ```
 
-Compare the two clients' hashes. **Equal decoded-PCM sha256 ⇒ bit-identical
-audio.** (`total_samples` must match too, otherwise you captured different
-tracks/versions.)
+The qconnect log identifies the segmented path with a `planned ... segments`
+message. Its MusicPD URL contains `/qobuz-segmented/` followed by an opaque,
+per-process token. A direct URL instead exercises one of the compatibility
+paths and does not validate segmented reconstruction.
 
----
+Then play the same track and format through the reference upmpdcli setup and
+repeat the capture:
 
-## Recorded result (2026-06-18)
+```sh
+REFERENCE_URL=$(mpc -h 127.0.0.1 current -f '%file%')
+curl -fsSL "$REFERENCE_URL" -o /tmp/reference.flac
+flac -t /tmp/reference.flac
+metaflac --show-sample-rate --show-bps --show-channels \
+  --show-total-samples /tmp/reference.flac
+flac -s -d --force-raw-format --endian=little --sign=signed \
+  -c /tmp/reference.flac | sha256sum
+```
 
-Track: *"Someone To Believe In"* — Robin Gibb. 16-bit only on Qobuz, so both
-clients correctly resolved `fmt=6` (CD quality, 44.1 kHz / 16 bit / stereo).
+Parity requires all of the following:
 
-| | upmpdcli + MPD | qobuzconnect2mpd |
-|---|---|---|
-| URL `eid` / `fmt` | 47588621 / 6 | 47588621 / 6 |
-| sample_rate / bps / ch / samples | 44100 / 16 / 2 / 9286284 | 44100 / 16 / 2 / 9286284 |
-| container sha256 | `155fcb0ae40a43abd114fcb336b6aa76f6cd257ce8e3d8985f912a62a1199ebb` | `155fcb0ae40a43abd114fcb336b6aa76f6cd257ce8e3d8985f912a62a1199ebb` |
-| decoded-PCM sha256 | `c746d05734c5b9497d8dafd1d119ff488b4649769e5b7b45818a3c2165f157c8` | `c746d05734c5b9497d8dafd1d119ff488b4649769e5b7b45818a3c2165f157c8` |
+- both files pass `flac -t`;
+- sample rate, bits per sample, channels, and total samples match;
+- the decoded-PCM SHA-256 values match.
 
-**Result: byte-for-byte identical** — not merely the same audio, the same file
-bytes. Combined with the same-MPD output chain, this is end-to-end proof that
-`qobuzconnect2mpd` is bit-perfect and indistinguishable from the upmpdcli/MPD
-reference.
+A matching container SHA-256 is useful on two direct-URL captures, but it is
+not required when one side is reconstructed from segmented CMAF.
 
----
+## What the historical direct-URL test proves
 
-## Caveats / what to keep an eye on
+A 2026-06-18 test of the former direct-URL path found identical container and
+decoded-PCM hashes for the same 44.1 kHz, 16-bit stereo track through upmpdcli
+and `qobuzconnect2mpd`. That result validates the classic direct pass-through
+path at that point in time. It does not validate today's segmented
+reconstruction path; use the procedure above on a URL confirmed to be
+segmented.
 
-- **Format selection is the only place the two could ever diverge in quality.**
-  `getStreamUrl` requests `qconnectformatid` (default 27 = HiRes) and falls back
-  through `{27 → 7 → 6 → 5}`. For a track Qobuz only offers in 16-bit (like the
-  one above), `fmt=6` is correct and matches what upmpdcli gets. A genuine
-  problem would be qobuzconnect2mpd serving a *lower* format than upmpdcli does
-  for the *same* track.
-- **Live check:** the status file (`qconnectstatusfile`) shows MPD's real
-  decoded format per track (e.g. `24 bit / 192 kHz / stereo`), taken from
-  `mpd_status_get_audio_format` — a continuous readout of the quality actually
-  playing.
-- **Re-running:** capture the *same* track on both clients (verify identical
-  `total_samples`); the signed CDN URLs expire after ~10 minutes.
+## Format and MusicPD checks
+
+The receiver requests `qconnectformatid` and falls back through lower supported
+qualities in the order 27, 7, 6, then 5. Compare the effective format, not just
+the requested value. The status file reports MusicPD's decoded sample rate,
+bit depth, and channel count using `mpd_status_get_audio_format`.
+
+After receiver-level PCM parity is established, verify the MusicPD output
+separately. Mixer settings, ReplayGain, DSP filters, resamplers, audio-server
+conversion, and hardware format limits can all change the signal downstream of
+the receiver. Use the operating system's live audio-device format reporting to
+confirm that the output rate and sample format match MusicPD's decoded format.

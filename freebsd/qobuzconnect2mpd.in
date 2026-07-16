@@ -4,22 +4,18 @@
 # REQUIRE: NETWORKING FILESYSTEMS musicpd
 # KEYWORD: shutdown
 #
-# Template — generated to qobuzconnect2mpd by meson (configure_file) using the
-# install prefix/bindir/sysconfdir.  Do not edit the generated copy; edit this
-# .in instead.
+# Template generated as qobuzconnect2mpd.rc and installed as qobuzconnect2mpd.
+# Do not edit the generated copy; edit this .in file instead.
 #
 # FreeBSD rc.d service script for qobuzconnect2mpd
 # (Qobuz Connect receiver daemon that bridges the Qobuz app to MPD).
 #
 # Enable with:  sysrc qobuzconnect2mpd_enable=YES
-# The daemon runs as an unprivileged user; override qobuzconnect2mpd_user,
-# qobuzconnect2mpd_config, etc. in /etc/rc.conf.d/qobuzconnect2mpd if needed.
+# The daemon runs as an unprivileged user. Override qobuzconnect2mpd_user,
+# qobuzconnect2mpd_homedir, or qobuzconnect2mpd_config in rc.conf as needed.
 
 PREFIX="@PREFIX@"
 BINDIR="@BINDIR@"
-
-qobuzconnect2mpd_user="giacomo"
-qobuzconnect2mpd_homedir="/home/giacomo"
 
 . /etc/rc.subr
 
@@ -29,12 +25,12 @@ rcvar="qobuzconnect2mpd_enable"
 load_rc_config "$name"
 
 : ${qobuzconnect2mpd_enable:="NO"}
-: ${qobuzconnect2mpd_user:="giacomo"}
-: ${qobuzconnect2mpd_homedir:="/home/giacomo"}
+: ${qobuzconnect2mpd_user:="qobuzconnect2mpd"}
+: ${qobuzconnect2mpd_homedir:="/var/db/qobuzconnect2mpd"}
 : ${qobuzconnect2mpd_flags:=""}
-# Config is read directly from the repo checkout (run-from-repo: a single file
-# to edit, nothing copied on update); pidfile in the user's cache dir
-# (/var/run is not writable by an unprivileged user).
+# Config is read directly from the repository checkout. The pidfile lives in
+# the service account's state directory because /var/run is not writable after
+# rc.subr drops privileges.
 : ${qobuzconnect2mpd_config:="@QOBUZCONNECT2MPD_CONFIG@"}
 : ${qobuzconnect2mpd_pidfile:="${qobuzconnect2mpd_homedir}/.cache/qobuzconnect2mpd/qobuzconnect2mpd.pid"}
 
@@ -45,24 +41,22 @@ export HOME="${qobuzconnect2mpd_homedir}"
 # Services start with a minimal PATH that omits /usr/local/bin on FreeBSD.
 export PATH="${BINDIR}:/usr/bin:/bin"
 
-# daemon(8) backgrounds qobuzconnect2mpd (run in the foreground, without -d)
-# and writes its pidfile. No -r: the daemon process detaches the child and
-# exits, so there is no supervisor and `service stop` (or killall) terminates
-# the child directly and it stays down. The daemon is NOT restarted on crash.
+# daemon(8) backgrounds qobuzconnect2mpd (run in the foreground, without -d),
+# writes its pidfile, and sends stdout/stderr to syslog. No -r: the daemon does
+# not restart the child after service stop or a crash.
 command="/usr/sbin/daemon"
 procname="${BINDIR}/qobuzconnect2mpd"
 pidfile="${qobuzconnect2mpd_pidfile}"
 
 required_files="${qobuzconnect2mpd_config}"
 
-command_args="-f -p ${qobuzconnect2mpd_pidfile} -t ${name} -- ${BINDIR}/qobuzconnect2mpd -c ${qobuzconnect2mpd_config} ${qobuzconnect2mpd_flags}"
+command_args="-f -S -T ${name} -p ${qobuzconnect2mpd_pidfile} -t ${name} -- ${BINDIR}/qobuzconnect2mpd -c ${qobuzconnect2mpd_config} ${qobuzconnect2mpd_flags}"
 
 start_precmd="qobuzconnect2mpd_precmd"
 
 qobuzconnect2mpd_precmd()
 {
-	# Ensure the pidfile/cache dir exists and is owned by the run user
-	# (created as root, before rc.subr drops privileges via su).
+	# Created as root before rc.subr drops privileges.
 	/usr/bin/install -d -o "${qobuzconnect2mpd_user}" -m 0755 "${qobuzconnect2mpd_pidfile%/*}"
 }
 

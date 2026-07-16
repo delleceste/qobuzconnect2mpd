@@ -21,7 +21,10 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <optional>
 
 #include "proto.hxx"
 #include "httphandler.hxx"
@@ -31,38 +34,40 @@ typedef void CURL;
 
 namespace QConnect {
 
-// Callbacks fired from the WSession event loop (called from the ws thread).
+// Callbacks are serialized on a worker thread so renderer operations cannot
+// block WebSocket receive, heartbeat, or ping/pong handling.
 struct WSessionCallbacks {
     // Play/pause/seek: playing_state is PLAYING/PAUSED/STOPPED,
     // position_ms is the target seek position, has_position distinguishes
     // "seek to 0" from "no seek". current_item identifies the track.
-    std::function<void(PlayingState, uint32_t /*position_ms*/,
+    std::function<void(uint64_t /*command_id*/, PlayingState,
+                        uint32_t /*position_ms*/,
                         bool /*has_position*/,
                         const QueueTrackRef& /*current_item*/)> on_set_state;
 
     // Volume change: absolute volume (0-100), or delta if delta != 0.
     std::function<void(uint32_t /*volume*/, int32_t /*delta*/)> on_set_volume;
 
+    // Renderer activation/deactivation. Runs on the serialized callback worker.
+    std::function<void(bool /*active*/)> on_set_active;
+
     // Qobuz app connected/disconnected
+    // on_disconnected is emitted for network/server failure only. Deliberate
+    // disconnect during session replacement must not clear the new queue.
     std::function<void()> on_connected;
-    std::function<void()> on_disconnected;
-    // Full queue received (e.g. user pressed Play Album).
-    // tracks carry both queue_item_id and track_id for each entry.
-    // start_index is the position within the queue to start playing.
-    std::function<void(const std::vector<QueueTrack>& /*tracks*/,
-                        uint32_t                       /*start_index*/)>
-        on_queue_load;
-
-    // Incremental queue updates (carry full QueueTrack for mapping)
-    std::function<void(const std::vector<QueueTrack>& /*tracks*/,
-                        uint32_t /*insert_after_item_id*/)>
-        on_tracks_inserted;
-
-    std::function<void(const std::vector<QueueTrack>& /*tracks*/)>
-        on_tracks_added;
-
-    std::function<void(const std::vector<uint64_t>& /*queue_item_ids*/)>
-        on_tracks_removed;
+    std::function<void(bool /*error*/)> on_disconnected;
+    // Pass decoded messages intact so queue version and scalar presence are
+    // retained (queue item id 0 and insert_after=-1 are valid values).
+    std::function<void(const MsgSessionState&)>         on_session_state;
+    std::function<void(const MsgQueueState&)>           on_queue_state;
+    std::function<void(const MsgQueueLoadTracks&)>      on_queue_load;
+    std::function<void(const MsgQueueTracksInserted&)>  on_tracks_inserted;
+    std::function<void(const MsgQueueTracksAdded&)>     on_tracks_added;
+    std::function<void(const MsgQueueTracksRemoved&)>   on_tracks_removed;
+    std::function<void(const MsgQueueTracksReordered&)> on_tracks_reordered;
+    std::function<void(const MsgQueueCleared&)>         on_queue_cleared;
+    std::function<void(const MsgShuffleMode&)>          on_shuffle_mode;
+    std::function<void(const MsgLoopMode&)>             on_loop_mode;
 };
 
 // Manages one Qobuz Connect session.
@@ -106,11 +111,30 @@ public:
     // Declare renderer_id as the active renderer (sent after AddRenderer).
     void setActiveRenderer(uint64_t renderer_id);
 
+    // Publish a queue version only after the corresponding MusicPD and local
+    // queue mutation has committed successfully.
+    void commitQueueVersion(const QueueVersion& version);
+
+    // Release state reporting after the matching SetState command has either
+    // been applied or definitively abandoned. Later command IDs supersede
+    // earlier deferred commands.
+    void completeSetState(uint64_t command_id);
+
 private:
     uint64_t nowAlignedMs() const;
     uint64_t alignTimestampMs(uint64_t ts_ms) const;
     void eventLoop();
     bool sendRaw(const Bytes& data);
+    bool sendDirectFrame(const Bytes& data, unsigned int flags);
+    bool flushOutbound();
+    bool hasOutbound();
+    bool enqueueFrame(Bytes data, unsigned int flags);
+    void wakeEventLoop();
+    void drainWakePipe();
+    void callbackLoop();
+    void postCallback(std::function<void()> callback);
+    void stopCallbackWorker();
+    void maybeRestoreState();
     bool sendHeartbeat();
     void dispatchMessage(const Message& msg);
 
@@ -122,20 +146,48 @@ private:
 
     CURL*       m_curl{nullptr};
     std::thread m_thread;
+    std::thread m_callback_thread;
+    // connect() publishes this object before starting its threads so early
+    // callbacks can find it.  A concurrent stop must wait until startup has
+    // either completed or rolled back before touching CURL or thread handles.
+    std::mutex  m_lifecycle_mutex;
 
     std::atomic<bool>  m_connected{false};
     std::atomic<bool>  m_stop{false};
-    std::mutex         m_send_mutex;
+    std::atomic<bool>  m_event_started{false};
+    // Set true only when the event loop exits due to a network error or
+    // server-initiated CLOSE (not when disconnect() is called externally).
+    std::atomic<bool>  m_error_exit{false};
+
+    struct OutboundFrame {
+        Bytes        data;
+        size_t       offset{0};
+        unsigned int flags{0};
+    };
+    std::mutex                   m_outbound_mutex;
+    std::deque<OutboundFrame>    m_outbound;
+    std::optional<OutboundFrame> m_current_outbound;
+    int                          m_wake_pipe[2]{-1, -1};
+    std::mutex                   m_wake_mutex;
+
+    std::mutex                        m_callback_mutex;
+    std::condition_variable           m_callback_cv;
+    std::deque<std::function<void()>> m_callback_queue;
+    bool                              m_callback_stop{false};
 
     // Session context received from server
     Bytes    m_session_uuid;
     uint64_t m_session_id{0};
     uint64_t m_renderer_id{0};
     bool     m_is_active{false};
+    std::optional<MsgQueueState> m_last_queue_snapshot;
+    std::optional<RendererState> m_pending_restore_state;
 
     // Last reported renderer state (used for heartbeats and immediate responses)
     QueueRendererState   m_last_state{};
     std::mutex           m_state_mutex;
+    uint64_t             m_set_state_serial{0};
+    uint64_t             m_set_state_completed{0};
     // Estimated cloud-time offset (cloud_epoch_ms - local_epoch_ms).
     std::atomic<int64_t> m_cloud_time_offset_ms{0};
 

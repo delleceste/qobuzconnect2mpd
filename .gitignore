@@ -1,5 +1,6 @@
 # Meson build directory
 /builddir/
+/.qtc_clangd/
 
 # Real config with credentials — run-from-repo, copied from the tracked
 # conf/qobuzconnect2mpd.conf.example template. Never commit secrets.

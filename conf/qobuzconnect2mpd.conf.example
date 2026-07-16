@@ -1,22 +1,18 @@
+
+
 # qobuzconnect2mpd configuration
 
 ###########################################################################
-# qconnect2mpd — Qobuz Connect receiver daemon
+# qobuzconnect2mpd — Qobuz Connect receiver daemon
 #
 # Run alongside upmpdcli to let the Qobuz mobile/desktop app cast audio
 # directly to this device (similar to Spotify Connect).
-# Start the daemon with:  qconnect2mpd [-c /etc/upmpdcli.conf]
-#
-# Run-from-repo: copy this template to qobuzconnect2mpd.conf in the same
-# directory and fill in your credentials. The real qobuzconnect2mpd.conf is
-# gitignored so secrets never land in version control:
-#
-#   cp conf/qobuzconnect2mpd.conf.example conf/qobuzconnect2mpd.conf
+# Start the daemon with:  qobuzconnect2mpd [-c /etc/upmpdcli.conf]
 ###########################################################################
 
 # Device name shown in the Qobuz app.
 # Defaults to the value of 'friendlyname'.
-qconnectfriendlyname = arki - MPD
+qconnectfriendlyname = Qobuz MPD
 
 # Device type integer.  1=Speaker (default), 2=TV, 3=Phone, 4=Receiver
 #qconnectdevicetype = 1
@@ -43,21 +39,17 @@ qconnectstatusfile = /tmp/qconnect2mpd-status.txt
 # /tmp is writable by any user; change to a persistent location if preferred.
 qconnectlogfile = /tmp/qconnect2mpd.log
 
-# Log verbosity. Default is minimal (errors only).
-#   error  only errors                       (default)
-#   info   + connection/queue/seek events and now-playing
-#   debug  + full protocol/MPD trace (very verbose)
-# Overridable at runtime with the QC_LOGLEVEL env var; QC_DEBUG=1 forces debug.
-#qconnectloglevel = error
+# Log verbosity: error (default), info, or debug. QC_LOGLEVEL overrides this;
+# QC_DEBUG=1 enables debug logging for compatibility with older setups.
+#qconnectloglevel = info
 
 # Unix socket path for IPC coordination with upmpdcli.
 # When upmpdcli starts playing via UPnP it sends STOP to this socket;
 # qconnect2mpd notifies upmpdcli with PLAYING/STOPPED events.
 #qconnectsockpath = /var/run/upmpdcli-qconnect.sock
 
-# Qobuz credentials for qconnect2mpd.  If not set, the values of
-# qobuzuser/qobuzpass/qobuzappid/qobuzcfvalue are used instead.
-qconnectuser = your-qobuz-email@example.com
-qconnectpass = your-qobuz-password
+# Qobuz authentication uses the browser OAuth flow and a locally cached token.
+# Set an explicit writable path when the daemon runs under a service account.
+#qconnecttokenfile = /var/db/qobuzconnect2mpd/user_token
 #qconnectappid =
 #qconnectcfvalue =

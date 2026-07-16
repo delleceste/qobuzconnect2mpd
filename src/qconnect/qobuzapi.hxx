@@ -20,22 +20,23 @@
 #include <cstdint>
 #include <vector>
 #include <map>
+#include <mutex>
 #include <json/json.h>
 
 namespace QConnect {
 
+class SegmentedTrackRegistry;
+
 // Minimal Qobuz REST API client for qconnect2mpd.
 //
-// Authentication uses the JWT obtained from the Qobuz app during the
-// connect-to-qconnect handshake (ConnectCredentials::api_jwt).  This
-// token is already scoped to the current user's session so no separate
-// login step is required.
-//
-// Alternatively, if the JWT is unavailable, falls back to the classic
-// user/password token stored in upmpdcli's config (qobuzuser/qobuzpass).
+// User authentication uses a Qobuz OAuth user token. A QConnect controller may
+// also provide a session-scoped API JWT during connect-to-qconnect, but it is
+// retained only as protocol metadata and is not used for REST authentication.
 
 struct TrackStreamInfo {
     std::string stream_url;  // signed HTTPS URL, valid for ~10 min
+    std::string local_path;  // legacy materialized streams only
+    std::string segment_token; // registry key; empty for direct URLs
     std::string mime_type;   // e.g. "audio/flac"
     int         format_id{6};
     uint32_t    duration_ms{0};
@@ -61,17 +62,9 @@ public:
               const std::string& app_id,
               const std::string& app_secret);
 
-    // Use a JWT obtained from the Qobuz app for authentication.
-    // When set, this takes priority over user/password credentials.
-    void setJwt(const std::string& jwt) { m_jwt = jwt; }
-
-    // Use classic user+password authentication.
-    // Calls /user/login and stores the user_auth_token.
-    bool login(const std::string& user, const std::string& pass);
-
     // OAuth2 flow: exchange the code_autorisation parameter from the Qobuz
-    // OAuth redirect URL for a user_auth_token. This is the only login method
-    // that works reliably as of April 2026 (Qobuz deprecated /user/login).
+    // OAuth redirect URL for a user_auth_token. This is the only supported
+    // user-authentication method.
     //
     // The OAuth URL that the user should open in a browser is built with
     // buildOAuthUrl(). After login Qobuz redirects to the redirect_url with
@@ -88,12 +81,18 @@ public:
     // Load a previously saved user_auth_token. Returns true on success.
     bool loadToken(const std::string& path);
 
-    // Return the user_auth_token obtained from login() or oauthExchangeCode()
-    // (empty if not logged in).
-    const std::string& userToken() const { return m_user_token; }
+    // Return the user_auth_token obtained from oauthExchangeCode().
+    // Empty if OAuth has not completed and no cached token was loaded.
+    std::string userToken() const {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        return m_user_token;
+    }
 
     // Return the app_id (set via constructor or fetched from bundle.js).
-    const std::string& appId() const { return m_app_id; }
+    std::string appId() const {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        return m_app_id;
+    }
 
     // Fetch app_id and secret candidates dynamically from the Qobuz web player
     // bundle.js.  Called automatically by QcManager when qobuzappid is not
@@ -112,37 +111,60 @@ public:
     // Fetch a QConnect WebSocket JWT directly from the Qobuz cloud.
     // Calls POST /qws/createToken using the stored user_auth_token.
     // On success populates out_endpoint (e.g. "wss://play.qobuz.com/ws")
-    // and out_jwt, and returns true.  Requires a prior successful login().
+    // and out_jwt, and returns true. Requires an OAuth user token.
     bool fetchQwsToken(std::string& out_endpoint, std::string& out_jwt);
 
+    // Configure local HTTP proxy base URL used to serve segmented tracks
+    // (e.g. "http://127.0.0.1:9093/qobuz-segmented").
+    void setLocalProxyBaseUrl(const std::string& v) {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        m_local_proxy_base_url = v;
+    }
+
+    // Registry used by planSegmentedTrack to publish track plans for the
+    // HTTP proxy to stream from.  Must be set before calling getStreamUrl().
+    void setSegmentedRegistry(SegmentedTrackRegistry* r) {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        m_seg_registry = r;
+    }
+
 private:
+    bool ensureStreamSession();
+    bool startStreamSession();
+    bool tryFileUrl(uint32_t track_id, int format_id, TrackStreamInfo& out,
+                    long* http_code = nullptr);
     bool tryGetStreamUrl(uint32_t track_id, int format_id, TrackStreamInfo& out,
                          long* http_code = nullptr);
-    // quiet: downgrade non-200 logging to debug (used while probing candidate
-    // secrets, where a 400 is expected and not a real error).
+    // Build a SegmentedTrackPlan, register it, and populate `out` with the
+    // proxy URL that MPD will request to stream the track on demand.
+    bool planSegmentedTrack(const Json::Value& root, uint32_t track_id,
+                             int format_id, TrackStreamInfo& out);
     std::string httpGet(const std::string& path,
                          long* http_code_out = nullptr,
-                         bool  quiet = false);
-    // Sign a request with the classic getFileUrl secret. With secret_override
-    // empty, signs with m_app_secret; pass a secret to sign with a different
-    // one (e.g. the classic secret for the legacy /track/getFileUrl endpoint).
+                         bool quiet = false);
+    std::string httpPostForm(const std::string& path,
+                             const std::map<std::string, std::string>& form,
+                             long* http_code_out = nullptr);
     std::string buildRequestSignature(const std::string& method_prefix,
                                       const std::map<std::string, std::string>& args,
                                       uint64_t ts,
-                                      const std::string& secret_override = "") const;
+                                      const std::string& secret) const;
 
+    mutable std::recursive_mutex m_mutex;
     std::string m_base_url;
     std::string m_app_id;
     std::string m_app_secret;              // active secret (MD5 suffix for signing)
     std::vector<std::string> m_secret_candidates; // decoded from bundle.js
-    // Persistent copy of all bundle.js secrets (m_secret_candidates is cleared
-    // once the session secret is confirmed). Used to find the classic secret.
+    // Session selection consumes m_secret_candidates, but the classic
+    // /track/getFileUrl endpoint may require a different bundle secret.
     std::vector<std::string> m_bundle_secrets;
-    // Secret that validates the classic API (/track/getFileUrl). Different from
-    // m_app_secret, which signs the newer session/file endpoints.
-    std::string m_classic_secret;
-    std::string m_user_token;              // from /user/login
-    std::string m_jwt;                     // from Qobuz app JWT (preferred)
+    std::string m_classic_secret;          // cached classic API secret
+    std::string m_user_token;              // from OAuth exchange/cache
+    std::string m_stream_session_id;       // from /session/start
+    uint64_t    m_stream_session_expires_at{0}; // unix seconds
+    std::string m_stream_session_infos;    // from /session/start
+    std::string m_local_proxy_base_url;
+    SegmentedTrackRegistry* m_seg_registry{nullptr}; // not owned
 };
 
 } // namespace QConnect
