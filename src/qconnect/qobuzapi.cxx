@@ -31,16 +31,20 @@
 #include <json/json.h>
 
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <fcntl.h>
 #include <map>
 #include <algorithm>
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
+#include <limits>
 #include <openssl/evp.h>
 #include <regex>
 #include <sstream>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace QConnect {
 
@@ -63,8 +67,35 @@ static std::string hexString(const uint8_t* data, size_t len) {
 // libcurl write callback
 static size_t curlWriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     auto* s = static_cast<std::string*>(userdata);
-    s->append(ptr, size * nmemb);
-    return size * nmemb;
+    if (size != 0 && nmemb > std::numeric_limits<size_t>::max() / size)
+        return 0;
+    const size_t bytes = size * nmemb;
+    constexpr size_t kMaxResponseBytes = 64 * 1024 * 1024;
+    if (s->size() > kMaxResponseBytes ||
+        bytes > kMaxResponseBytes - s->size())
+        return 0;
+    try {
+        s->append(ptr, bytes);
+    } catch (...) {
+        return 0;
+    }
+    return bytes;
+}
+
+static std::string urlEncode(const std::string& value) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return {};
+    char* escaped = curl_easy_escape(curl, value.c_str(),
+                                     static_cast<int>(value.size()));
+    std::string result = escaped ? escaped : "";
+    if (escaped) curl_free(escaped);
+    curl_easy_cleanup(curl);
+    return result;
+}
+
+static std::string endpointOnly(const std::string& path) {
+    const auto query = path.find('?');
+    return path.substr(0, query);
 }
 
 // (Segment fetch/decrypt and per-track plan building live in segstream.cxx.
@@ -81,55 +112,6 @@ QobuzApi::QobuzApi(const std::string& api_base_url,
     // Ensure no trailing slash
     while (!m_base_url.empty() && m_base_url.back() == '/')
         m_base_url.pop_back();
-}
-
-static std::string md5Hex(const std::string& s) {
-    uint8_t digest[EVP_MAX_MD_SIZE];
-    unsigned int digest_len = 0;
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_md5(), nullptr);
-    EVP_DigestUpdate(ctx, s.data(), s.size());
-    EVP_DigestFinal_ex(ctx, digest, &digest_len);
-    EVP_MD_CTX_free(ctx);
-    return hexString(digest, digest_len);
-}
-
-bool QobuzApi::login(const std::string& user, const std::string& pass) {
-    if (user.empty() || pass.empty()) return false;
-
-    // Try plain password first, then MD5-hashed password_auth as fallback.
-    // Note: as of early April 2026 Qobuz's /user/login endpoint is returning
-    // 401 for all third-party clients due to a cloud infrastructure migration.
-    // This is a Qobuz-side issue (see streamrip#954); we try both forms so we
-    // automatically recover when Qobuz resolves it.
-    struct LoginVariant { const char* pass_param; std::string pass_value; };
-    const LoginVariant kTries[] = {
-        {"password",      pass},
-        {"password_auth", md5Hex(pass)},
-    };
-
-    for (const auto& v : kTries) {
-        std::string path = "/user/login?username=" + user
-                           + "&" + v.pass_param + "=" + v.pass_value
-                           + "&app_id=" + m_app_id;
-        long http_code = 0;
-        std::string resp = httpGet(path, &http_code);
-        if (resp.empty()) {
-            LOGDEB("QobuzApi::login: " << v.pass_param << " attempt HTTP " << http_code << "\n");
-            continue;
-        }
-        Json::Value root;
-        Json::CharReaderBuilder rdr;
-        std::string errs;
-        std::istringstream ss(resp);
-        if (!Json::parseFromStream(rdr, ss, &root, &errs)) continue;
-        m_user_token = root.get("user_auth_token", "").asString();
-        if (m_user_token.empty()) continue;
-        LOGINF("QobuzApi::login: ok via " << v.pass_param << "\n");
-        return true;
-    }
-    LOGERR("QobuzApi::login: failed (Qobuz cloud migration in progress — mDNS path still works)\n");
-    return false;
 }
 
 std::string QobuzApi::buildRequestSignature(const std::string& method_prefix,
@@ -154,6 +136,7 @@ std::string QobuzApi::buildRequestSignature(const std::string& method_prefix,
 
 bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
                               TrackStreamInfo& out) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     bool refreshed_credentials = false;
 retry_after_refresh:
     bool have_stream_session = ensureStreamSession();
@@ -261,7 +244,8 @@ bool QobuzApi::startStreamSession() {
     m_stream_session_id = sid;
     m_stream_session_expires_at = root.get("expires_at", 0).asUInt64();
     m_stream_session_infos = root.get("infos", "").asString();
-    LOGDEB("QobuzApi: session/start ok sid=" << sid << " exp=" << m_stream_session_expires_at << "\n");
+    LOGDEB("QobuzApi: session/start ok, expires="
+           << m_stream_session_expires_at << "\n");
     return true;
 }
 
@@ -283,15 +267,17 @@ bool QobuzApi::tryFileUrl(uint32_t track_id, int format_id,
                      + "&request_sig=" + sig;
 
     std::string url = m_base_url + path;
-    LOGDEB("QobuzApi: GET " << url << " [new-api]\n");
+    LOGDEB("QobuzApi: GET /file/url [new-api]\n");
     CURL* curl = curl_easy_init();
     if (!curl) return false;
     std::string result;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
     struct curl_slist* hdrs = nullptr;
     if (!m_user_token.empty()) {
@@ -361,10 +347,9 @@ bool QobuzApi::planSegmentedTrack(const Json::Value& root, uint32_t track_id,
         return false;
     }
 
-    std::vector<std::string> hdrs;
-    if (!m_user_token.empty()) hdrs.push_back("X-User-Auth-Token: " + m_user_token);
-    hdrs.push_back("X-App-Id: " + m_app_id);
-    hdrs.push_back("X-Session-Id: " + m_stream_session_id);
+    // The template is already signed. Qobuz's own client sends no API/session
+    // headers to the CDN, which also prevents bearer-token leakage on redirects.
+    const std::vector<std::string> segment_headers;
 
     double sr_raw = root.get("sampling_rate", 44.1).asDouble();
     int sampling_rate = (sr_raw < 1000) ? static_cast<int>(sr_raw * 1000)
@@ -373,30 +358,34 @@ bool QobuzApi::planSegmentedTrack(const Json::Value& root, uint32_t track_id,
     uint32_t duration_ms =
         static_cast<uint32_t>(root.get("duration", 0).asDouble() * 1000.0);
     int n_seg_fallback = root.get("n_segments", 0).asInt();
+    int effective_format_id = root.get("format_id", format_id).asInt();
 
     auto plan = std::make_shared<SegmentedTrackPlan>();
     std::string err;
-    if (!buildSegmentedTrackPlan(urltpl, hdrs, keystr, m_stream_session_infos,
-                                  track_id, format_id, n_seg_fallback,
+    if (!buildSegmentedTrackPlan(urltpl, segment_headers, keystr,
+                                  m_stream_session_infos,
+                                  track_id, effective_format_id, n_seg_fallback,
                                   sampling_rate, bit_depth, duration_ms,
                                   *plan, &err)) {
         LOGERR("QobuzApi: plan track " << track_id << " failed: " << err << "\n");
         return false;
     }
 
-    std::string token = SegmentedTrackRegistry::tokenForTrack(track_id, format_id);
+    std::string token = SegmentedTrackRegistry::tokenForTrack(
+        track_id, effective_format_id);
     m_seg_registry->registerPlan(token, plan);
 
     out.stream_url   = m_local_proxy_base_url + "/" + token;
     out.local_path.clear(); // nothing on disk
+    out.segment_token = token;
     out.mime_type    = "audio/flac";
-    out.format_id    = root.get("format_id", format_id).asInt();
+    out.format_id    = effective_format_id;
     out.duration_ms  = duration_ms;
     out.sampling_rate = sampling_rate;
     out.bit_depth    = bit_depth;
     LOGSTD("QobuzApi: track " << track_id
            << ": planned " << plan->n_audio_segments() << " segments ("
-           << plan->total_bytes << " bytes) -> " << token << "\n");
+           << plan->total_bytes << " bytes)\n");
     return true;
 }
 
@@ -461,6 +450,7 @@ bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
 }
 
 bool QobuzApi::getTrackMeta(uint32_t track_id, TrackMeta& out) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     std::string path = "/track/get?track_id=" + std::to_string(track_id)
                      + "&app_id=" + m_app_id;
     std::string resp = httpGet(path);
@@ -499,8 +489,10 @@ static std::string fetchRawUrl(const std::string& url) {
     curl_easy_setopt(curl, CURLOPT_URL,            url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  curlWriteCb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &result);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,        30L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,       1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     // Accept gzip so bundle.js arrives compressed and is decompressed by curl
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
@@ -560,9 +552,11 @@ static std::string base64urlDecode(const std::string& in) {
 // ---- OAuth login ------------------------------------------------------------
 
 bool QobuzApi::oauthExchangeCode(const std::string& code) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     // Private key is hardcoded in the Qobuz player (extracted from qobuz-player v0.9.0).
     static const std::string kPrivateKey = "6lz8C03UDIC7";
-    std::string path = "/oauth/callback?code=" + code + "&private_key=" + kPrivateKey;
+    std::string path = "/oauth/callback?code=" + urlEncode(code)
+                       + "&private_key=" + urlEncode(kPrivateKey);
     std::string resp = httpGet(path);
     if (resp.empty()) {
         LOGERR("QobuzApi::oauthExchangeCode: empty response\n");
@@ -580,8 +574,7 @@ bool QobuzApi::oauthExchangeCode(const std::string& code) {
     std::string tok = root.get("token", "").asString();
     if (tok.empty()) tok = root.get("user_auth_token", "").asString();
     if (tok.empty()) {
-        LOGERR("QobuzApi::oauthExchangeCode: no token in response: "
-               << resp.substr(0, 300) << "\n");
+        LOGERR("QobuzApi::oauthExchangeCode: response contained no token\n");
         return false;
     }
     m_user_token = tok;
@@ -590,34 +583,123 @@ bool QobuzApi::oauthExchangeCode(const std::string& code) {
 }
 
 std::string QobuzApi::buildOAuthUrl(const std::string& redirect_url) const {
-    return "https://www.qobuz.com/signin/oauth?ext_app_id=" + m_app_id
-           + "&redirect_url=" + redirect_url;
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return "https://www.qobuz.com/signin/oauth?ext_app_id=" + urlEncode(m_app_id)
+           + "&redirect_url=" + urlEncode(redirect_url);
 }
 
 bool QobuzApi::saveToken(const std::string& path) const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (m_user_token.empty() || path.empty()) return false;
     namespace fs = std::filesystem;
     fs::path p(path);
+    if (p.filename().empty()) return false;
+    fs::path parent = p.has_parent_path() ? p.parent_path() : fs::path(".");
     if (p.has_parent_path()) {
         std::error_code ec;
-        fs::create_directories(p.parent_path(), ec);
+        fs::create_directories(parent, ec);
+        if (ec) {
+            LOGERR("QobuzApi::saveToken: cannot create token directory\n");
+            return false;
+        }
     }
-    std::ofstream f(path);
-    if (!f) {
-        LOGERR("QobuzApi::saveToken: cannot write " << path << "\n");
+
+    int dir_fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    struct stat dir_stat{};
+    if (dir_fd < 0 || ::fstat(dir_fd, &dir_stat) != 0 ||
+        !S_ISDIR(dir_stat.st_mode) || dir_stat.st_uid != ::geteuid()) {
+        LOGERR("QobuzApi::saveToken: token directory is not securely owned\n");
+        if (dir_fd >= 0) ::close(dir_fd);
         return false;
     }
-    f << m_user_token;
+
+    std::string pattern = (parent / (p.filename().string() + ".tmp.XXXXXX")).string();
+    std::vector<char> tmp_path(pattern.begin(), pattern.end());
+    tmp_path.push_back('\0');
+    int fd = ::mkstemp(tmp_path.data());
+    if (fd < 0) {
+        LOGERR("QobuzApi::saveToken: cannot write " << path << "\n");
+        ::close(dir_fd);
+        return false;
+    }
+    auto discard_temp = [&]() {
+        ::close(fd);
+        ::unlink(tmp_path.data());
+        ::close(dir_fd);
+    };
+    if (::fchmod(fd, 0600) != 0) {
+        LOGERR("QobuzApi::saveToken: cannot restrict permissions on "
+               << path << "\n");
+        discard_temp();
+        return false;
+    }
+    size_t written = 0;
+    while (written < m_user_token.size()) {
+        ssize_t n = ::write(fd, m_user_token.data() + written,
+                            m_user_token.size() - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            LOGERR("QobuzApi::saveToken: write failed for " << path << "\n");
+            discard_temp();
+            return false;
+        }
+        written += static_cast<size_t>(n);
+    }
+    const bool sync_ok = ::fsync(fd) == 0;
+    const int close_result = ::close(fd);
+    if (!sync_ok || close_result != 0) {
+        fd = -1;
+        LOGERR("QobuzApi::saveToken: could not flush " << path << "\n");
+        ::unlink(tmp_path.data());
+        ::close(dir_fd);
+        return false;
+    }
+    fd = -1;
+    if (::rename(tmp_path.data(), path.c_str()) != 0) {
+        LOGERR("QobuzApi::saveToken: cannot install " << path << "\n");
+        ::unlink(tmp_path.data());
+        ::close(dir_fd);
+        return false;
+    }
+    (void)::fsync(dir_fd);
+    ::close(dir_fd);
     LOGINF("QobuzApi: token saved to " << path << "\n");
     return true;
 }
 
 bool QobuzApi::loadToken(const std::string& path) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (path.empty()) return false;
-    std::ifstream f(path);
-    if (!f) return false;
+    int fd = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        if (errno != ENOENT)
+            LOGERR("QobuzApi::loadToken: cannot open " << path << "\n");
+        return false;
+    }
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != ::geteuid() || ::fchmod(fd, 0600) != 0) {
+        LOGERR("QobuzApi::loadToken: token is not a secure regular file\n");
+        ::close(fd);
+        return false;
+    }
     std::string tok;
-    std::getline(f, tok);
+    char buffer[4096];
+    constexpr size_t kMaxTokenBytes = 64 * 1024;
+    for (;;) {
+        ssize_t n = ::read(fd, buffer, sizeof(buffer));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 || tok.size() + static_cast<size_t>(n) > kMaxTokenBytes) {
+            LOGERR("QobuzApi::loadToken: invalid token file\n");
+            ::close(fd);
+            return false;
+        }
+        if (n == 0) break;
+        tok.append(buffer, static_cast<size_t>(n));
+    }
+    ::close(fd);
+    const auto newline = tok.find_first_of("\r\n");
+    if (newline != std::string::npos) tok.resize(newline);
     if (tok.empty()) return false;
     m_user_token = tok;
     LOGINF("QobuzApi: token loaded from " << path << "\n");
@@ -627,6 +709,7 @@ bool QobuzApi::loadToken(const std::string& path) {
 // ---- fetchAppCredentials ----------------------------------------------------
 
 bool QobuzApi::fetchAppCredentials() {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     const std::string play_url = "https://play.qobuz.com";
 
     // Step 1: fetch the login page to find the versioned bundle.js path
@@ -697,8 +780,8 @@ bool QobuzApi::fetchAppCredentials() {
             std::string encoded = chars.substr(0, chars.size() - 44);
             std::string secret  = base64urlDecode(encoded);
             if (!secret.empty()) {
-                LOGDEB("QobuzApi: fetchAppCredentials: candidate ["
-                       << tz_full << "] " << secret << "\n");
+                LOGDEB("QobuzApi: fetchAppCredentials: decoded candidate ["
+                       << tz_full << "]\n");
                 m_secret_candidates.push_back(secret);
             }
         }
@@ -714,8 +797,9 @@ bool QobuzApi::fetchAppCredentials() {
 }
 
 bool QobuzApi::fetchQwsToken(std::string& out_endpoint, std::string& out_jwt) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (m_user_token.empty()) {
-        LOGERR("QobuzApi::fetchQwsToken: no user token — call login() first\n");
+        LOGERR("QobuzApi::fetchQwsToken: no OAuth user token\n");
         return false;
     }
 
@@ -733,8 +817,10 @@ bool QobuzApi::fetchQwsToken(std::string& out_endpoint, std::string& out_jwt) {
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    post_body.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &result);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,       15L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL,      1L);
 
     struct curl_slist* hdrs = nullptr;
     std::string auth_hdr = "X-User-Auth-Token: " + m_user_token;
@@ -756,8 +842,7 @@ bool QobuzApi::fetchQwsToken(std::string& out_endpoint, std::string& out_jwt) {
         return false;
     }
     if (http_code != 200) {
-        LOGERR("QobuzApi::fetchQwsToken: HTTP " << http_code
-               << " body: " << result.substr(0, 300) << "\n");
+        LOGERR("QobuzApi::fetchQwsToken: HTTP " << http_code << "\n");
         return false;
     }
 
@@ -792,7 +877,7 @@ std::string QobuzApi::httpPostForm(const std::string& path,
                                    const std::map<std::string, std::string>& form,
                                    long* http_code_out) {
     std::string url = m_base_url + path;
-    LOGDEB("QobuzApi: POST " << url << "\n");
+    LOGDEB("QobuzApi: POST " << endpointOnly(path) << "\n");
     CURL* curl = curl_easy_init();
     if (!curl) return {};
 
@@ -815,8 +900,10 @@ std::string QobuzApi::httpPostForm(const std::string& path,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
     struct curl_slist* hdrs = nullptr;
     hdrs = curl_slist_append(hdrs, "Origin: https://play.qobuz.com");
@@ -840,9 +927,8 @@ std::string QobuzApi::httpPostForm(const std::string& path,
         LOGERR("QobuzApi: POST curl failed: " << curl_easy_strerror(rc) << "\n");
         result.clear();
     } else if (http_code != 200) {
-        LOGERR("QobuzApi: POST HTTP " << http_code << " for " << path << "\n");
-        if (!result.empty())
-            LOGERR("QobuzApi: response body: " << result.substr(0, 500) << "\n");
+        LOGERR("QobuzApi: POST HTTP " << http_code << " for "
+               << endpointOnly(path) << "\n");
         result.clear();
     }
 
@@ -853,7 +939,7 @@ std::string QobuzApi::httpPostForm(const std::string& path,
 
 std::string QobuzApi::httpGet(const std::string& path, long* http_code_out) {
     std::string url = m_base_url + path;
-    LOGDEB("QobuzApi: GET " << url << "\n");
+    LOGDEB("QobuzApi: GET " << endpointOnly(path) << "\n");
 
     CURL* curl = curl_easy_init();
     if (!curl) return {};
@@ -862,16 +948,17 @@ std::string QobuzApi::httpGet(const std::string& path, long* http_code_out) {
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT,
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
 
     // Build auth headers. X-App-Id is sent on every request;
     // Origin/Referer mimic a web-player request so the server accepts the web-player app_id.
-    // X-User-Auth-Token is added only after login.
-    // (JWT from the Qobuz app is for the WebSocket, not the REST API)
+    // X-User-Auth-Token is added after OAuth or loading its cached token.
     struct curl_slist* hdrs = nullptr;
     hdrs = curl_slist_append(hdrs, "Origin: https://play.qobuz.com");
     hdrs = curl_slist_append(hdrs, "Referer: https://play.qobuz.com/");
@@ -894,9 +981,8 @@ std::string QobuzApi::httpGet(const std::string& path, long* http_code_out) {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
         if (http_code_out) *http_code_out = http_code;
         if (http_code != 200) {
-            LOGERR("QobuzApi: HTTP " << http_code << " for " << path << "\n");
-            if (!result.empty())
-                LOGERR("QobuzApi: response body: " << result.substr(0, 500) << "\n");
+            LOGERR("QobuzApi: HTTP " << http_code << " for "
+                   << endpointOnly(path) << "\n");
             result.clear();
         }
     }

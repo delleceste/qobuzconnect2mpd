@@ -118,6 +118,57 @@ executable(
   install: true,
   cpp_args: [],
 )
+
+qc_proto_test = executable(
+  'qconnect-proto-test',
+  files('tests/qconnect_proto_test.cxx', 'src/qconnect/proto.cxx'),
+  include_directories: include_directories('src/qconnect'),
+  dependencies: dependency('threads'),
+)
+test('qconnect-proto', qc_proto_test)
+
+qc_segstream_test = executable(
+  'qconnect-segstream-test',
+  files('tests/segstream_test.cxx', 'src/qconnect/segstream.cxx'),
+  include_directories: include_directories('src/qconnect'),
+  dependencies: [dependency('libcurl'), dependency('openssl'), dependency('threads')],
+)
+test('qconnect-segstream', qc_segstream_test)
+
+qc_http_stream_test = executable(
+  'qconnect-http-stream-test',
+  files(
+    'tests/httphandler_stream_test.cxx',
+    'src/qconnect/httphandler.cxx',
+    'src/qconnect/segstream.cxx',
+  ),
+  include_directories: include_directories('src/qconnect'),
+  dependencies: [
+    dependency('libcurl'),
+    dependency('libmicrohttpd'),
+    dependency('jsoncpp'),
+    dependency('openssl'),
+    dependency('threads'),
+  ],
+)
+test('qconnect-http-stream', qc_http_stream_test)
+
+qc_qobuz_token_test = executable(
+  'qconnect-qobuz-token-test',
+  files(
+    'tests/qobuzapi_token_test.cxx',
+    'src/qconnect/qobuzapi.cxx',
+    'src/qconnect/segstream.cxx',
+  ),
+  include_directories: include_directories('src/qconnect'),
+  dependencies: [
+    dependency('libcurl'),
+    dependency('jsoncpp'),
+    dependency('openssl'),
+    dependency('threads'),
+  ],
+)
+test('qconnect-qobuz-token', qc_qobuz_token_test)
 #### End qconnect2mpd
 
 ########################### Optional Configuration GUI

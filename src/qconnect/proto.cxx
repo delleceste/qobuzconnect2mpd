@@ -17,6 +17,7 @@
 
 #include "proto.hxx"
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 
@@ -127,6 +128,12 @@ void writeMessageField(Bytes& b, int fn, const Bytes& submsg) {
     b.insert(b.end(), submsg.begin(), submsg.end());
 }
 
+void writeMessageFieldPresent(Bytes& b, int fn, const Bytes& submsg) {
+    writeTag(b, fn, WT_LEN);
+    writeVarint(b, submsg.size());
+    b.insert(b.end(), submsg.begin(), submsg.end());
+}
+
 // Write a fixed64 field (wire type 1, 8 bytes little-endian)
 void writeFixed64Field(Bytes& b, int fn, uint64_t v) {
     writeTag(b, fn, WT_64BIT);
@@ -197,6 +204,16 @@ bool readFixed32(const uint8_t* data, size_t len, size_t& pos, uint32_t& out) {
     return true;
 }
 
+// Read a fixed64 field (8 bytes little-endian, wire type 1).
+bool readFixed64(const uint8_t* data, size_t len, size_t& pos, uint64_t& out) {
+    if (pos + 8 > len) return false;
+    out = 0;
+    for (int i = 0; i < 8; ++i)
+        out |= static_cast<uint64_t>(data[pos + i]) << (8 * i);
+    pos += 8;
+    return true;
+}
+
 // Read a length-delimited field and return its span.
 bool readLenField(const uint8_t* data, size_t len, size_t& pos,
                   const uint8_t*& field_data, size_t& field_len) {
@@ -212,6 +229,7 @@ bool readLenField(const uint8_t* data, size_t len, size_t& pos,
 // ---- Nested struct decoders -------------------------------------------------
 
 bool decodeQueueVersion(const uint8_t* d, size_t len, QueueVersion& out) {
+    out.present = true;
     size_t pos = 0;
     while (pos < len) {
         int fn; uint8_t wt;
@@ -259,23 +277,42 @@ bool decodeRendererState(const uint8_t* d, size_t len, RendererState& out) {
         switch (fn) {
         case 1: readVarint(d, len, pos, v); out.playing_state = static_cast<PlayingState>(v); break;
         case 2: readVarint(d, len, pos, v); out.buffer_state  = static_cast<BufferState>(v);  break;
-        // field 3 = Position message { timestamp=1, value_ms=2 } — we only need value_ms
+        // field 3 = Position message { fixed64 timestamp=1, value_ms=2 }
         case 3:
             if (!readLenField(d, len, pos, fd, fl)) return false;
+            out.has_position = true;
             {
                 size_t p2 = 0;
                 while (p2 < fl) {
                     int fn2; uint8_t wt2;
-                    if (!readTag(fd, fl, p2, fn2, wt2)) break;
+                    if (!readTag(fd, fl, p2, fn2, wt2)) return false;
                     uint64_t v2;
-                    if (fn2 == 2) { readVarint(fd, fl, p2, v2); out.current_position_ms = static_cast<uint32_t>(v2); }
-                    else skipField(fd, fl, p2, wt2);
+                    if (fn2 == 1 && wt2 == WT_64BIT) {
+                        if (!readFixed64(fd, fl, p2, v2)) return false;
+                        out.position_timestamp_ms = v2;
+                    } else if (fn2 == 2 && wt2 == WT_VARINT) {
+                        if (!readVarint(fd, fl, p2, v2)) return false;
+                        out.current_position_ms = static_cast<uint32_t>(v2);
+                    } else if (!skipField(fd, fl, p2, wt2)) {
+                        return false;
+                    }
                 }
             }
             break;
-        case 4: readVarint(d, len, pos, v); out.duration_ms              = static_cast<uint32_t>(v); break;
-        case 5: readVarint(d, len, pos, v); out.current_queue_item_id    = v; break;
-        case 6: readVarint(d, len, pos, v); out.next_queue_item_id       = v; break;
+        case 4:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.duration_ms = static_cast<uint32_t>(v);
+            break;
+        case 5:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.current_queue_index = static_cast<uint32_t>(v);
+            out.has_current_queue_index = true;
+            break;
+        case 7:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.next_queue_item_id = v;
+            out.has_next_queue_item_id = true;
+            break;
         default: if (!skipField(d, len, pos, wt)) return false; break;
         }
     }
@@ -288,13 +325,55 @@ bool decodeQueueRendererState(const uint8_t* d, size_t len, QueueRendererState& 
         int fn; uint8_t wt;
         if (!readTag(d, len, pos, fn, wt)) return false;
         const uint8_t* fd; size_t fl;
+        uint64_t v;
         switch (fn) {
         case 1:
-            if (!readLenField(d, len, pos, fd, fl)) return false;
-            decodeQueueVersion(fd, fl, out.queue_version); break;
+            if (!readVarint(d, len, pos, v)) return false;
+            out.state.playing_state = static_cast<PlayingState>(v);
+            break;
         case 2:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.state.buffer_state = static_cast<BufferState>(v);
+            break;
+        case 3:
             if (!readLenField(d, len, pos, fd, fl)) return false;
-            decodeRendererState(fd, fl, out.state); break;
+            out.state.has_position = true;
+            {
+                size_t p2 = 0;
+                while (p2 < fl) {
+                    int fn2; uint8_t wt2;
+                    if (!readTag(fd, fl, p2, fn2, wt2)) return false;
+                    uint64_t v2;
+                    if (fn2 == 1 && wt2 == WT_64BIT) {
+                        if (!readFixed64(fd, fl, p2, v2)) return false;
+                        out.state.position_timestamp_ms = v2;
+                    } else if (fn2 == 2 && wt2 == WT_VARINT) {
+                        if (!readVarint(fd, fl, p2, v2)) return false;
+                        out.state.current_position_ms = static_cast<uint32_t>(v2);
+                    } else if (!skipField(fd, fl, p2, wt2)) {
+                        return false;
+                    }
+                }
+            }
+            break;
+        case 4:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.state.duration_ms = static_cast<uint32_t>(v);
+            break;
+        case 5:
+            if (!readLenField(d, len, pos, fd, fl)) return false;
+            if (!decodeQueueVersion(fd, fl, out.queue_version)) return false;
+            break;
+        case 6:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.state.current_queue_item_id = v;
+            out.state.has_current_queue_item_id = true;
+            break;
+        case 7:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.state.next_queue_item_id = v;
+            out.state.has_next_queue_item_id = true;
+            break;
         default: if (!skipField(d, len, pos, wt)) return false; break;
         }
     }
@@ -393,7 +472,11 @@ bool decodeMsgSessionState(const uint8_t* d, size_t len, MsgSessionState& out) {
         case 2: readVarint(d,len,pos,v); out.session_id = v; break;
         case 3: if (!readLenField(d,len,pos,fd,fl)) return false;
                 decodeQueueVersion(fd, fl, out.queue_version); break;
-        case 4: readVarint(d,len,pos,v); out.track_index = static_cast<uint32_t>(v); break;
+        case 4:
+            if (!readVarint(d,len,pos,v)) return false;
+            out.track_index = static_cast<uint32_t>(v);
+            out.has_track_index = true;
+            break;
         default: if (!skipField(d, len, pos, wt)) return false; break;
         }
     }
@@ -436,11 +519,30 @@ bool decodeMsgAddRenderer(const uint8_t* d, size_t len, MsgAddRenderer& out) {
     return true;
 }
 
-bool decodeMsgQueueTracks(const uint8_t* d, size_t len,
-                           std::vector<QueueTrack>& tracks,
-                           QueueVersion& qver,
-                           uint32_t* queue_position = nullptr,
-                           uint32_t* insert_after   = nullptr) {
+bool decodeVersionAndTracks(const uint8_t* d, size_t len,
+                            std::vector<QueueTrack>& tracks,
+                            QueueVersion& qver) {
+    size_t pos = 0;
+    while (pos < len) {
+        int fn; uint8_t wt;
+        if (!readTag(d, len, pos, fn, wt)) return false;
+        const uint8_t* fd; size_t fl;
+        switch (fn) {
+        case 1: if (!readLenField(d,len,pos,fd,fl)) return false;
+                if (!decodeQueueVersion(fd, fl, qver)) return false; break;
+        case 3: // tracks
+            if (!readLenField(d,len,pos,fd,fl)) return false;
+            { QueueTrack t;
+              if (!decodeQueueTrack(fd, fl, t)) return false;
+              tracks.push_back(std::move(t)); }
+            break;
+        default: if (!skipField(d, len, pos, wt)) return false; break;
+        }
+    }
+    return true;
+}
+
+bool decodeMsgQueueState(const uint8_t* d, size_t len, MsgQueueState& out) {
     size_t pos = 0;
     while (pos < len) {
         int fn; uint8_t wt;
@@ -448,20 +550,128 @@ bool decodeMsgQueueTracks(const uint8_t* d, size_t len,
         const uint8_t* fd; size_t fl;
         uint64_t v;
         switch (fn) {
-        case 1: if (!readLenField(d,len,pos,fd,fl)) return false;
-                decodeQueueVersion(fd, fl, qver); break;
-        case 3: // tracks
-            if (!readLenField(d,len,pos,fd,fl)) return false;
-            { QueueTrack t; decodeQueueTrack(fd, fl, t); tracks.push_back(t); }
+        case 1:
+            if (!readLenField(d, len, pos, fd, fl) ||
+                !decodeQueueVersion(fd, fl, out.queue_version)) return false;
             break;
-        case 4: // queue_position (load) or insert_after (insert)
-            readVarint(d,len,pos,v);
-            if (queue_position) *queue_position = static_cast<uint32_t>(v);
-            if (insert_after)   *insert_after   = static_cast<uint32_t>(v);
+        case 3: {
+            if (!readLenField(d, len, pos, fd, fl)) return false;
+            QueueTrack track;
+            if (!decodeQueueTrack(fd, fl, track)) return false;
+            out.tracks.push_back(std::move(track));
+            break;
+        }
+        case 4:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.shuffle_on = v != 0;
+            out.has_shuffle_on = true;
+            break;
+        case 5:
+            if (wt == WT_LEN) {
+                if (!readLenField(d, len, pos, fd, fl)) return false;
+                size_t packed_pos = 0;
+                while (packed_pos < fl) {
+                    if (!readVarint(fd, fl, packed_pos, v)) return false;
+                    out.shuffled_track_indexes.push_back(
+                        static_cast<uint32_t>(v));
+                }
+            } else {
+                if (wt != WT_VARINT || !readVarint(d, len, pos, v)) return false;
+                out.shuffled_track_indexes.push_back(static_cast<uint32_t>(v));
+            }
             break;
         default: if (!skipField(d, len, pos, wt)) return false; break;
         }
     }
+    return true;
+}
+
+bool decodeMsgQueueLoad(const uint8_t* d, size_t len, MsgQueueLoadTracks& out) {
+    size_t pos = 0;
+    while (pos < len) {
+        int fn; uint8_t wt;
+        if (!readTag(d, len, pos, fn, wt)) return false;
+        const uint8_t* fd; size_t fl;
+        uint64_t v;
+        switch (fn) {
+        case 1:
+            if (!readLenField(d, len, pos, fd, fl) ||
+                !decodeQueueVersion(fd, fl, out.queue_version)) return false;
+            break;
+        case 3: {
+            if (!readLenField(d, len, pos, fd, fl)) return false;
+            QueueTrack track;
+            if (!decodeQueueTrack(fd, fl, track)) return false;
+            out.tracks.push_back(std::move(track));
+            break;
+        }
+        case 4:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.queue_position = static_cast<uint32_t>(v);
+            out.has_queue_position = true;
+            break;
+        case 6:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.shuffle_pivot_queue_item_id = static_cast<int32_t>(v);
+            out.has_shuffle_pivot_queue_item_id = true;
+            break;
+        case 7:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.shuffle_on = v != 0;
+            out.has_shuffle_on = true;
+            break;
+        default: if (!skipField(d, len, pos, wt)) return false; break;
+        }
+    }
+    return true;
+}
+
+bool decodeMsgQueueInserted(const uint8_t* d, size_t len,
+                            MsgQueueTracksInserted& out) {
+    size_t pos = 0;
+    while (pos < len) {
+        int fn; uint8_t wt;
+        if (!readTag(d, len, pos, fn, wt)) return false;
+        const uint8_t* fd; size_t fl;
+        uint64_t v;
+        switch (fn) {
+        case 1:
+            if (!readLenField(d, len, pos, fd, fl) ||
+                !decodeQueueVersion(fd, fl, out.queue_version)) return false;
+            break;
+        case 3: {
+            if (!readLenField(d, len, pos, fd, fl)) return false;
+            QueueTrack track;
+            if (!decodeQueueTrack(fd, fl, track)) return false;
+            out.tracks.push_back(std::move(track));
+            break;
+        }
+        case 4:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.insert_after = static_cast<int32_t>(v);
+            out.has_insert_after = true;
+            break;
+        default: if (!skipField(d, len, pos, wt)) return false; break;
+        }
+    }
+    return true;
+}
+
+bool decodeQueueItemIds(const uint8_t* d, size_t len, size_t& pos,
+                        uint8_t wt, std::vector<uint64_t>& ids) {
+    uint64_t v;
+    if (wt == WT_LEN) {
+        const uint8_t* fd; size_t fl;
+        if (!readLenField(d, len, pos, fd, fl)) return false;
+        size_t packed_pos = 0;
+        while (packed_pos < fl) {
+            if (!readVarint(fd, fl, packed_pos, v)) return false;
+            ids.push_back(v);
+        }
+        return true;
+    }
+    if (wt != WT_VARINT || !readVarint(d, len, pos, v)) return false;
+    ids.push_back(v);
     return true;
 }
 
@@ -471,25 +681,102 @@ bool decodeMsgQueueRemoved(const uint8_t* d, size_t len, MsgQueueTracksRemoved& 
         int fn; uint8_t wt;
         if (!readTag(d, len, pos, fn, wt)) return false;
         const uint8_t* fd; size_t fl;
-        uint64_t v;
         switch (fn) {
         case 1: if (!readLenField(d,len,pos,fd,fl)) return false;
-                decodeQueueVersion(fd, fl, out.queue_version); break;
+                if (!decodeQueueVersion(fd, fl, out.queue_version)) return false; break;
         case 3: // queue_item_ids (packed or repeated)
-            if (wt == WT_LEN) {
-                // packed varint
-                if (!readLenField(d,len,pos,fd,fl)) return false;
-                size_t p2 = 0;
-                while (p2 < fl) {
-                    if (!readVarint(fd, fl, p2, v)) break;
-                    out.queue_item_ids.push_back(v);
-                }
-            } else {
-                readVarint(d,len,pos,v);
-                out.queue_item_ids.push_back(v);
-            }
+            if (!decodeQueueItemIds(d, len, pos, wt, out.queue_item_ids)) return false;
             break;
         default: if (!skipField(d, len, pos, wt)) return false; break;
+        }
+    }
+    return true;
+}
+
+bool decodeMsgQueueReordered(const uint8_t* d, size_t len,
+                             MsgQueueTracksReordered& out) {
+    size_t pos = 0;
+    while (pos < len) {
+        int fn; uint8_t wt;
+        if (!readTag(d, len, pos, fn, wt)) return false;
+        const uint8_t* fd; size_t fl;
+        uint64_t v;
+        switch (fn) {
+        case 1:
+            if (!readLenField(d, len, pos, fd, fl) ||
+                !decodeQueueVersion(fd, fl, out.queue_version)) return false;
+            break;
+        case 3:
+            if (!decodeQueueItemIds(d, len, pos, wt, out.queue_item_ids)) return false;
+            break;
+        case 4:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.insert_after = v;
+            out.has_insert_after = true;
+            break;
+        default: if (!skipField(d, len, pos, wt)) return false; break;
+        }
+    }
+    return true;
+}
+
+bool decodeQueueVersionOnly(const uint8_t* d, size_t len, QueueVersion& out) {
+    size_t pos = 0;
+    while (pos < len) {
+        int fn; uint8_t wt;
+        if (!readTag(d, len, pos, fn, wt)) return false;
+        if (fn == 1 && wt == WT_LEN) {
+            const uint8_t* fd; size_t fl;
+            if (!readLenField(d, len, pos, fd, fl) ||
+                !decodeQueueVersion(fd, fl, out)) return false;
+        } else if (!skipField(d, len, pos, wt)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool decodeMsgShuffleMode(const uint8_t* d, size_t len, MsgShuffleMode& out,
+                          int shuffle_field) {
+    size_t pos = 0;
+    while (pos < len) {
+        int fn; uint8_t wt;
+        if (!readTag(d, len, pos, fn, wt)) return false;
+        uint64_t v;
+        if (fn == 1 && wt == WT_LEN) {
+            const uint8_t* fd; size_t fl;
+            if (!readLenField(d, len, pos, fd, fl) ||
+                !decodeQueueVersion(fd, fl, out.queue_version)) return false;
+        } else if (fn == shuffle_field && wt == WT_VARINT) {
+            if (!readVarint(d, len, pos, v)) return false;
+            out.shuffle_on = v != 0;
+            out.has_shuffle_on = true;
+        } else if (fn == 4 && wt == WT_32BIT) {
+            if (!readFixed32(d, len, pos, out.current_queue_item_id)) return false;
+            out.has_current_queue_item_id = true;
+        } else if (fn == 5 && wt == WT_VARINT) {
+            if (!readVarint(d, len, pos, v)) return false;
+            out.shuffle_pivot = static_cast<uint32_t>(v);
+            out.has_shuffle_pivot = true;
+        } else if (!skipField(d, len, pos, wt)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool decodeMsgLoopMode(const uint8_t* d, size_t len, MsgLoopMode& out) {
+    size_t pos = 0;
+    while (pos < len) {
+        int fn; uint8_t wt;
+        if (!readTag(d, len, pos, fn, wt)) return false;
+        uint64_t v;
+        if (fn == 1 && wt == WT_VARINT) {
+            if (!readVarint(d, len, pos, v)) return false;
+            out.mode = static_cast<LoopMode>(v);
+            out.has_mode = true;
+        } else if (!skipField(d, len, pos, wt)) {
+            return false;
         }
     }
     return true;
@@ -537,6 +824,12 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
                 }
             }
             break;
+        case MsgType::CMD_SET_SHUFFLE_MODE:
+            if (!decodeMsgShuffleMode(fd, fl, msg.shuffle_mode, 1)) return false;
+            break;
+        case MsgType::CMD_SET_LOOP_MODE:
+            if (!decodeMsgLoopMode(fd, fl, msg.loop_mode)) return false;
+            break;
         case MsgType::SRVRC_SESSION_STATE:
             decodeMsgSessionState(fd, fl, msg.session_state); break;
         case MsgType::SRVRC_RENDERER_STATE_UPD:
@@ -570,46 +863,37 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
             }
             break;
         case MsgType::SRVRC_QUEUE_STATE:
-            decodeMsgQueueTracks(fd, fl, msg.queue_state.tracks,
-                                  msg.queue_state.queue_version);
+            if (!decodeMsgQueueState(fd, fl, msg.queue_state)) return false;
             break;
         case MsgType::SRVRC_QUEUE_CLEARED:
-            // body is just queue_version + action_uuid; we don't need either.
-            // The wsession handler only needs to know the message arrived.
+            if (!decodeQueueVersionOnly(fd, fl,
+                                        msg.queue_cleared.queue_version)) return false;
             break;
         case MsgType::SRVRC_QUEUE_LOAD_TRACKS:
-            decodeMsgQueueTracks(fd, fl, msg.queue_load_tracks.tracks,
-                                  msg.queue_load_tracks.queue_version,
-                                  &msg.queue_load_tracks.queue_position);
+            if (!decodeMsgQueueLoad(fd, fl, msg.queue_load_tracks)) return false;
             break;
         case MsgType::SRVRC_TRACKS_INSERTED:
-            decodeMsgQueueTracks(fd, fl, msg.tracks_inserted.tracks,
-                                  msg.tracks_inserted.queue_version,
-                                  nullptr,
-                                  &msg.tracks_inserted.insert_after);
+            if (!decodeMsgQueueInserted(fd, fl, msg.tracks_inserted)) return false;
             break;
         case MsgType::SRVRC_TRACKS_ADDED:
-            decodeMsgQueueTracks(fd, fl, msg.tracks_added.tracks,
-                                  msg.tracks_added.queue_version);
+            if (!decodeVersionAndTracks(fd, fl, msg.tracks_added.tracks,
+                                        msg.tracks_added.queue_version)) return false;
             break;
         case MsgType::SRVRC_TRACKS_REMOVED:
-            decodeMsgQueueRemoved(fd, fl, msg.tracks_removed); break;
+            if (!decodeMsgQueueRemoved(fd, fl, msg.tracks_removed)) return false;
+            break;
+        case MsgType::SRVRC_TRACKS_REORDERED:
+            if (!decodeMsgQueueReordered(fd, fl, msg.tracks_reordered)) return false;
+            break;
+        case MsgType::SRVRC_SHUFFLE_MODE_SET:
+            if (!decodeMsgShuffleMode(fd, fl, msg.shuffle_mode, 3)) return false;
+            break;
+        case MsgType::SRVRC_LOOP_MODE_SET:
+            if (!decodeMsgLoopMode(fd, fl, msg.loop_mode)) return false;
+            break;
         case MsgType::SRVRC_QUEUE_VERSION_CHANGED:
-            {
-                size_t p = 0;
-                while (p < fl) {
-                    int fn2; uint8_t wt2;
-                    if (!readTag(fd,fl,p,fn2,wt2)) break;
-                    const uint8_t* fd2; size_t fl2;
-                    if (fn2 == 1 && wt2 == WT_LEN &&
-                        readLenField(fd, fl, p, fd2, fl2)) {
-                        decodeQueueVersion(fd2, fl2,
-                                           msg.queue_version_changed.queue_version);
-                    } else {
-                        skipField(fd,fl,p,wt2);
-                    }
-                }
-            }
+            if (!decodeQueueVersionOnly(
+                    fd, fl, msg.queue_version_changed.queue_version)) return false;
             break;
         default:
             handled = false; break;
@@ -675,7 +959,7 @@ Bytes encodeRendererState(const RendererState& s) {
     Bytes b;
     writeInt32Field(b, 1, static_cast<int32_t>(s.playing_state));
     writeInt32Field(b, 2, static_cast<int32_t>(s.buffer_state));
-    if (s.position_timestamp_ms || s.current_position_ms) {
+    if (s.has_position || s.position_timestamp_ms || s.current_position_ms) {
         Bytes pos;
         uint64_t ts = s.position_timestamp_ms ? s.position_timestamp_ms : nowMs();
         writeFixed64Field(pos, 1, ts);
@@ -685,10 +969,10 @@ Bytes encodeRendererState(const RendererState& s) {
         writeMessageField(b, 3, pos);
     }
     writeUint32Field(b, 4, s.duration_ms);
-    if (s.has_current_queue_item_id || s.current_queue_item_id)
-        writeUint64FieldPresent(b, 5, s.current_queue_item_id);
-    if (s.next_queue_item_id)
-        writeUint64Field(b, 6, s.next_queue_item_id);
+    if (s.has_current_queue_index || s.current_queue_index)
+        writeUint32FieldPresent(b, 5, s.current_queue_index);
+    if (s.has_next_queue_item_id || s.next_queue_item_id)
+        writeUint64FieldPresent(b, 7, s.next_queue_item_id);
     return b;
 }
 
@@ -706,7 +990,8 @@ Bytes encodeQueueRendererState(const QueueRendererState& s) {
     writeInt32Field(b, 2, static_cast<int32_t>(s.state.buffer_state));
     // Always send Position when we have a timestamp (even if position_ms == 0,
     // e.g. start of track). The server extrapolates: pos + (now - timestamp).
-    if (s.state.position_timestamp_ms || s.state.current_position_ms) {
+    if (s.state.has_position || s.state.position_timestamp_ms ||
+        s.state.current_position_ms) {
         Bytes pos;
         uint64_t ts = s.state.position_timestamp_ms ? s.state.position_timestamp_ms : nowMs();
         writeFixed64Field(pos, 1, ts);
@@ -717,11 +1002,12 @@ Bytes encodeQueueRendererState(const QueueRendererState& s) {
     }
     writeUint32Field(b, 4, s.state.duration_ms);
     Bytes qv = encodeQueueVersion(s.queue_version);
-    if (!qv.empty()) writeMessageField(b, 5, qv);
+    if (s.queue_version.present || !qv.empty())
+        writeMessageFieldPresent(b, 5, qv);
     if (s.state.has_current_queue_item_id || s.state.current_queue_item_id)
         writeUint64FieldPresent(b, 6, s.state.current_queue_item_id);
-    if (s.state.next_queue_item_id)
-        writeUint64Field(b, 7, s.state.next_queue_item_id);
+    if (s.state.has_next_queue_item_id || s.state.next_queue_item_id)
+        writeUint64FieldPresent(b, 7, s.state.next_queue_item_id);
     return b;
 }
 
@@ -771,9 +1057,11 @@ Bytes wrapInPayload(uint64_t time_ms, int32_t batch_id,
     writeMessageField(batch, 3, qcm);
 
     // Payload { msg_id=1, msg_date=2, proto=3, payload=7 }
-    static uint32_t s_payload_msg_id = 0;
+    static std::atomic<uint32_t> s_payload_msg_id{0};
     Bytes payload;
-    writeUint32Field(payload, 1, ++s_payload_msg_id);
+    writeUint32Field(
+        payload, 1,
+        s_payload_msg_id.fetch_add(1, std::memory_order_relaxed) + 1);
     writeUint64Field(payload, 2, time_ms);
     writeInt32Field(payload, 3, static_cast<int32_t>(QCloudProto::QCONNECT));
     writeBytesField(payload, 7, batch);

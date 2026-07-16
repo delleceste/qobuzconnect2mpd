@@ -122,7 +122,8 @@ enum class MsgType : int32_t {
     SRVRC_DEVICE_QUALITY_CHANGED = 101,
     SRVRC_AUTOPLAY_MODE_SET    = 102,
     SRVRC_AUTOPLAY_TRACKS_LOADED = 103,
-    SRVRC_QUEUE_VERSION_CHANGED  = 104,
+    SRVRC_AUTOPLAY_TRACKS_REMOVED = 104,
+    SRVRC_QUEUE_VERSION_CHANGED  = 105,
 };
 
 // ---- Common enums and structs ------------------------------------------------
@@ -160,6 +161,7 @@ enum class LoopMode : int32_t {
 struct QueueVersion {
     uint64_t major{0};
     int32_t  minor{0};
+    bool     present{false};
 };
 
 struct QueueTrackRef {
@@ -175,9 +177,13 @@ struct RendererState {
     uint32_t     current_position_ms{0};
     uint64_t     position_timestamp_ms{0}; // epoch ms when position was sampled
     uint32_t     duration_ms{0};
+    uint32_t     current_queue_index{0};
     uint64_t     current_queue_item_id{0};
     uint64_t     next_queue_item_id{0};
+    bool         has_current_queue_index{false};
+    bool         has_position{false};              // position message present (0 is valid)
     bool         has_current_queue_item_id{false}; // presence flag (0 is valid)
+    bool         has_next_queue_item_id{false};    // presence flag (0 is valid)
 };
 
 struct QueueRendererState {
@@ -221,6 +227,7 @@ struct MsgSessionState {
     uint64_t     session_id{0};
     QueueVersion queue_version;
     uint32_t     track_index{0};
+    bool         has_track_index{false};
 };
 
 struct MsgRendererStateUpdated {
@@ -251,19 +258,27 @@ struct QueueTrack {
 struct MsgQueueState {
     QueueVersion           queue_version;
     std::vector<QueueTrack> tracks;
+    std::vector<uint32_t>  shuffled_track_indexes;
     bool                   shuffle_on{false};
+    bool                   has_shuffle_on{false};
 };
 
 struct MsgQueueLoadTracks {
     QueueVersion            queue_version;
     std::vector<QueueTrack> tracks;
     uint32_t                queue_position{0};
+    bool                    has_queue_position{false};
+    int32_t                 shuffle_pivot_queue_item_id{0};
+    bool                    has_shuffle_pivot_queue_item_id{false};
+    bool                    shuffle_on{false};
+    bool                    has_shuffle_on{false};
 };
 
 struct MsgQueueTracksInserted {
     QueueVersion            queue_version;
     std::vector<QueueTrack> tracks;
-    uint32_t                insert_after{0};
+    int32_t                 insert_after{0};
+    bool                    has_insert_after{false};
 };
 
 struct MsgQueueTracksAdded {
@@ -274,6 +289,32 @@ struct MsgQueueTracksAdded {
 struct MsgQueueTracksRemoved {
     QueueVersion           queue_version;
     std::vector<uint64_t>  queue_item_ids;
+};
+
+struct MsgQueueTracksReordered {
+    QueueVersion          queue_version;
+    std::vector<uint64_t> queue_item_ids;
+    uint64_t              insert_after{0};
+    bool                  has_insert_after{false};
+};
+
+struct MsgQueueCleared {
+    QueueVersion queue_version;
+};
+
+struct MsgShuffleMode {
+    QueueVersion queue_version;
+    bool         shuffle_on{false};
+    bool         has_shuffle_on{false};
+    uint32_t     current_queue_item_id{0};
+    bool         has_current_queue_item_id{false};
+    uint32_t     shuffle_pivot{0};
+    bool         has_shuffle_pivot{false};
+};
+
+struct MsgLoopMode {
+    LoopMode mode{LoopMode::UNKNOWN};
+    bool     has_mode{false};
 };
 
 struct MsgQueueVersionChanged {
@@ -287,16 +328,20 @@ struct Message {
     MsgSetState            set_state;
     MsgSetActive           set_active;
     MsgSetVolume           set_volume;
+    MsgShuffleMode         shuffle_mode;
+    MsgLoopMode            loop_mode;
     MsgSessionState        session_state;
     MsgRendererStateUpdated renderer_state_upd;
     MsgAddRenderer         add_renderer;
     MsgRemoveRenderer      remove_renderer;
     MsgActiveRendererChanged active_renderer_changed;
     MsgQueueState          queue_state;
+    MsgQueueCleared        queue_cleared;
     MsgQueueLoadTracks     queue_load_tracks;
     MsgQueueTracksInserted tracks_inserted;
     MsgQueueTracksAdded    tracks_added;
     MsgQueueTracksRemoved  tracks_removed;
+    MsgQueueTracksReordered tracks_reordered;
     MsgQueueVersionChanged queue_version_changed;
 };
 

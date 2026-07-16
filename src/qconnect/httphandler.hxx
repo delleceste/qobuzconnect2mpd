@@ -16,7 +16,9 @@
  */
 #pragma once
 
+#include <chrono>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <cstdint>
 #include <microhttpd.h>
@@ -42,9 +44,10 @@ struct ConnectCredentials {
 using ConnectCallback = std::function<void(ConnectCredentials)>;
 
 // Called when the browser completes the OAuth flow and redirects to
-// GET /oauth/callback?code_autorisation=<code>.
+// GET <configured-callback-path>?code_autorisation=<code>.
 // The code should be passed to QobuzApi::oauthExchangeCode().
-using OAuthCallback = std::function<void(const std::string& code)>;
+// Return true only when the code was exchanged and persisted successfully.
+using OAuthCallback = std::function<bool(const std::string& code)>;
 
 // Serves the three HTTP endpoints required by the Qobuz Connect protocol:
 //
@@ -79,13 +82,14 @@ public:
     // Update the session ID returned by get-connect-info.
     void setSessionId(const std::string& session_id);
 
-    // Register the callback invoked when the browser completes OAuth login.
-    void setOAuthCallback(OAuthCallback cb) { m_oauth_cb = std::move(cb); }
+    // Register a short-lived callback path invoked when the browser completes
+    // OAuth login. The path must contain an unguessable per-login nonce.
+    void setOAuthCallback(const std::string& callback_path, OAuthCallback cb);
 
     // Registry used to look up segmented-track plans on
     // GET /qobuz-segmented/<token>.  Must be set before the Qobuz app starts
     // requesting tracks.  Not owned.
-    void setSegmentedRegistry(SegmentedTrackRegistry* r) { m_seg_registry = r; }
+    void setSegmentedRegistry(SegmentedTrackRegistry* r);
 
 private:
     static MHD_Result requestCallback(void* cls,
@@ -96,6 +100,12 @@ private:
                                        const char* upload_data,
                                        size_t*     upload_data_size,
                                        void**      con_cls);
+
+    static void requestCompletedCallback(
+        void* cls,
+        struct MHD_Connection* conn,
+        void** con_cls,
+        enum MHD_RequestTerminationCode termination_code);
 
     MHD_Result handleRequest(struct MHD_Connection* conn,
                               const char* url,
@@ -112,8 +122,12 @@ private:
     int              m_port;
     int              m_max_quality;
     ConnectCallback  m_on_connect;
+    mutable std::mutex m_state_mutex;
     std::string      m_session_id;
     OAuthCallback    m_oauth_cb;
+    std::string      m_oauth_path;
+    std::chrono::steady_clock::time_point m_oauth_expires_at{};
+    bool             m_oauth_in_progress{false};
     SegmentedTrackRegistry* m_seg_registry{nullptr}; // not owned
     struct MHD_Daemon* m_daemon{nullptr};
 };

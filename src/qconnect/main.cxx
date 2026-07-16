@@ -30,11 +30,10 @@
 //   qconnectsockpath       Unix socket for IPC with upmpdcli
 //                          (default: /var/run/upmpdcli-qconnect.sock)
 //
-//   # Qobuz credentials — reused from qobuz plugin if not set here:
-//   qconnectuser           Qobuz username  (falls back to qobuzuser)
-//   qconnectpass           Qobuz password  (falls back to qobuzpass)
+//   # Qobuz API configuration (authentication uses browser OAuth):
 //   qconnectappid          App ID          (falls back to qobuzappid)
 //   qconnectcfvalue        App secret      (falls back to qobuzcfvalue)
+//   qconnecttokenfile      OAuth token cache path (default: XDG/HOME data dir)
 //
 //   # MPD connection (reused from main upmpdcli config):
 //   mpdhost / mpdport / mpdpassword
@@ -172,15 +171,12 @@ int main(int argc, char* argv[]) {
     if (!qcfg.status_file.empty())
         LOGSTD("qconnect2mpd: status file: " << qcfg.status_file << "\n");
 
-    // Qobuz credentials — prefer qconnect-specific, fall back to qobuz plugin
-    qcfg.qobuz_user   = cfgGet(cfg, "qconnectuser",
-                                 cfgGet(cfg, "qobuzuser"));
-    qcfg.qobuz_pass   = cfgGet(cfg, "qconnectpass",
-                                 cfgGet(cfg, "qobuzpass"));
+    // Qobuz API identity. User authentication is OAuth-only.
     qcfg.app_id       = cfgGet(cfg, "qconnectappid",
                                  cfgGet(cfg, "qobuzappid"));
     qcfg.app_secret   = cfgGet(cfg, "qconnectcfvalue",
                                  cfgGet(cfg, "qobuzcfvalue"));
+    qcfg.token_file   = cfgGet(cfg, "qconnecttokenfile");
 
     // UUID: persist across restarts by reading/writing a state file
     std::string state_path = cfgGet(cfg, "cachedir",

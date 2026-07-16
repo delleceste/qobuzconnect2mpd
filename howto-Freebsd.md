@@ -7,7 +7,7 @@ This guide installs `qobuzconnect2mpd` as a FreeBSD `rc.d` service.
 Install the build tools, libraries, and MPD:
 
 ```sh
-pkg install meson ninja pkgconf curl libmicrohttpd jsoncpp libmpdclient openssl mpd
+pkg install meson ninja pkgconf curl libmicrohttpd jsoncpp libmpdclient openssl musicpd
 ```
 
 If you build from ports instead of packages, install the equivalent ports for
@@ -55,8 +55,8 @@ If you use a different `--prefix`, the paths follow that prefix.
 Install and enable MPD first:
 
 ```sh
-sysrc mpd_enable=YES
-service mpd start
+sysrc musicpd_enable=YES
+service musicpd start
 ```
 
 Make sure MPD listens where `qobuzconnect2mpd` will connect.  The default
@@ -70,7 +70,7 @@ port "6600"
 Restart MPD after changing its configuration:
 
 ```sh
-service mpd restart
+service musicpd restart
 ```
 
 ## Configure qobuzconnect2mpd
@@ -90,16 +90,16 @@ mpdport = 6600
 qconnectformatid = 27
 ```
 
-Add Qobuz credentials if you want password login at startup:
+Authentication is OAuth-only. Set a persistent token-cache path:
 
 ```conf
-qconnectuser = your-account@example.com
-qconnectpass = your-password
+qconnecttokenfile = /var/db/qobuzconnect2mpd/user_token
 ```
 
-If credentials are omitted, the daemon prints an OAuth URL in the service log
-when it starts.  Open that URL in a browser on the same LAN and complete the
-login flow.
+On first start, the daemon prints an OAuth URL in the service log. Open that URL
+in a browser on the same LAN and complete the login flow. The cached token is
+created with mode `0600`. The callback URL is valid for five minutes and one
+successful exchange; restart the service to generate another URL if needed.
 
 ## Enable the service
 
@@ -123,10 +123,12 @@ sysrc qobuzconnect2mpd_config=/path/to/qobuzconnect2mpd.conf
 sysrc 'qobuzconnect2mpd_flags=-c /path/to/qobuzconnect2mpd.conf -o /var/tmp/qobuzconnect2mpd.status'
 ```
 
-To run the daemon as a dedicated user, create the user and set:
+To run the daemon as a dedicated user, create a writable state directory and
+set the service account:
 
 ```sh
 pw useradd qobuzconnect2mpd -d /nonexistent -s /usr/sbin/nologin
+install -d -o qobuzconnect2mpd -g qobuzconnect2mpd -m 700 /var/db/qobuzconnect2mpd
 sysrc qobuzconnect2mpd_runas=qobuzconnect2mpd
 ```
 
@@ -179,7 +181,7 @@ Useful checks:
 ```sh
 sockstat -4 -l | grep 9093
 sockstat -4 -l | grep 6600
-service mpd status
+service musicpd status
 service qobuzconnect2mpd status
 ```
 

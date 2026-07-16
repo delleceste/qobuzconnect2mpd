@@ -12,11 +12,13 @@ mDNS), you cast a track or queue to it, and the audio plays through MPD.
    Connect cloud relay.
 3. When the user presses Play, the daemon resolves stream URLs from the Qobuz
    API and loads them into MPD's queue.
-4. Playback state (play/pause/seek/volume/track change) is kept in sync between
+4. Playback state (play/pause/seek/track change) is kept in sync between
    the app and MPD in both directions.
 
-HiRes and lossless CMAF/FLAC streams are downloaded, assembled locally, and
-served to MPD via a lightweight built-in HTTP proxy.
+HiRes and lossless CMAF/FLAC streams are reconstructed into a shared growing
+cache and served to MPD by a lightweight built-in HTTP proxy. Downloads use two
+bounded workers; the current and next MusicPD items take priority over queue
+prefetch work.
 
 ## Dependencies
 
@@ -35,6 +37,7 @@ Build tool: [Meson](https://mesonbuild.com/) + Ninja.
 ```sh
 meson setup builddir
 ninja -C builddir
+meson test -C builddir --print-errorlogs
 ```
 
 The binary is `builddir/qobuzconnect2mpd`.
@@ -57,8 +60,7 @@ provided at `conf/qobuzconnect2mpd.conf`.
 | `mpdhost` | `localhost` | MPD hostname |
 | `mpdport` | `6600` | MPD port |
 | `mpdpassword` | *(none)* | MPD password |
-| `qconnectuser` | value of `qobuzuser` | Qobuz account e-mail |
-| `qconnectpass` | value of `qobuzpass` | Qobuz account password |
+| `qconnecttokenfile` | XDG/HOME data directory | OAuth token cache path |
 | `qconnectappid` | value of `qobuzappid` | Qobuz app ID (auto-fetched if empty) |
 | `qconnectcfvalue` | value of `qobuzcfvalue` | Qobuz app secret (auto-fetched if empty) |
 | `qconnectstatusfile` | `/tmp/qconnect2mpd-status.txt` | Path for the now-playing status file (see `-o` below) |
@@ -91,9 +93,11 @@ When a track starts playing the daemon prints to stdout:
 
 ```
 ▶  Artist Name - Track Title
-   FLAC audio bitstream data, 16 bit, stereo, 44.1 kHz
-   /tmp/qconnect2mpd-segmented/12345_27_1234567890.flac
 ```
+
+Legacy local-file streams may also include the file type and path. Current
+segmented streams remain in the private growing cache and do not expose a
+persistent path.
 
 ### Status file (`-o`)
 
@@ -131,24 +135,47 @@ reflects the current session only.
 
 ## Authentication
 
-Qobuz credentials (`qconnectuser` / `qconnectpass`) are used on the first run
-to obtain an OAuth token, which is cached at
-`~/.local/share/qconnect2mpd/user_token`.  Subsequent runs reuse the cached
-token without re-authenticating.
+User authentication is OAuth-only. By default, the resulting token is cached
+at `~/.local/share/qconnect2mpd/user_token` with mode `0600`; use
+`qconnecttokenfile` to select a service-account path. Subsequent runs reuse it
+without re-authenticating. The token directory must be owned by the daemon's
+effective user.
 
-If no credentials are in the config, or if the login endpoint is unavailable,
-the daemon prints an OAuth URL at startup:
+If no cached token is available, the daemon prints an OAuth URL at startup:
 
 ```
   Not authenticated — open this URL in a browser to log in:
 
-  https://www.qobuz.com/oauth2/...
+  https://www.qobuz.com/signin/oauth?...
 
   (after login this device will connect automatically)
 ```
 
 Open the URL in a browser, log in with your Qobuz account, and the token is
-captured automatically via the local redirect handler.
+captured automatically via the local redirect handler. Qobuz API requests use
+this OAuth token; signed CDN segment requests do not receive it. The `jwt_api`
+value delivered by a Connect controller is accepted as protocol metadata but is
+not substituted for the verified OAuth `X-User-Auth-Token` flow.
+
+The printed callback path contains a random nonce, accepts only one exchange,
+and expires after five minutes. Restart the daemon to generate a new URL if it
+expires.
+
+## Queue and seek behavior
+
+The Qobuz queue is authoritative even while only part of it has been resolved
+into MusicPD. The selected item is resolved first, followed by MusicPD's next
+item; remaining tracks are added incrementally. Remove, insert, reorder,
+shuffle, clear, and explicit queue-version updates are acknowledged only after
+the corresponding local state has committed.
+
+MusicPD's FLAC decoder needs an exact HTTP length before it can seek. Playback
+can begin from the growing cache without that length, but the first seek on an
+incomplete segmented track waits for its prioritized reconstruction, reopens
+the same queue item with the measured length, and then applies the requested
+millisecond position. The renderer reports buffering during this preparation.
+Segment proxy URLs use opaque per-process tokens rather than predictable track
+IDs because the discovery HTTP listener is reachable on the LAN.
 
 ## Bit-perfect audio chain
 
@@ -169,8 +196,8 @@ Qobuz CDN
     │  3. Prepend the STREAMINFO header from the init segment
     ▼
 HTTP proxy on 127.0.0.1:9093              — httphandler.cxx
-    │  on-demand streaming, Range-aware,
-    │  no transcoding, no buffering tricks
+    │  shared growing cache, no transcoding
+    │  measured Content-Length and byte ranges after completion
     ▼
 MPD (libFLAC decoder)                      — lossless PCM
     ▼
