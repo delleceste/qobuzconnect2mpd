@@ -11,8 +11,10 @@
 # (Qobuz Connect receiver daemon that bridges the Qobuz app to MPD).
 #
 # Enable with:  sysrc qobuzconnect2mpd_enable=YES
-# The daemon runs as an unprivileged user. Override qobuzconnect2mpd_user,
-# qobuzconnect2mpd_homedir, or qobuzconnect2mpd_config in rc.conf as needed.
+# The daemon runs as an unprivileged user created by the FreeBSD install step.
+# Override qobuzconnect2mpd_user, qobuzconnect2mpd_group,
+# qobuzconnect2mpd_homedir, or
+# qobuzconnect2mpd_config in rc.conf as needed.
 
 PREFIX="@PREFIX@"
 BINDIR="@BINDIR@"
@@ -26,11 +28,11 @@ load_rc_config "$name"
 
 : ${qobuzconnect2mpd_enable:="NO"}
 : ${qobuzconnect2mpd_user:="qobuzconnect2mpd"}
+: ${qobuzconnect2mpd_group:="qobuzconnect2mpd"}
 : ${qobuzconnect2mpd_homedir:="/var/db/qobuzconnect2mpd"}
 : ${qobuzconnect2mpd_flags:=""}
-# Config is read directly from the repository checkout. The pidfile lives in
-# the service account's state directory because /var/run is not writable after
-# rc.subr drops privileges.
+# The pidfile lives in the service account's state directory because /var/run
+# is not writable after rc.subr drops privileges.
 : ${qobuzconnect2mpd_config:="@QOBUZCONNECT2MPD_CONFIG@"}
 : ${qobuzconnect2mpd_pidfile:="${qobuzconnect2mpd_homedir}/.cache/qobuzconnect2mpd/qobuzconnect2mpd.pid"}
 
@@ -57,7 +59,14 @@ start_precmd="qobuzconnect2mpd_precmd"
 qobuzconnect2mpd_precmd()
 {
 	# Created as root before rc.subr drops privileges.
-	/usr/bin/install -d -o "${qobuzconnect2mpd_user}" -m 0755 "${qobuzconnect2mpd_pidfile%/*}"
+	if ! /usr/bin/id "${qobuzconnect2mpd_user}" >/dev/null 2>&1; then
+		err 1 "user ${qobuzconnect2mpd_user} does not exist"
+	fi
+	if ! /usr/bin/getent group "${qobuzconnect2mpd_group}" >/dev/null 2>&1; then
+		err 1 "group ${qobuzconnect2mpd_group} does not exist"
+	fi
+	/usr/bin/install -d -o "${qobuzconnect2mpd_user}" -g "${qobuzconnect2mpd_group}" -m 0700 "${qobuzconnect2mpd_homedir}"
+	/usr/bin/install -d -o "${qobuzconnect2mpd_user}" -g "${qobuzconnect2mpd_group}" -m 0755 "${qobuzconnect2mpd_pidfile%/*}"
 }
 
 run_rc_command "$1"

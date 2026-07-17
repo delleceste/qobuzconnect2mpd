@@ -19,15 +19,10 @@ available.
 From the source tree:
 
 ```sh
-cp conf/qobuzconnect2mpd.conf.example conf/qobuzconnect2mpd.conf
 meson setup build -Dinit_system=freebsd --prefix=/usr/local
 ninja -C build
 meson test -C build --print-errorlogs
 ```
-
-`conf/qobuzconnect2mpd.conf` is the live configuration for this checkout and is
-ignored by Git. Keep the checkout at a stable path: Meson records this config's
-absolute path in the generated `rc.d` script.
 
 `-Dinit_system=freebsd` forces FreeBSD `rc.d` support.  On a native FreeBSD
 host, `-Dinit_system=auto` also selects it automatically:
@@ -52,10 +47,17 @@ This installs:
 |------|---------|
 | `/usr/local/bin/qobuzconnect2mpd` | daemon executable |
 | `/usr/local/etc/rc.d/qobuzconnect2mpd` | FreeBSD service script |
+| `/usr/local/etc/qobuzconnect2mpd.conf.sample` | sample daemon configuration |
 
-If you use a different `--prefix`, the paths follow that prefix. Meson does not
-install or overwrite a live configuration. The service defaults to the ignored
-`conf/qobuzconnect2mpd.conf` in the source checkout used at configure time.
+If you use a different `--prefix`, the installed binary, service script, and
+sample configuration follow that prefix. Meson does not install or overwrite a
+live configuration. The service defaults to `/usr/local/etc/qobuzconnect2mpd.conf`.
+
+On a direct FreeBSD install, Meson also creates the unprivileged
+`qobuzconnect2mpd` user and group, then creates `/var/db/qobuzconnect2mpd`
+owned by that account with mode `0700`. This setup is skipped when installing
+into `DESTDIR`, so package builds can stage files without mutating the build
+host.
 
 ## Configure MPD
 
@@ -82,11 +84,11 @@ service musicpd restart
 
 ## Configure qobuzconnect2mpd
 
-Edit the checkout-local configuration copied from the tracked template during
-the build step:
+Create and edit the live configuration from the installed sample:
 
 ```sh
-ee /path/to/qobuzconnect2mpd/conf/qobuzconnect2mpd.conf
+cp /usr/local/etc/qobuzconnect2mpd.conf.sample /usr/local/etc/qobuzconnect2mpd.conf
+ee /usr/local/etc/qobuzconnect2mpd.conf
 ```
 
 At minimum, check:
@@ -110,38 +112,52 @@ responses are reconstructed for MusicPD. Direct `/file/url` responses and the
 classic `track/getFileUrl` endpoint are compatibility fallbacks. No Qobuz
 username or password belongs in the configuration.
 
-## Create the service account
+## Service account
 
-The installed `rc.d` script defaults to the unprivileged
-`qobuzconnect2mpd` account and `/var/db/qobuzconnect2mpd` as its home:
+The installed `rc.d` script defaults to the unprivileged `qobuzconnect2mpd`
+account and `/var/db/qobuzconnect2mpd` as its home. A direct `ninja install`
+creates them automatically. If you installed into `DESTDIR` or are assembling a
+package manually, create them on the target system:
 
 ```sh
+pw groupadd qobuzconnect2mpd
 pw useradd qobuzconnect2mpd -d /var/db/qobuzconnect2mpd -s /usr/sbin/nologin
 install -d -o qobuzconnect2mpd -g qobuzconnect2mpd -m 700 /var/db/qobuzconnect2mpd
-chown qobuzconnect2mpd:qobuzconnect2mpd /path/to/qobuzconnect2mpd/conf/qobuzconnect2mpd.conf
-chmod 600 /path/to/qobuzconnect2mpd/conf/qobuzconnect2mpd.conf
+chown root:qobuzconnect2mpd /usr/local/etc/qobuzconnect2mpd.conf
+chmod 640 /usr/local/etc/qobuzconnect2mpd.conf
 ```
 
-The service user also needs execute permission on each parent directory of the
-source checkout so it can read that configuration.
+Use mode `600` and owner `qobuzconnect2mpd:qobuzconnect2mpd` instead if the
+configuration contains secrets that only the daemon should read.
 
-For the simplest first login, temporarily give the service account a usable
-shell, run the daemon in the foreground as that account, open the printed OAuth
-URL, and stop it after the token has been saved. The callback URL is valid for
-five minutes and one successful exchange. The cached token is created with mode
-`0600`.
+OAuth does not require running a browser as the service account. The daemon
+prints a one-time login URL, you open that URL in any browser that can reach the
+daemon host, and the running daemon receives the callback and writes the token
+as `qobuzconnect2mpd`.
+
+For the most direct first login, temporarily give the service account a usable
+shell, run the daemon in the foreground as that account, copy the printed OAuth
+URL into your browser, and stop it after the token has been saved. The callback
+URL is valid for five minutes and one successful exchange. The cached token is
+created with mode `0600`.
+
+Do not use `su - qobuzconnect2mpd`: the account normally has
+`/usr/sbin/nologin` as its shell, which produces `This account is currently not
+available.` Change the shell temporarily and quote the command passed to `su
+-c` so the daemon receives its `-c /usr/local/etc/qobuzconnect2mpd.conf`
+arguments.
 
 ```sh
 pw usermod qobuzconnect2mpd -s /bin/sh
 su -m qobuzconnect2mpd -c \
   'HOME=/var/db/qobuzconnect2mpd /usr/local/bin/qobuzconnect2mpd \
-  -c /path/to/qobuzconnect2mpd/conf/qobuzconnect2mpd.conf'
+  -c /usr/local/etc/qobuzconnect2mpd.conf'
 pw usermod qobuzconnect2mpd -s /usr/sbin/nologin
 ```
 
-Alternatively, start the service and find the same first-run URL in syslog
-(normally `/var/log/messages`). Restart the foreground process or service to
-generate a new URL if the callback expires.
+Alternatively, start the service normally and copy the same first-run URL from
+syslog (normally `/var/log/messages`) into your browser. Restart the foreground
+process or service to generate a new URL if the callback expires.
 
 ## Enable the service
 
@@ -155,8 +171,9 @@ The generated rc script uses values equivalent to:
 
 ```sh
 qobuzconnect2mpd_user="qobuzconnect2mpd"
+qobuzconnect2mpd_group="qobuzconnect2mpd"
 qobuzconnect2mpd_homedir="/var/db/qobuzconnect2mpd"
-qobuzconnect2mpd_config="/absolute/path/to/checkout/conf/qobuzconnect2mpd.conf"
+qobuzconnect2mpd_config="/usr/local/etc/qobuzconnect2mpd.conf"
 qobuzconnect2mpd_flags=""
 ```
 
@@ -171,6 +188,7 @@ To use a different service account or home directory:
 
 ```sh
 sysrc qobuzconnect2mpd_user=another-account
+sysrc qobuzconnect2mpd_group=another-group
 sysrc qobuzconnect2mpd_homedir=/var/db/another-account
 ```
 

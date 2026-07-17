@@ -429,15 +429,19 @@ On FreeBSD this is selected automatically; it can also be forced manually:
 meson setup build -Dinit_system=freebsd --prefix=/usr/local
 ninja -C build
 ninja -C build install
-cp conf/qobuzconnect2mpd.conf.example conf/qobuzconnect2mpd.conf
-# Edit conf/qobuzconnect2mpd.conf before starting the service.
+cp /usr/local/etc/qobuzconnect2mpd.conf.sample /usr/local/etc/qobuzconnect2mpd.conf
+# Edit /usr/local/etc/qobuzconnect2mpd.conf before starting the service.
 sysrc qobuzconnect2mpd_enable=YES
 service qobuzconnect2mpd start
 ```
 
-The generated `rc.d` script points to the live, ignored configuration in the
-source checkout. Meson does not install that file. Keep the checkout at its
-configured path, or override `qobuzconnect2mpd_config` in `rc.conf`.
+The generated `rc.d` script defaults to `/usr/local/etc/qobuzconnect2mpd.conf`.
+Meson installs `/usr/local/etc/qobuzconnect2mpd.conf.sample`, but does not
+install or overwrite the live configuration. The FreeBSD install step also
+creates the unprivileged `qobuzconnect2mpd` account and
+`/var/db/qobuzconnect2mpd` state directory when not installing into `DESTDIR`.
+Override `qobuzconnect2mpd_config`, `qobuzconnect2mpd_user`, or
+`qobuzconnect2mpd_homedir` in `rc.conf` if needed.
 
 See [howto-Freebsd.md](howto-Freebsd.md) for the full FreeBSD installation,
 configuration, service management, and troubleshooting guide.

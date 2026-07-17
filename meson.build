@@ -263,9 +263,6 @@ qobuzconnect2mpd_bin = join_paths(
   get_option('bindir'),
   'qobuzconnect2mpd',
 )
-# Continuous-development layout: the real config is ignored by Git and read
-# directly from the checkout beside its tracked .example template.
-qobuzconnect2mpd_config = meson.current_source_dir() / 'conf' / 'qobuzconnect2mpd.conf'
 
 init_system = get_option('init_system')
 if init_system == 'auto'
@@ -291,6 +288,12 @@ if init_system == 'systemd'
 
   install_data(systemd_unit, install_dir: get_option('datadir') / 'systemd/user')
 elif init_system == 'freebsd'
+  qobuzconnect2mpd_config = join_paths(
+    get_option('prefix'),
+    get_option('sysconfdir'),
+    'qobuzconnect2mpd.conf',
+  )
+
   freebsd_conf = configuration_data()
   freebsd_conf.set('PREFIX', get_option('prefix'))
   freebsd_conf.set('BINDIR', join_paths(get_option('prefix'), get_option('bindir')))
@@ -307,6 +310,18 @@ elif init_system == 'freebsd'
     install_dir: get_option('sysconfdir') / 'rc.d',
     rename: 'qobuzconnect2mpd',
     install_mode: 'rwxr-xr-x',
+  )
+
+  install_data(
+    'conf/qobuzconnect2mpd.conf.example',
+    install_dir: get_option('sysconfdir'),
+    rename: 'qobuzconnect2mpd.conf.sample',
+  )
+
+  meson.add_install_script(
+    'freebsd/install-service-account.sh',
+    'qobuzconnect2mpd',
+    '/var/db/qobuzconnect2mpd',
   )
 endif
 
