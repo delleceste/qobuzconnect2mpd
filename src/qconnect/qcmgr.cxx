@@ -679,6 +679,8 @@ void QcManager::onSetState(uint64_t command_id, PlayingState ps,
                 superseded = m_pending_playback.command_id;
             m_pending_playback.active = true;
             m_pending_playback.command_id = command_id;
+            m_pending_playback.queue_generation =
+                m_queue_load_generation.load(std::memory_order_relaxed);
             m_pending_playback.state = ps;
             m_pending_playback.has_target = current_item.has_queue_item_id;
             m_pending_playback.target_qid = current_item.queue_item_id;
@@ -690,6 +692,15 @@ void QcManager::onSetState(uint64_t command_id, PlayingState ps,
         return;
     }
 
+    uint64_t superseded = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_pending_mutex);
+        if (m_pending_playback.active) {
+            superseded = m_pending_playback.command_id;
+            m_pending_playback = PendingPlayback{};
+        }
+    }
+    completeSetState(superseded);
     applyPlaybackCommand(ps, current_item.has_queue_item_id,
                          current_item.queue_item_id, has_position, position_ms,
                          command_id);
@@ -805,16 +816,18 @@ void QcManager::onQueueState(const MsgQueueState& queue) {
                                                    std::memory_order_relaxed)) {
         start_idx = m_session_track_index.load(std::memory_order_relaxed);
     }
-    enqueueQueueLoad(effective_tracks, start_idx, queue.queue_version);
+    enqueueQueueLoad(effective_tracks, start_idx, queue.queue_version, false);
 }
 
 void QcManager::onQueueLoad(const MsgQueueLoadTracks& queue) {
     if (!m_ws_active.load(std::memory_order_relaxed)) return;
     if (queue.has_shuffle_on)
         m_shuffle_on.store(queue.shuffle_on, std::memory_order_relaxed);
+    // QueueLoadTracks is the controller's replace-and-play action. QueueState
+    // is only a snapshot and deliberately uses the non-playing path above.
     enqueueQueueLoad(queue.tracks,
                      queue.has_queue_position ? queue.queue_position : 0,
-                     queue.queue_version);
+                     queue.queue_version, true);
 }
 
 void QcManager::onQueueCleared(const MsgQueueCleared& update) {
@@ -845,7 +858,8 @@ void QcManager::onQueueCleared(const MsgQueueCleared& update) {
 
 void QcManager::enqueueQueueLoad(const std::vector<QueueTrack>& tracks,
                                  uint32_t start_idx,
-                                 const QueueVersion& queue_version) {
+                                 const QueueVersion& queue_version,
+                                 bool play_when_ready) {
     if (tracks.empty()) {
         MsgQueueCleared cleared;
         cleared.queue_version = queue_version;
@@ -863,29 +877,41 @@ void QcManager::enqueueQueueLoad(const std::vector<QueueTrack>& tracks,
         m_async_tasks.clear();
     }
 
-    uint64_t abandoned_command = 0;
-    {
-        std::lock_guard<std::mutex> lk(m_pending_mutex);
-        if (m_pending_playback.active && m_pending_playback.has_target) {
-            bool target_present = std::any_of(
-                tracks.begin(), tracks.end(), [this](const QueueTrack& track) {
-                    return track.queue_item_id == m_pending_playback.target_qid;
-                });
-            if (!target_present) {
-                abandoned_command = m_pending_playback.command_id;
-                m_pending_playback = PendingPlayback{};
-            }
-        }
-    }
-    completeSetState(abandoned_command);
-
     // Stop the previous QConnect item while resolving the new current URL, but
     // keep it available for MpdCtl's transactional rollback.
+    uint64_t superseded_command = 0;
     {
         std::lock_guard<std::mutex> apply_lk(m_queue_apply_mutex);
         if (generation !=
             m_queue_load_generation.load(std::memory_order_relaxed))
             return;
+        {
+            std::lock_guard<std::mutex> lk(m_pending_mutex);
+            if (play_when_ready) {
+                if (m_pending_playback.active)
+                    superseded_command = m_pending_playback.command_id;
+                m_pending_playback = PendingPlayback{};
+                m_pending_playback.active = true;
+                m_pending_playback.queue_generation = generation;
+                m_pending_playback.state = PlayingState::PLAYING;
+                m_pending_playback.has_target = true;
+                m_pending_playback.target_qid =
+                    tracks[start_idx].queue_item_id;
+            } else if (m_pending_playback.active &&
+                       m_pending_playback.has_target) {
+                bool target_present = std::any_of(
+                    tracks.begin(), tracks.end(), [this](const QueueTrack& track) {
+                        return track.queue_item_id ==
+                               m_pending_playback.target_qid;
+                    });
+                if (!target_present) {
+                    superseded_command = m_pending_playback.command_id;
+                    m_pending_playback = PendingPlayback{};
+                }
+            }
+            if (m_pending_playback.active)
+                m_pending_playback.queue_generation = generation;
+        }
         {
             std::lock_guard<std::mutex> lk(m_qmap_mutex);
             m_all_queue_item_ids.clear();
@@ -897,6 +923,10 @@ void QcManager::enqueueQueueLoad(const std::vector<QueueTrack>& tracks,
         if (m_mpd && !m_mpd->stop())
             LOGERR("QcManager: could not stop old queue before replacement\n");
     }
+    completeSetState(superseded_command);
+    if (play_when_ready)
+        LOGINF("QcManager: queue load will start playback at item "
+               << start_idx << "\n");
     QueueOp op;
     op.type = QueueOp::Type::Load;
     op.generation = generation;
@@ -1423,6 +1453,7 @@ void QcManager::queueLoadLoop() {
             {
                 std::lock_guard<std::mutex> lk(m_pending_mutex);
                 if (m_pending_playback.active &&
+                    m_pending_playback.queue_generation == op.generation &&
                     m_pending_playback.has_target &&
                     std::find(op.item_ids.begin(), op.item_ids.end(),
                               m_pending_playback.target_qid) != op.item_ids.end()) {
@@ -1601,7 +1632,7 @@ void QcManager::queueLoadLoop() {
 
             commitQueueVersion(op.queue_version);
             prioritizeCurrentDownloads();
-            applyPendingPlayback();
+            applyPendingPlayback(op.generation);
             refreshMpdState();
             for (size_t i = 0; i < op.tracks.size(); ++i) {
                 if (titles[i].empty())
@@ -1619,7 +1650,8 @@ void QcManager::queueLoadLoop() {
             uint64_t abandoned_command = 0;
             {
                 std::lock_guard<std::mutex> lk(m_pending_mutex);
-                if (m_pending_playback.active) {
+                if (m_pending_playback.active &&
+                    m_pending_playback.queue_generation == op.generation) {
                     abandoned_command = m_pending_playback.command_id;
                     m_pending_playback = PendingPlayback{};
                 }
@@ -1630,7 +1662,9 @@ void QcManager::queueLoadLoop() {
 
         {
             std::lock_guard<std::mutex> lk(m_pending_mutex);
-            if (m_pending_playback.active && m_pending_playback.has_target) {
+            if (m_pending_playback.active &&
+                m_pending_playback.queue_generation == op.generation &&
+                m_pending_playback.has_target) {
                 auto requested = std::find_if(
                     op.remaining_indices.begin(), op.remaining_indices.end(),
                     [&](size_t index) {
@@ -1761,7 +1795,7 @@ void QcManager::queueLoadLoop() {
         }
         if (queue_changed) {
             prioritizeCurrentDownloads();
-            applyPendingPlayback();
+            applyPendingPlayback(op.generation);
             refreshMpdState();
         }
 
@@ -1784,7 +1818,8 @@ void QcManager::queueLoadLoop() {
             uint64_t abandoned_command = 0;
             {
                 std::lock_guard<std::mutex> lk(m_pending_mutex);
-                if (m_pending_playback.active) {
+                if (m_pending_playback.active &&
+                    m_pending_playback.queue_generation == load_generation) {
                     abandoned_command = m_pending_playback.command_id;
                     m_pending_playback = PendingPlayback{};
                 }
@@ -1956,14 +1991,17 @@ bool QcManager::prepareSegmentedSeek(int mpd_position,
     return true;
 }
 
-void QcManager::applyPendingPlayback() {
+void QcManager::applyPendingPlayback(uint64_t queue_generation) {
     PendingPlayback command;
     bool applied = false;
     {
         std::lock_guard<std::mutex> apply_lk(m_queue_apply_mutex);
+        if (queueLoadAborted(queue_generation)) return;
         {
             std::lock_guard<std::mutex> lk(m_pending_mutex);
             if (!m_pending_playback.active) return;
+            if (m_pending_playback.queue_generation != queue_generation)
+                return;
             if (m_pending_playback.has_target &&
                 mpdPosForQueueItem(m_pending_playback.target_qid) < 0)
                 return;

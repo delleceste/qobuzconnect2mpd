@@ -166,8 +166,9 @@ private:
 
     void enqueueQueueLoad(const std::vector<QueueTrack>& tracks,
                           uint32_t start_idx,
-                          const QueueVersion& queue_version);
-    void applyPendingPlayback();
+                          const QueueVersion& queue_version,
+                          bool play_when_ready);
+    void applyPendingPlayback(uint64_t queue_generation);
     bool applyPlaybackCommand(PlayingState state, bool has_target,
                               uint64_t target_qid, bool has_position,
                               uint32_t position_ms, uint64_t command_id);
@@ -268,6 +269,7 @@ private:
     struct PendingPlayback {
         bool         active{false};
         uint64_t     command_id{0};
+        uint64_t     queue_generation{0};
         PlayingState state{PlayingState::UNKNOWN};
         bool         has_target{false};
         uint64_t     target_qid{0};
