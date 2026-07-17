@@ -22,6 +22,9 @@
 
 #ifdef MDU_INCLUDE_LOG
 #  include MDU_INCLUDE_LOG
+#  ifndef LOGTRC
+#    define LOGTRC LOGDEB2
+#  endif
 #else
 #  include <cstdlib>
 #  include <ctime>
@@ -37,15 +40,21 @@ extern std::ofstream g_qc_log_file;
 extern std::mutex    g_qc_log_mutex;
 
 // Verbosity level, defined in main.cxx (default QC_LOG_ERROR). Higher levels
-// include all lower ones. Set from qconnectloglevel, -v/--debug, QC_DEBUG, or
+// include all lower ones. Set from qconnectloglevel, -v/-vv, QC_DEBUG, or
 // the QC_LOGLEVEL environment variable.
 //   0 = errors only (LOGERR)         — the default, minimal output
 //   1 = + info/normal (LOGINF/LOGSTD)
-//   2 = + debug trace (LOGDEB)
+//   2 = + debug diagnostics (LOGDEB)
+//   3 = + high-frequency trace (LOGTRC)
 extern int g_qc_log_level;
 
 namespace QConnect {
-enum { QC_LOG_ERROR = 0, QC_LOG_INFO = 1, QC_LOG_DEBUG = 2 };
+enum {
+    QC_LOG_ERROR = 0,
+    QC_LOG_INFO = 1,
+    QC_LOG_DEBUG = 2,
+    QC_LOG_TRACE = 3
+};
 
 inline std::string qcTimestamp() {
     time_t t = time(nullptr);
@@ -98,6 +107,17 @@ inline std::string qcTimestamp() {
              std::ostringstream _s; _s << X; \
              std::lock_guard<std::mutex> _lk(g_qc_log_mutex); \
              g_qc_log_file << QConnect::qcTimestamp() << " [DEB] " << _s.str() << std::flush; \
+         } \
+     } while(0)
+#  endif
+
+// LOGTRC — high-frequency log-file trace, emitted at level >= QC_LOG_TRACE (3).
+#  ifndef LOGTRC
+#    define LOGTRC(X) do { \
+         if (g_qc_log_level >= QConnect::QC_LOG_TRACE && g_qc_log_file.is_open()) { \
+             std::ostringstream _s; _s << X; \
+             std::lock_guard<std::mutex> _lk(g_qc_log_mutex); \
+             g_qc_log_file << QConnect::qcTimestamp() << " [TRC] " << _s.str() << std::flush; \
          } \
      } while(0)
 #  endif

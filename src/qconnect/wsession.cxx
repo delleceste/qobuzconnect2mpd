@@ -427,7 +427,7 @@ void WSession::reportState(const QueueRendererState& state) {
     if (m_last_state.queue_version.present)
         s.queue_version = m_last_state.queue_version;
     m_last_state = s;
-    LOGDEB("WSession: reportState pos_ms=" << s.state.current_position_ms
+    LOGTRC("WSession: reportState pos_ms=" << s.state.current_position_ms
            << " buf=" << static_cast<int>(s.state.buffer_state)
            << " qver=" << s.queue_version.major << "." << s.queue_version.minor << "\n");
     int bid = nextBatchId(m_batch_id);
@@ -1019,7 +1019,7 @@ void WSession::dispatchMessage(const Message& msg) {
         break;
 
     case MsgType::SRVRC_RENDERER_STATE_UPD:
-        LOGDEB("WSession: RendererStateUpdated id="
+        LOGTRC("WSession: RendererStateUpdated id="
                << msg.renderer_state_upd.renderer_id << "\n");
         if (msg.renderer_state_upd.renderer_id != m_renderer_id && !m_is_active) {
             m_pending_restore_state = msg.renderer_state_upd.state;

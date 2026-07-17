@@ -429,7 +429,7 @@ void MdnsAnnouncer::loop() {
             std::string ifaddr = getIfaceAddr(m_iface);
             if (!ifaddr.empty()) {
                 sendPacket(ifaddr, false);
-                LOGDEB("MdnsAnnouncer: announced " << m_instance
+                LOGTRC("MdnsAnnouncer: announced " << m_instance
                        << " at " << ifaddr << ":" << m_port << "\n");
             } else {
                 LOGDEB("MdnsAnnouncer: no usable interface found, skipping\n");

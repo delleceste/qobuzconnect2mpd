@@ -1192,7 +1192,7 @@ void QcManager::onMpdState(const MpdState& st) {
         break;
     }
 
-    LOGDEB("QcManager: reportState state=" << static_cast<int>(qrs.state.playing_state)
+    LOGTRC("QcManager: reportState state=" << static_cast<int>(qrs.state.playing_state)
            << " pos_ms=" << qrs.state.current_position_ms
            << " dur_ms=" << qrs.state.duration_ms
            << " qitem=" << qrs.state.current_queue_item_id << "\n");

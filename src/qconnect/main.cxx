@@ -39,10 +39,11 @@
 //   mpdhost / mpdport / mpdpassword
 //
 // Usage:
-//   qconnect2mpd [-c configfile] [-d] [-v]
+//   qconnect2mpd [-c configfile] [-d] [-v|-vv]
 //     -c  path to upmpdcli config file
 //     -d  daemonise (fork to background)
 //     -v  enable debug logging (same as qconnectloglevel=debug)
+//     -vv enable high-frequency trace logging
 
 #include "qcmgr.hxx"
 #include "qclog.hxx"
@@ -96,7 +97,7 @@ int main(int argc, char* argv[]) {
     std::string config_file = "/etc/upmpdcli.conf";
     std::string status_file_arg;
     bool daemonise = false;
-    bool debug_logging = false;
+    int verbosity = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-c") && i + 1 < argc) {
@@ -105,11 +106,19 @@ int main(int argc, char* argv[]) {
             daemonise = true;
         } else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
             status_file_arg = argv[++i];
-        } else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--debug")) {
-            debug_logging = true;
+        } else if (argv[i][0] == '-' && argv[i][1] == 'v' &&
+                   argv[i][2] != '\0' &&
+                   strspn(argv[i] + 1, "v") == strlen(argv[i] + 1)) {
+            verbosity += static_cast<int>(strlen(argv[i] + 1));
+        } else if (!strcmp(argv[i], "-v")) {
+            ++verbosity;
+        } else if (!strcmp(argv[i], "--debug")) {
+            if (verbosity < 1) verbosity = 1;
+        } else if (!strcmp(argv[i], "--trace")) {
+            if (verbosity < 2) verbosity = 2;
         } else {
             std::cerr << "Usage: " << argv[0]
-                      << " [-c configfile] [-d] [-o statusfile] [-v|--debug]\n";
+                      << " [-c configfile] [-d] [-o statusfile] [-v|-vv]\n";
             return 1;
         }
     }
@@ -141,6 +150,8 @@ int main(int argc, char* argv[]) {
             return QC_LOG_INFO;
         if (value == "2" || value == "debug" || value == "deb")
             return QC_LOG_DEBUG;
+        if (value == "3" || value == "trace" || value == "trc")
+            return QC_LOG_TRACE;
         return fallback;
     };
     g_qc_log_level = parseLogLevel(
@@ -151,7 +162,9 @@ int main(int argc, char* argv[]) {
         debug && *debug && std::string(debug) != "0") {
         g_qc_log_level = QC_LOG_DEBUG;
     }
-    if (debug_logging)
+    if (verbosity >= 2)
+        g_qc_log_level = QC_LOG_TRACE;
+    else if (verbosity == 1)
         g_qc_log_level = QC_LOG_DEBUG;
 
     QcConfig qcfg;

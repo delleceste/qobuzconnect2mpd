@@ -39,8 +39,8 @@ qconnectstatusfile = /tmp/qconnect2mpd-status.txt
 # /tmp is writable by any user; change to a persistent location if preferred.
 qconnectlogfile = /tmp/qconnect2mpd.log
 
-# Log verbosity: error (default), info, or debug. -v/--debug, QC_LOGLEVEL, or
-# QC_DEBUG=1 can enable debug logging for an individual run.
+# Log verbosity: error (default), info, debug, or trace. -v enables debug;
+# -vv enables trace. QC_LOGLEVEL or QC_DEBUG=1 can override an individual run.
 #qconnectloglevel = info
 
 # Unix socket path for IPC coordination with upmpdcli.

@@ -74,21 +74,22 @@ install or overwrite the live configuration.
 | `qconnectcfvalue` | value of `qobuzcfvalue` | Qobuz app secret (auto-fetched if empty) |
 | `qconnectstatusfile` | *(none)* | Path for the now-playing status file; the sample uses `/tmp/qconnect2mpd-status.txt` |
 | `qconnectlogfile` | *(none)* | Path for the log file; the sample uses `/tmp/qconnect2mpd.log` |
-| `qconnectloglevel` | `error` | QConnect log verbosity: `error`, `info`, or `debug` |
+| `qconnectloglevel` | `error` | QConnect log verbosity: `error`, `info`, `debug`, or `trace` |
 
 ## Usage
 
 ```
-qobuzconnect2mpd [-c configfile] [-d] [-o statusfile] [-v|--debug]
+qobuzconnect2mpd [-c configfile] [-d] [-o statusfile] [-v|-vv]
 
   -c configfile   Path to configuration file (default: /etc/upmpdcli.conf)
   -d              Daemonise (fork to background)
   -o statusfile   Write now-playing status to this file (updated every second);
                   overrides qconnectstatusfile in the config file
   -v, --debug     Enable debug logging for this run
+  -vv, --trace    Also log high-frequency state synchronization and mDNS traces
 ```
 
-Debug traces are written to `qconnectlogfile`, not stdout.
+Debug and trace records are written to `qconnectlogfile`, not stdout.
 
 ### Startup log
 
@@ -157,8 +158,12 @@ FLAC header and is fetched before the 31 audio segments shown here.
 The compact audio triplet is `sample-rate,bits-per-sample,channels`, read from
 FLAC STREAMINFO during reconstruction and from MusicPD when playback begins.
 
-Log levels: `[OUT]` normal output, `[INF]` informational, `[DEB]` debug, and
-`[ERR]` errors.
+Trace level additionally logs per-second MusicPD/Qobuz position reports,
+renderer-state acknowledgements, and periodic mDNS announcements. Use `-vv`,
+`--trace`, `qconnectloglevel=trace`, or `QC_LOGLEVEL=trace` to enable it.
+
+Log levels: `[OUT]` normal output, `[INF]` informational, `[DEB]` debug,
+`[TRC]` high-frequency trace, and `[ERR]` errors.
 The file is truncated (not appended) on each daemon restart, so the log always
 reflects the current session only.
 
