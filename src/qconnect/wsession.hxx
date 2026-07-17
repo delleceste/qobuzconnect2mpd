@@ -135,6 +135,7 @@ private:
     void postCallback(std::function<void()> callback);
     void stopCallbackWorker();
     void maybeRestoreState();
+    bool sendTransportPing();
     bool sendHeartbeat();
     void dispatchMessage(const Message& msg);
 
@@ -195,8 +196,9 @@ private:
     std::atomic<int32_t> m_batch_id{0};
     uint64_t             m_msg_id{1};
 
-    static constexpr int HEARTBEAT_INTERVAL_S = 10;
-    static constexpr int RECV_TIMEOUT_MS      = 500;
+    static constexpr int TRANSPORT_PING_INTERVAL_S = 20;
+    static constexpr int HEARTBEAT_INTERVAL_S      = 10;
+    static constexpr int RECV_TIMEOUT_MS           = 500;
 };
 
 } // namespace QConnect

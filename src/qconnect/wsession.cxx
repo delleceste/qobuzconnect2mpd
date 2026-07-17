@@ -91,6 +91,9 @@ bool WSession::connect(const ConnectCredentials& creds) {
     curl_easy_setopt(m_curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(m_curl, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(m_curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(m_curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(m_curl, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(m_curl, CURLOPT_TCP_KEEPINTVL, 15L);
     // Required for WebSocket to be enabled in curl (experimental flag guard)
     curl_easy_setopt(m_curl, CURLOPT_PROTOCOLS_STR, "wss,ws");
 
@@ -496,6 +499,12 @@ bool WSession::sendHeartbeat() {
     return sendRaw(buildStateUpdated(now, nextBatchId(m_batch_id), state));
 }
 
+bool WSession::sendTransportPing() {
+    // State heartbeats are intentionally limited to the active renderer. Keep
+    // an inactive session alive as well so the cloud or an intermediary does
+    // not reap an otherwise silent upgraded connection.
+    return enqueueFrame(Bytes{'q', 'c', '2', 'm', 'p', 'd'}, CURLWS_PING);
+}
 
 void WSession::eventLoop() {
     curl_socket_t sockfd = CURL_SOCKET_BAD;
@@ -506,7 +515,8 @@ void WSession::eventLoop() {
         m_stop = true;
     }
 
-    auto last_heartbeat = std::chrono::steady_clock::now();
+    auto last_transport_ping = std::chrono::steady_clock::now();
+    auto last_heartbeat = last_transport_ping;
     constexpr size_t BUFSIZE = 65536;
     std::vector<uint8_t> buf(BUFSIZE);
     Bytes incoming_frame;
@@ -608,6 +618,12 @@ void WSession::eventLoop() {
         }
 
         auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(
+                now - last_transport_ping).count() >=
+            TRANSPORT_PING_INTERVAL_S) {
+            sendTransportPing();
+            last_transport_ping = now;
+        }
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 now - last_heartbeat).count() >= HEARTBEAT_INTERVAL_S) {
             sendHeartbeat();
