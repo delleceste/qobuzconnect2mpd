@@ -58,11 +58,31 @@ static std::string formatMs(uint32_t ms) {
     return buf;
 }
 
-void QcManager::printNowPlaying(const std::string& title, const std::string& local_path) {
-    std::cout << "\033[1;32m▶  " << title << "\033[0m\n";
-    LOGINF("▶  " << title << "\n");
-    if (!local_path.empty())
-        std::cout << "   \033[2m" << local_path << "\033[0m\n";
+static std::string compactAudioFormat(const MpdState& state) {
+    if (state.sample_rate == 0) return {};
+    std::string value = std::to_string(state.sample_rate);
+    if (state.bits > 0) value += "," + std::to_string(state.bits);
+    if (state.channels > 0) value += "," + std::to_string(state.channels);
+    return value;
+}
+
+void QcManager::printNowPlaying(const std::string& title,
+                                const std::string& local_path,
+                                const std::string& audio_format) {
+    if (!title.empty())
+        std::cout << "\033[1;32m▶  " << title << "\033[0m\n";
+    if (!local_path.empty()) {
+        std::cout << "   \033[2mtrack " << local_path;
+        if (!audio_format.empty()) std::cout << " [" << audio_format << "]";
+        std::cout << " playing...\033[0m\n";
+        LOGINF("track " << local_path
+               << (audio_format.empty() ? std::string{} :
+                   " [" + audio_format + "]")
+               << " playing"
+               << (title.empty() ? std::string{} : ": " + title) << "\n");
+    } else if (!title.empty()) {
+        LOGINF("playing: " << title << "\n");
+    }
     std::cout << std::flush;
     // Decoded format is populated from MusicPD's status response.
     {
@@ -117,14 +137,17 @@ static void removeMaterializedFile(const std::string& path) {
 
 static void removeAllMaterializedFiles() {
     namespace fs = std::filesystem;
-    const fs::path dir("/tmp/qconnect2mpd-segmented");
-    std::error_code ec;
-    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec))
-        return;
-    for (const auto& entry : fs::directory_iterator(dir, ec)) {
-        if (ec) break;
-        fs::remove_all(entry.path(), ec);
-        ec.clear();
+    for (const fs::path& dir : {
+             fs::path(segmentedCacheDirectory()),
+             fs::path("/tmp/qconnect2mpd-segmented")}) {
+        std::error_code ec;
+        if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec))
+            continue;
+        for (const auto& entry : fs::directory_iterator(dir, ec)) {
+            if (ec) break;
+            fs::remove_all(entry.path(), ec);
+            ec.clear();
+        }
     }
 }
 
@@ -252,6 +275,7 @@ bool QcManager::start() {
         return false;
     }
     m_stopping.store(false, std::memory_order_release);
+    removeAllMaterializedFiles();
     // ---- Qobuz API client --------------------------------------------------
     m_api = std::make_unique<QobuzApi>(m_cfg.api_base_url,
                                         m_cfg.app_id,
@@ -1020,8 +1044,12 @@ void QcManager::onMpdState(const MpdState& st) {
     qrs.state.position_timestamp_ms = nowMs(); // record when we sampled this
     qrs.state.duration_ms          = st.duration_ms;
 
-    // Map MPD queue position to Qobuz queue_item_id; collect display info on track change.
-    std::string track_title, track_local_path;
+    // Map MPD queue position to Qobuz queue_item_id; collect display info when
+    // MusicPD starts or resumes a track.
+    const bool began_playing = st.status == MpdState::Status::PLAY &&
+        (m_last_mpd_status != MpdState::Status::PLAY ||
+         st.queue_pos != m_last_mpd_queue_pos.load(std::memory_order_relaxed));
+    std::string track_title, track_local_path, track_segment_token;
     if (st.queue_pos >= 0) {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
         if (static_cast<size_t>(st.queue_pos) < m_queue_item_ids.size()) {
@@ -1041,17 +1069,17 @@ void QcManager::onMpdState(const MpdState& st) {
             qrs.state.next_queue_item_id = m_queue_item_ids[st.next_queue_pos];
             qrs.state.has_next_queue_item_id = true;
         }
-        if (st.queue_pos != m_last_mpd_queue_pos.load() &&
-            st.status == MpdState::Status::PLAY) {
+        if (began_playing) {
             if (static_cast<size_t>(st.queue_pos) < m_track_titles.size())
                 track_title = m_track_titles[st.queue_pos];
             if (static_cast<size_t>(st.queue_pos) < m_track_local_paths.size())
                 track_local_path = m_track_local_paths[st.queue_pos];
+            if (static_cast<size_t>(st.queue_pos) < m_track_segment_tokens.size())
+                track_segment_token = m_track_segment_tokens[st.queue_pos];
         }
     }
-    // Print now-playing outside the queue-map lock.
-    if (!track_title.empty())
-        printNowPlaying(track_title, track_local_path);
+    if (track_local_path.empty() && !track_segment_token.empty())
+        track_local_path = m_seg_registry.cachePath(track_segment_token);
 
     std::string decoded_format;
     if (st.status != MpdState::Status::STOP && st.sample_rate > 0) {
@@ -1079,6 +1107,11 @@ void QcManager::onMpdState(const MpdState& st) {
         std::lock_guard<std::mutex> lk(m_status_mutex);
         m_status_format_info = std::move(decoded_format);
     }
+    // Print now-playing outside the queue-map and status locks. The compact
+    // format comes from MusicPD's decoder, so channels are authoritative here.
+    if (!track_title.empty() || !track_local_path.empty())
+        printNowPlaying(track_title, track_local_path,
+                        compactAudioFormat(st));
 
     switch (st.status) {
     case MpdState::Status::PLAY:

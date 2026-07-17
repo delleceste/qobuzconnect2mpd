@@ -6,6 +6,7 @@
  */
 
 #include "segstream.hxx"
+#include "qclog.hxx"
 
 #include <curl/curl.h>
 #include <openssl/evp.h>
@@ -26,13 +27,21 @@
 #include <thread>
 
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 namespace QConnect {
 
+const std::string& segmentedCacheDirectory() {
+    static const std::string path = "/tmp/qobuzconnect2mpd-" +
+        std::to_string(static_cast<unsigned long>(::geteuid())) + "/cache";
+    return path;
+}
+
 struct SegmentedDownloadState {
     ~SegmentedDownloadState() {
         if (fd >= 0) ::close(fd);
+        if (!cache_path.empty()) ::unlink(cache_path.c_str());
     }
 
     std::mutex mutex;
@@ -50,6 +59,7 @@ struct SegmentedDownloadState {
         static_cast<int>(SegmentedDownloadPriority::Background)};
     size_t next_segment{1};
     std::string error;
+    std::string cache_path;
 };
 
 namespace {
@@ -64,6 +74,23 @@ constexpr size_t kMaxPendingTrackDownloads = 16;
 // table is not accurate enough to reject them in advance.
 constexpr size_t kMaxRetainedCachedTracks = 8;
 constexpr uint64_t kMaxRetainedCachedBytes = uint64_t{1024} * 1024 * 1024;
+std::atomic<uint64_t> g_cache_sequence{0};
+
+static std::string makeCachePath(const SegmentedTrackPlan& plan) {
+    return segmentedCacheDirectory() + "/track_" +
+           std::to_string(plan.track_id) + "_" +
+           std::to_string(plan.format_id) + "_" +
+           std::to_string(static_cast<unsigned long>(::getpid())) + "_" +
+           std::to_string(g_cache_sequence.fetch_add(
+               1, std::memory_order_relaxed) + 1) + ".flac";
+}
+
+static std::string streamFormat(const SegmentedTrackPlan& plan) {
+    std::string format = std::to_string(plan.sampling_rate) + "," +
+        (plan.bit_depth > 0 ? std::to_string(plan.bit_depth) : "?");
+    if (plan.channels > 0) format += "," + std::to_string(plan.channels);
+    return format;
+}
 
 static int curlProgressCb(void* userdata, curl_off_t, curl_off_t,
                           curl_off_t, curl_off_t) {
@@ -217,6 +244,9 @@ struct CmafSegmentCrypto {
 struct CmafInitInfo {
     std::vector<uint8_t>  flac_header;
     std::vector<uint32_t> segment_byte_lens;
+    int sampling_rate{0};
+    int bit_depth{0};
+    int channels{0};
 };
 
 static size_t readBoxSize(const std::vector<uint8_t>& d, size_t p) {
@@ -256,6 +286,14 @@ static bool parseInitSegment(const std::vector<uint8_t>& data, CmafInitInfo& out
             // Set the "last metadata block" flag so MPD treats the STREAMINFO
             // as the final metadata block (no further headers follow).
             out.flac_header[4] |= 0x80;
+            // FLAC STREAMINFO packs sample rate (20 bits), channels-1 (3),
+            // and bits-per-sample-1 (5) into bytes 18..25 of this header.
+            uint64_t format_bits = 0;
+            for (size_t i = 18; i < 26; ++i)
+                format_bits = (format_bits << 8) | out.flac_header[i];
+            out.sampling_rate = static_cast<int>((format_bits >> 44) & 0xfffff);
+            out.channels = static_cast<int>(((format_bits >> 41) & 0x7) + 1);
+            out.bit_depth = static_cast<int>(((format_bits >> 36) & 0x1f) + 1);
             // Some valid init segments end after STREAMINFO and rely on the
             // /file/url n_segments field for the segment count.
             if (a + 1 > len) return true;
@@ -446,18 +484,20 @@ static bool openDownloadCache(
     std::string& error) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    const fs::path dir("/tmp/qconnect2mpd-segmented");
+    const fs::path dir(segmentedCacheDirectory());
     fs::create_directories(dir, ec);
     if (ec) {
         error = "cannot create cache directory: " + ec.message();
         return false;
     }
+    if (::chmod(dir.c_str(), 0700) != 0) {
+        error = "cannot restrict cache directory permissions: " +
+                std::string(std::strerror(errno));
+        return false;
+    }
 
-    std::string pattern = (dir / (std::to_string(plan.track_id) + "_" +
-                           std::to_string(plan.format_id) + ".cache.XXXXXX")).string();
-    std::vector<char> path(pattern.begin(), pattern.end());
-    path.push_back('\0');
-    state->fd = ::mkstemp(path.data());
+    state->fd = ::open(state->cache_path.c_str(),
+                       O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (state->fd < 0) {
         error = "cannot create cache file: " +
                 std::string(std::strerror(errno));
@@ -468,13 +508,15 @@ static bool openDownloadCache(
                 std::string(std::strerror(errno));
         ::close(state->fd);
         state->fd = -1;
-        ::unlink(path.data());
+        ::unlink(state->cache_path.c_str());
         return false;
     }
 
-    // The open descriptor is shared by the writer and all readers.  Unlinking
-    // immediately makes cleanup automatic after the last plan/reader exits.
-    ::unlink(path.data());
+    LOGINF("QobuzApi: track " << state->cache_path << " ["
+           << streamFormat(plan) << "] reconstructing "
+           << plan.n_audio_segments()
+           << " encrypted Qobuz audio segments"
+              " (initialization segment 0 already parsed)\n");
     return true;
 }
 
@@ -574,19 +616,32 @@ static ReconstructionStep reconstructTrackStep(
             return ReconstructionStep::Finished;
         }
         ++state->next_segment;
+        const size_t segment_count = plan->n_audio_segments();
+        const unsigned percent = segment_count == 0 ? 100 :
+            static_cast<unsigned>((segment * 100) / segment_count);
+        LOGDEB("QobuzApi: track " << state->cache_path << " ["
+               << streamFormat(*plan) << "] [segment " << segment << "/"
+               << segment_count << "] in progress (" << percent << "%)\n");
     }
 
     if (state->next_segment <= plan->n_audio_segments())
         return ReconstructionStep::Continue;
 
+    uint64_t completed_size = 0;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (state->cancelled.load(std::memory_order_relaxed))
             return ReconstructionStep::Finished;
         state->exact_size = state->available;
         state->complete = true;
+        completed_size = state->exact_size;
     }
     state->changed.notify_all();
+    LOGINF("QobuzApi: track " << state->cache_path << " ["
+           << streamFormat(*plan) << "] complete: "
+           << plan->n_audio_segments() << "/"
+           << plan->n_audio_segments() << " segments, "
+           << completed_size << " bytes\n");
     return ReconstructionStep::Finished;
 }
 
@@ -884,6 +939,7 @@ SegmentedDownloadHandle scheduleSegmentedTrackDownload(
         }
         if (!state) {
             state = std::make_shared<SegmentedDownloadState>();
+            state->cache_path = makeCachePath(*plan);
             if (pin_reader)
                 state->readers.store(1, std::memory_order_relaxed);
             plan->m_download_state = state;
@@ -1196,6 +1252,14 @@ void SegmentedTrackRegistry::prioritize(const std::string& token) {
         startSegmentedTrackDownload(plan, SegmentedDownloadPriority::Upcoming);
 }
 
+std::string SegmentedTrackRegistry::cachePath(const std::string& token) const {
+    auto plan = get(token);
+    if (!plan) return {};
+    std::lock_guard<std::mutex> plan_lock(plan->m_download_mu);
+    return plan->m_download_state
+        ? plan->m_download_state->cache_path : std::string{};
+}
+
 void SegmentedTrackRegistry::clear() {
     std::vector<std::shared_ptr<SegmentedTrackPlan>> removed;
     {
@@ -1310,8 +1374,10 @@ bool buildSegmentedTrackPlan(
     }
     out.total_bytes = estimated_lengths_known ? out.flac_header.size() + acc : 0;
 
-    out.sampling_rate = sampling_rate;
-    out.bit_depth = bit_depth;
+    out.sampling_rate = init.sampling_rate > 0
+        ? init.sampling_rate : sampling_rate;
+    out.bit_depth = init.bit_depth > 0 ? init.bit_depth : bit_depth;
+    out.channels = init.channels > 0 ? init.channels : -1;
     out.duration_ms = duration_ms;
     return true;
 }

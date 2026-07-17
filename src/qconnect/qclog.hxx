@@ -37,8 +37,8 @@ extern std::ofstream g_qc_log_file;
 extern std::mutex    g_qc_log_mutex;
 
 // Verbosity level, defined in main.cxx (default QC_LOG_ERROR). Higher levels
-// include all lower ones. Set from the qconnectloglevel config key / QC_DEBUG
-// or QC_LOGLEVEL environment variables.
+// include all lower ones. Set from qconnectloglevel, -v/--debug, QC_DEBUG, or
+// the QC_LOGLEVEL environment variable.
 //   0 = errors only (LOGERR)         — the default, minimal output
 //   1 = + info/normal (LOGINF/LOGSTD)
 //   2 = + debug trace (LOGDEB)

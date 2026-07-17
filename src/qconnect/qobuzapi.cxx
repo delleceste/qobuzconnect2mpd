@@ -390,11 +390,16 @@ bool QobuzApi::planSegmentedTrack(const Json::Value& root, uint32_t track_id,
     out.mime_type    = "audio/flac";
     out.format_id    = effective_format_id;
     out.duration_ms  = duration_ms;
-    out.sampling_rate = sampling_rate;
-    out.bit_depth    = bit_depth;
-    LOGSTD("QobuzApi: track " << track_id
-           << ": planned " << plan->n_audio_segments() << " segments ("
-           << plan->total_bytes << " bytes)\n");
+    out.sampling_rate = plan->sampling_rate;
+    out.bit_depth    = plan->bit_depth;
+    LOGDEB("QobuzApi: track " << track_id << " ["
+           << plan->sampling_rate << ","
+           << (plan->bit_depth > 0 ? std::to_string(plan->bit_depth) : "?")
+           << (plan->channels > 0
+               ? "," + std::to_string(plan->channels) : std::string{})
+           << "]: planned " << plan->n_audio_segments()
+           << " encrypted audio segments for FLAC reconstruction"
+              " (estimated " << plan->total_bytes << " bytes)\n");
     return true;
 }
 
@@ -528,6 +533,16 @@ bool QobuzApi::getTrackMeta(uint32_t track_id, TrackMeta& out) {
 
     if (root.isMember("album"))
         out.album = root["album"].get("title", "").asString();
+
+    std::string label;
+    if (!out.artist.empty()) label = out.artist;
+    if (!out.title.empty()) {
+        if (!label.empty()) label += " - ";
+        label += out.title;
+    }
+    if (!out.album.empty()) label += " [" + out.album + "]";
+    if (!label.empty())
+        LOGINF("QobuzApi: track " << track_id << ": " << label << "\n");
 
     return true;
 }

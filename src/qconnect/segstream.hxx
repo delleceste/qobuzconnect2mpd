@@ -16,6 +16,10 @@
 
 namespace QConnect {
 
+// Per-effective-UID directory so tests, foreground runs, and the FreeBSD
+// service account cannot interfere with each other's caches.
+const std::string& segmentedCacheDirectory();
+
 struct SegmentedDownloadState;
 class SegmentedTrackRegistry;
 class SegmentedDownloadScheduler;
@@ -53,6 +57,7 @@ struct SegmentedTrackPlan {
 
     int      sampling_rate{44100};
     int      bit_depth{-1};
+    int      channels{-1};
     uint32_t duration_ms{0};
 
     size_t n_audio_segments() const { return segment_byte_lens.size(); }
@@ -150,6 +155,7 @@ public:
     void                              retainOnly(
         const std::unordered_set<std::string>& tokens);
     void                              prioritize(const std::string& token);
+    std::string                       cachePath(const std::string& token) const;
     void                              clear();
     size_t                            size() const;
 private:

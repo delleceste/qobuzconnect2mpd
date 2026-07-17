@@ -158,7 +158,9 @@ private:
     int posInFullQueue(uint64_t queue_item_id) const;
 
     // Console + status file
-    void printNowPlaying(const std::string& title, const std::string& local_path);
+    void printNowPlaying(const std::string& title,
+                         const std::string& local_path,
+                         const std::string& audio_format);
     void writeStatusFile();
     void statusLoop();
 

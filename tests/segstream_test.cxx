@@ -1,11 +1,19 @@
 #include "segstream.hxx"
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 #include <vector>
+
+std::ofstream g_qc_log_file;
+std::mutex g_qc_log_mutex;
+int g_qc_log_level = 0;
 
 namespace {
 
@@ -133,13 +141,53 @@ bool testRegistryRetention() {
     return true;
 }
 
+bool testVisibleCacheLifecycle() {
+    using namespace QConnect;
+    SegmentedTrackRegistry registry;
+    auto plan = makeImmediatePlan(301, "fLaC-visible-cache");
+    const auto token = SegmentedTrackRegistry::tokenForTrack(301, 6);
+    registry.registerPlan(token, plan);
+
+    auto handle = acquireSegmentedTrackDownload(plan);
+    CHECK(handle != nullptr);
+    uint64_t size = 0;
+    CHECK(waitForSegmentedTrack(handle, size, 2000));
+    CHECK(size == 18);
+
+    const std::string path = registry.cachePath(token);
+    CHECK(path.rfind(segmentedCacheDirectory() + "/track_301_6_", 0)
+          == 0);
+    CHECK(path.size() >= 5 && path.substr(path.size() - 5) == ".flac");
+    CHECK(std::filesystem::is_regular_file(path));
+    std::ifstream cache(path, std::ios::binary);
+    const std::string cached_bytes{
+        std::istreambuf_iterator<char>(cache),
+        std::istreambuf_iterator<char>()};
+    CHECK(cached_bytes == "fLaC-visible-cache");
+    const auto permissions = std::filesystem::status(path).permissions();
+    using perms = std::filesystem::perms;
+    CHECK((permissions & (perms::group_all | perms::others_all)) == perms::none);
+    const auto directory_permissions =
+        std::filesystem::status(segmentedCacheDirectory()).permissions();
+    CHECK((directory_permissions & (perms::group_all | perms::others_all)) ==
+          perms::none);
+
+    releaseSegmentedTrackDownload(handle);
+    registry.clear();
+    handle.reset();
+    plan.reset();
+    CHECK(!std::filesystem::exists(path));
+    return true;
+}
+
 } // namespace
 
 int main() {
     if (!testGrowingCacheRead() ||
         !testRetryableFailure() ||
         !testCompletedCacheLru() ||
-        !testRegistryRetention())
+        !testRegistryRetention() ||
+        !testVisibleCacheLifecycle())
         return EXIT_FAILURE;
     return EXIT_SUCCESS;
 }

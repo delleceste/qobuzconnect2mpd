@@ -79,13 +79,16 @@ install or overwrite the live configuration.
 ## Usage
 
 ```
-qobuzconnect2mpd [-c configfile] [-d] [-o statusfile]
+qobuzconnect2mpd [-c configfile] [-d] [-o statusfile] [-v|--debug]
 
   -c configfile   Path to configuration file (default: /etc/upmpdcli.conf)
   -d              Daemonise (fork to background)
   -o statusfile   Write now-playing status to this file (updated every second);
                   overrides qconnectstatusfile in the config file
+  -v, --debug     Enable debug logging for this run
 ```
+
+Debug traces are written to `qconnectlogfile`, not stdout.
 
 ### Startup log
 
@@ -103,10 +106,15 @@ When a track starts playing the daemon prints to stdout:
 
 ```
 ▶  Artist Name - Track Title
+   track /tmp/qobuzconnect2mpd-1001/cache/track_415828162_27_1234_1.flac [44100,16,2] playing...
 ```
 
-A legacy local-file stream may also include its path. Current segmented streams
-remain in the private growing cache and do not expose a persistent path.
+Segmented streams use a visible `0600` growing cache file while retained. The
+numeric component in `/tmp/qobuzconnect2mpd-<uid>/cache` is the daemon's
+effective user ID. The daemon removes the file on cache eviction or shutdown
+and clears files left by a previous crashed process on startup. The HTTP proxy
+reads the already-open descriptor for MusicPD, so removing the pathname cannot
+truncate active playback.
 
 ### Status file (`-o`)
 
@@ -128,17 +136,29 @@ When `qconnectlogfile` is set, timestamped entries are written for:
 
 - Startup events (config path, MPD connection result)
 - Now-playing track changes
+- Segmented FLAC reconstruction start and completion
 - Segment fetch errors and retries (with error reason and segment N/total)
 - Qobuz API / WebSocket connection events
 
 ```
 2026-05-15 14:32:01 [OUT] qconnect2mpd: MPD connected OK (localhost:6600)
-2026-05-15 14:32:15 [INF] ▶  Aphex Twin - Xtal
+2026-05-15 14:32:14 [INF] QobuzApi: track /tmp/qobuzconnect2mpd-1001/cache/track_415828162_27_1234_1.flac [44100,16,2] reconstructing 31 encrypted Qobuz audio segments (initialization segment 0 already parsed)
+2026-05-15 14:32:15 [INF] track /tmp/qobuzconnect2mpd-1001/cache/track_415828162_27_1234_1.flac [44100,16,2] playing: Aphex Twin - Xtal
+2026-05-15 14:32:17 [INF] QobuzApi: track /tmp/qobuzconnect2mpd-1001/cache/track_415828162_27_1234_1.flac [44100,16,2] complete: 31/31 segments, 116118901 bytes
 2026-05-15 14:35:02 [ERR] QobuzApi: segment 18/72 fetch failed (HTTP 503) for ... — retrying
 2026-05-15 14:35:07 [ERR] QobuzApi: segment 18/72 fetch failed (HTTP 503) for ... — giving up
 ```
 
-Log levels: `[OUT]` normal output, `[INF]` informational, `[ERR]` errors.
+At debug level, every reconstructed audio segment also produces a line such as
+`[segment 2/31] in progress (6%)`. This percentage counts completed media
+segments; it is not a byte percentage because Qobuz's segment byte table is
+only an estimate. Segment 0 is the initialization segment used to derive the
+FLAC header and is fetched before the 31 audio segments shown here.
+The compact audio triplet is `sample-rate,bits-per-sample,channels`, read from
+FLAC STREAMINFO during reconstruction and from MusicPD when playback begins.
+
+Log levels: `[OUT]` normal output, `[INF]` informational, `[DEB]` debug, and
+`[ERR]` errors.
 The file is truncated (not appended) on each daemon restart, so the log always
 reflects the current session only.
 

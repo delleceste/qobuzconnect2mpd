@@ -39,9 +39,10 @@
 //   mpdhost / mpdport / mpdpassword
 //
 // Usage:
-//   qconnect2mpd [-c configfile] [-d]
+//   qconnect2mpd [-c configfile] [-d] [-v]
 //     -c  path to upmpdcli config file
 //     -d  daemonise (fork to background)
+//     -v  enable debug logging (same as qconnectloglevel=debug)
 
 #include "qcmgr.hxx"
 #include "qclog.hxx"
@@ -95,6 +96,7 @@ int main(int argc, char* argv[]) {
     std::string config_file = "/etc/upmpdcli.conf";
     std::string status_file_arg;
     bool daemonise = false;
+    bool debug_logging = false;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-c") && i + 1 < argc) {
@@ -103,8 +105,11 @@ int main(int argc, char* argv[]) {
             daemonise = true;
         } else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
             status_file_arg = argv[++i];
+        } else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--debug")) {
+            debug_logging = true;
         } else {
-            std::cerr << "Usage: " << argv[0] << " [-c configfile] [-d] [-o statusfile]\n";
+            std::cerr << "Usage: " << argv[0]
+                      << " [-c configfile] [-d] [-o statusfile] [-v|--debug]\n";
             return 1;
         }
     }
@@ -146,6 +151,8 @@ int main(int argc, char* argv[]) {
         debug && *debug && std::string(debug) != "0") {
         g_qc_log_level = QC_LOG_DEBUG;
     }
+    if (debug_logging)
+        g_qc_log_level = QC_LOG_DEBUG;
 
     QcConfig qcfg;
 
