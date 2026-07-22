@@ -34,9 +34,12 @@
 //                          set false for cloud-only operation)
 //
 //   # Persistent state (OAuth token + device UUID) — one directory:
-//   qconnectstatedir       Directory holding user_token and device.uuid
-//                          (default: $XDG_STATE_HOME or $HOME/.local/state,
-//                          under qobuzconnect2mpd/). Created if missing.
+//   qconnectstatedir       Directory holding user_token and device.uuid.
+//                          Set this for a service account (the standard). If
+//                          unset, an interactive run falls back to
+//                          $XDG_STATE_HOME/qobuzconnect2mpd or
+//                          ~/.local/state/qobuzconnect2mpd; a service with it
+//                          unset aborts asking you to set it. Created if missing.
 //
 //   # Qobuz API configuration (authentication uses browser OAuth):
 //   qconnectappid          App ID          (falls back to qobuzappid)
@@ -69,7 +72,6 @@
 #include <string>
 #include <chrono>
 #include <thread>
-#include <pwd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -127,18 +129,20 @@ static bool makeDirs(const std::string& path, mode_t mode) {
 
 // Resolve the single directory that holds all persistent per-device state
 // (the OAuth token and the device UUID). An explicit 'qconnectstatedir' wins;
-// otherwise follow the XDG state convention, keyed on the running account.
+// otherwise fall back to the XDG state location for an interactive user only.
 static std::string resolveStateDir(ConfSimple& cfg) {
+    // A service account sets this explicitly (the documented standard); it is
+    // used verbatim, with no home/XDG guessing.
     std::string configured = cfgGet(cfg, "qconnectstatedir");
     if (!configured.empty()) return configured;
+    // Fallback only for an interactive user running the daemon by hand: the XDG
+    // state location under their real home. A nologin service account has no
+    // meaningful home here, so it must set qconnectstatedir — if it hasn't, this
+    // returns empty and main() aborts with that instruction (no invented path).
     if (const char* xdg = std::getenv("XDG_STATE_HOME"); xdg && *xdg)
         return std::string(xdg) + "/qobuzconnect2mpd";
     if (const char* home = std::getenv("HOME"); home && *home)
         return std::string(home) + "/.local/state/qobuzconnect2mpd";
-    if (const struct passwd* pw = ::getpwuid(::geteuid());
-        pw && pw->pw_dir && pw->pw_dir[0] == '/' &&
-        std::strcmp(pw->pw_dir, "/nonexistent") != 0)
-        return std::string(pw->pw_dir) + "/.local/state/qobuzconnect2mpd";
     return {};
 }
 

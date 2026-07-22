@@ -41,9 +41,10 @@ load_rc_config "$name"
 : ${qobuzconnect2mpd_rundir:="/var/run/${name}"}
 : ${qobuzconnect2mpd_pidfile:="${qobuzconnect2mpd_rundir}/qobuzconnect2mpd.pid"}
 
-# rc.subr's su -m does not update HOME; export it so the daemon resolves any
-# home-relative paths (cache, status/log files) correctly.
-export HOME="${qobuzconnect2mpd_homedir}"
+# No HOME juggling: the daemon locates its state directory from qconnectstatedir
+# in the config. The nologin service account has no desktop home, so the daemon
+# does not derive a state path from any home — it aborts if qconnectstatedir is
+# unset. required_files below ensures the config (which sets it) is present.
 
 # Services start with a minimal PATH that omits /usr/local/bin on FreeBSD.
 export PATH="${BINDIR}:/usr/bin:/bin"

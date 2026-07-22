@@ -55,10 +55,11 @@ qconnectlogfile = /tmp/qconnect2mpd.log
 
 # Persistent state directory — holds the OAuth token (user_token) and the
 # device UUID (device.uuid). One flat directory, created automatically if
-# missing. Under a service account set it to the account's writable home so a
-# stable device identity and cached login survive restarts.
-# Default when unset: $XDG_STATE_HOME/qobuzconnect2mpd, else
-# $HOME/.local/state/qobuzconnect2mpd.
+# missing. Set it explicitly for a service account (as here) so a stable device
+# identity and cached login survive restarts. A nologin service account has no
+# desktop home, so if this is unset the daemon aborts asking you to set it
+# (rather than inventing a path); only an interactive run falls back to
+# $XDG_STATE_HOME/qobuzconnect2mpd or ~/.local/state/qobuzconnect2mpd.
 qconnectstatedir = /var/db/qobuzconnect2mpd
 
 # Qobuz authentication uses the browser OAuth flow and a locally cached token.

@@ -176,9 +176,15 @@ If `security/sudo` is installed, use it — it execs the binary directly and doe
 not care about the account's shell:
 
 ```sh
-sudo -u qobuzconnect2mpd env HOME=/var/db/qobuzconnect2mpd \
-  /usr/local/bin/qobuzconnect2mpd -c /usr/local/etc/qobuzconnect2mpd.conf -L
+sudo -u qobuzconnect2mpd /usr/local/bin/qobuzconnect2mpd \
+  -c /usr/local/etc/qobuzconnect2mpd.conf -L
 ```
+
+No `HOME` needs to be set: the daemon takes its state directory from
+`qconnectstatedir` in the config (set above). The `qobuzconnect2mpd` account is
+`nologin` and has no desktop home, so the daemon does not derive a state path
+from a home at all — if `qconnectstatedir` were unset it would abort and ask you
+to set it, rather than inventing `~/.local/state` under the account.
 
 With base-system `su` only, give the account a shell for the duration and put it
 back afterwards. Quote the command passed to `su -c` so the daemon receives its
@@ -187,14 +193,10 @@ own `-c` argument:
 ```sh
 pw usermod qobuzconnect2mpd -s /bin/sh
 su -m qobuzconnect2mpd -c \
-  'HOME=/var/db/qobuzconnect2mpd /usr/local/bin/qobuzconnect2mpd \
-  -c /usr/local/etc/qobuzconnect2mpd.conf -L'
+  '/usr/local/bin/qobuzconnect2mpd -c /usr/local/etc/qobuzconnect2mpd.conf -L'
 pw usermod qobuzconnect2mpd -s /usr/sbin/nologin
 service qobuzconnect2mpd start
 ```
-
-`su -m` keeps the invoking environment, including `root`'s `HOME`, which is why
-`HOME` is set explicitly on the command line.
 
 Do not add `-d` to this run. The login URL is written to stdout only — it never
 goes to `qconnectlogfile` — and daemonising sends stdout to `/dev/null`, losing

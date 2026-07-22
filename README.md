@@ -70,7 +70,7 @@ install or overwrite the live configuration.
 | `mpdhost` | `localhost` | MPD hostname |
 | `mpdport` | `6600` | MPD port |
 | `mpdpassword` | *(none)* | MPD password |
-| `qconnectstatedir` | `$XDG_STATE_HOME` or `$HOME/.local/state`, under `qobuzconnect2mpd/` | Dir holding `user_token` and `device.uuid` (auto-created `0700`) |
+| `qconnectstatedir` | *(required for a service)*; interactive fallback `$XDG_STATE_HOME` or `~/.local/state`, under `qobuzconnect2mpd/` | Dir holding `user_token` and `device.uuid` (auto-created `0700`) |
 | `qconnecttokenfile` | `<qconnectstatedir>/user_token` | Override for the OAuth token path only |
 | `qconnectappid` | value of `qobuzappid` | Qobuz app ID (auto-fetched if empty) |
 | `qconnectcfvalue` | value of `qobuzcfvalue` | Qobuz app secret (auto-fetched if empty) |
@@ -174,11 +174,13 @@ reflects the current session only.
 
 User authentication is OAuth-only. All persistent per-device state — the OAuth
 token (`user_token`) and the device UUID (`device.uuid`) — lives in a single
-state directory set by `qconnectstatedir`. When unset it defaults to
-`$XDG_STATE_HOME/qobuzconnect2mpd` (else `$HOME/.local/state/qobuzconnect2mpd`);
-under a service account, point it at the account's writable home (e.g.
-`/var/db/qobuzconnect2mpd`). The directory is created automatically with mode
-`0700` and must be owned by the daemon's effective user. Set `qconnecttokenfile`
+state directory set by `qconnectstatedir`. **Set it explicitly for a service**
+(e.g. `/var/db/qobuzconnect2mpd`) — a `nologin` service account has no desktop
+home, so the daemon does not invent one; if `qconnectstatedir` is unset it
+aborts asking you to set it. Only an interactive run falls back to
+`$XDG_STATE_HOME/qobuzconnect2mpd`, else `~/.local/state/qobuzconnect2mpd`. The
+directory is created automatically with mode `0700` and must be owned by the
+daemon's effective user. Set `qconnecttokenfile`
 only to place the token somewhere other than `<qconnectstatedir>/user_token`.
 Subsequent runs reuse the cached token without re-authenticating.
 
@@ -225,15 +227,18 @@ The login URL is printed on **stdout only** — it is not written to
 1. **Stop the service if it is already running.** A second instance cannot bind
    `qconnectport` and will fail to start.
 
-2. **Point the state directory at a path the service account owns.** With a
-   system account, `HOME` is often not what you expect, so set it explicitly:
+2. **Point the state directory at a path the service account owns.** This is the
+   documented standard for a service account:
 
    ```conf
    qconnectstatedir = /var/lib/qobuzconnect2mpd
    ```
 
-   The daemon creates it (mode `0700`) if missing; the token file
-   `user_token` inside it is written with mode `0600`.
+   The daemon creates it (mode `0700`) if missing; the token file `user_token`
+   inside it is written with mode `0600`. No `HOME` needs to be passed — an
+   explicit `qconnectstatedir` is used verbatim. (For a `nologin` service
+   account this is required: the daemon won't fall back to a home-based path,
+   it aborts and asks you to set `qconnectstatedir`.)
 
 3. **Run the daemon once, in the foreground, as the service account, with `-L`:**
 
