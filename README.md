@@ -65,11 +65,13 @@ install or overwrite the live configuration.
 | `qconnectport` | `9093` | HTTP port for device endpoints |
 | `qconnectformatid` | value of `qobuzformatid` or `27` | Stream quality: 5=MP3, 6=FLAC, 7=HiRes-96k, 27=HiRes-192k |
 | `qconnectiface` | *(auto)* | Network interface for mDNS |
+| `qconnectmdnsrequired` | `true` | Fail startup if mDNS can't announce; `false` for cloud-only |
 | `qconnectsockpath` | *(disabled)* | Unix socket for IPC with upmpdcli |
 | `mpdhost` | `localhost` | MPD hostname |
 | `mpdport` | `6600` | MPD port |
 | `mpdpassword` | *(none)* | MPD password |
-| `qconnecttokenfile` | XDG/HOME data directory | OAuth token cache path |
+| `qconnectstatedir` | `$XDG_STATE_HOME` or `$HOME/.local/state`, under `qobuzconnect2mpd/` | Dir holding `user_token` and `device.uuid` (auto-created `0700`) |
+| `qconnecttokenfile` | `<qconnectstatedir>/user_token` | Override for the OAuth token path only |
 | `qconnectappid` | value of `qobuzappid` | Qobuz app ID (auto-fetched if empty) |
 | `qconnectcfvalue` | value of `qobuzcfvalue` | Qobuz app secret (auto-fetched if empty) |
 | `qconnectstatusfile` | *(none)* | Path for the now-playing status file; the sample uses `/tmp/qconnect2mpd-status.txt` |
@@ -79,10 +81,11 @@ install or overwrite the live configuration.
 ## Usage
 
 ```
-qobuzconnect2mpd [-c configfile] [-d] [-o statusfile] [-v|-vv]
+qobuzconnect2mpd [-c configfile] [-d] [-L] [-o statusfile] [-v|-vv]
 
   -c configfile   Path to configuration file (default: /etc/upmpdcli.conf)
   -d              Daemonise (fork to background)
+  -L              Bootstrap: complete the browser OAuth login, cache the token, exit
   -o statusfile   Write now-playing status to this file (updated every second);
                   overrides qconnectstatusfile in the config file
   -v, --debug     Enable debug logging for this run
@@ -207,6 +210,72 @@ captured automatically via the local redirect handler. Qobuz API requests use
 this OAuth token; signed CDN segment requests do not receive it. The `jwt_api`
 value delivered by a Connect controller is accepted as protocol metadata but is
 not substituted for the verified OAuth `X-User-Auth-Token` flow.
+
+### First authentication (one-time)
+
+Authentication happens once, interactively, in a browser. Afterwards the daemon
+starts unattended and never asks again. The important constraint is that the
+token must be written **by the account that will later run the service**, so the
+first login is done by running the daemon once as that account.
+
+The login URL is printed on **stdout only** — it is not written to
+`qconnectlogfile`. Do not use `-d` for this run: daemonising redirects stdout to
+`/dev/null` and the URL is lost.
+
+1. **Stop the service if it is already running.** A second instance cannot bind
+   `qconnectport` and will fail to start.
+
+2. **Point the state directory at a path the service account owns.** With a
+   system account, `HOME` is often not what you expect, so set it explicitly:
+
+   ```conf
+   qconnectstatedir = /var/lib/qobuzconnect2mpd
+   ```
+
+   The daemon creates it (mode `0700`) if missing; the token file
+   `user_token` inside it is written with mode `0600`.
+
+3. **Run the daemon once, in the foreground, as the service account, with `-L`:**
+
+   ```sh
+   sudo -u qobuzconnect2mpd /usr/local/bin/qobuzconnect2mpd \
+       -c /etc/qobuzconnect2mpd.conf -L
+   ```
+
+   `sudo -u` runs the binary directly, so it works even when the account has
+   `nologin` as its shell. `-L` completes the login, caches the token, and
+   exits on its own.
+
+4. **Open the printed URL in a browser and log in.** The URL is built from the
+   host's LAN address, for example
+   `http://192.168.1.20:9093/oauth/callback/<nonce>`, so the browser may be on
+   any machine that can reach that host and port — a desktop, a phone, anything
+   on the same network. It does not have to be the daemon's machine. If a
+   firewall sits in between, `qconnectport` must be open to the browser.
+
+5. **Wait for the confirmation page.** With `-L` the daemon exits by itself once
+   the token is written; without it, stop the foreground daemon with Ctrl-C. The
+   token is already persisted at that point.
+
+6. **Start the service normally.** It loads the cached token and connects
+   without any interaction.
+
+Verify the result before starting the service:
+
+```sh
+sudo ls -l /var/lib/qobuzconnect2mpd/user_token
+```
+
+Expect mode `-rw-------` and the service account as owner.
+
+**If the login URL expires.** The callback path carries a random nonce, accepts
+exactly one exchange, and is valid for five minutes. If it expires, or the first
+attempt fails, stop the daemon and repeat step 3 — each start generates a fresh
+URL.
+
+**If no URL is printed at all,** the daemon already has a usable cached token,
+or it could not fetch the Qobuz app ID (visible in the log). Delete the token
+file to force a new login.
 
 For playback, the daemon prefers the current `/session/start` plus `/file/url`
 flow. A segmented response is decrypted and reconstructed into FLAC behind the

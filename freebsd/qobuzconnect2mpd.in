@@ -31,10 +31,15 @@ load_rc_config "$name"
 : ${qobuzconnect2mpd_group:="qobuzconnect2mpd"}
 : ${qobuzconnect2mpd_homedir:="/var/db/qobuzconnect2mpd"}
 : ${qobuzconnect2mpd_flags:=""}
-# The pidfile lives in the service account's state directory because /var/run
-# is not writable after rc.subr drops privileges.
 : ${qobuzconnect2mpd_config:="@QOBUZCONNECT2MPD_CONFIG@"}
-: ${qobuzconnect2mpd_pidfile:="${qobuzconnect2mpd_homedir}/qobuzconnect2mpd.pid"}
+# The pidfile goes in /var/run/<name>/, not in the service account's home: the
+# home is 0700 (it holds the Qobuz token and cache), so rc.subr's check_pidfile
+# could not traverse it when `service qobuzconnect2mpd onestatus` is run by an
+# unprivileged user, and reported a running service as stopped.  /var/run is
+# not writable after rc.subr drops privileges, but start_precmd below still
+# runs as root and creates the directory owned by the service account.
+: ${qobuzconnect2mpd_rundir:="/var/run/${name}"}
+: ${qobuzconnect2mpd_pidfile:="${qobuzconnect2mpd_rundir}/qobuzconnect2mpd.pid"}
 
 # rc.subr's su -m does not update HOME; export it so the daemon resolves any
 # home-relative paths (cache, status/log files) correctly.
@@ -65,7 +70,10 @@ qobuzconnect2mpd_precmd()
 	if ! /usr/bin/getent group "${qobuzconnect2mpd_group}" >/dev/null 2>&1; then
 		err 1 "group ${qobuzconnect2mpd_group} does not exist"
 	fi
+	# 0700: the home holds the Qobuz token and cache.
 	/usr/bin/install -d -o "${qobuzconnect2mpd_user}" -g "${qobuzconnect2mpd_group}" -m 0700 "${qobuzconnect2mpd_homedir}"
+	# 0755, and recreated on every start because /var/run does not survive a
+	# reboot: the pid must stay readable so an unprivileged `onestatus` works.
 	/usr/bin/install -d -o "${qobuzconnect2mpd_user}" -g "${qobuzconnect2mpd_group}" -m 0755 "${qobuzconnect2mpd_pidfile%/*}"
 }
 

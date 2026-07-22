@@ -111,7 +111,9 @@ qconnectstatedir = /var/db/qobuzconnect2mpd
 The daemon first uses `/session/start` and `/file/url`; segmented CMAF/FLAC
 responses are reconstructed for MusicPD. Direct `/file/url` responses and the
 classic `track/getFileUrl` endpoint are compatibility fallbacks. No Qobuz
-username or password belongs in the configuration.
+username or password belongs in the configuration; the account is linked once
+through a browser, as described in
+[First authentication with Qobuz](#first-authentication-with-qobuz).
 
 ## Service account
 
@@ -131,18 +133,56 @@ chmod 640 /usr/local/etc/qobuzconnect2mpd.conf
 Use mode `600` and owner `qobuzconnect2mpd:qobuzconnect2mpd` instead if the
 configuration contains secrets that only the daemon should read.
 
-A headless service cannot complete a browser login, so it must find a token
-that was cached beforehand. Bootstrap it once with `-L`, running as the service
-account: `-L` prints a one-time login URL, waits while you open it in any
-browser that can reach the daemon host, receives the callback, writes the token
-(mode `0600`) into the state directory, and exits. The callback URL is valid for
-five minutes and one successful exchange. After it exits, start the service
-normally.
+See [First authentication with Qobuz](#first-authentication-with-qobuz) for the
+one-time interactive login that populates this account's token cache.
 
-Do not use `su - qobuzconnect2mpd`: the account normally has
-`/usr/sbin/nologin` as its shell, which produces `This account is currently not
-available.` Change the shell temporarily and quote the command passed to `su
--c` so the daemon receives its arguments.
+## First authentication with Qobuz
+
+Authentication is a one-time interactive browser login. The token is then cached
+and reused on every later start, so the service runs unattended afterwards.
+
+The token must be written by the account that will run the service — the
+unprivileged `qobuzconnect2mpd` user. So the first login is performed by running
+the daemon once, in the foreground, as that account, in `-L` bootstrap mode: `-L`
+completes the login, writes the token, and exits on its own.
+
+No browser runs as the service account. The daemon prints a login URL, you open
+it in any browser that can reach the daemon host, and the daemon itself receives
+the callback and writes the token.
+
+### Before you start
+
+The token is written to `<qconnectstatedir>/user_token`, so make sure
+`/usr/local/etc/qobuzconnect2mpd.conf` points the state directory at the service
+account's home (see [Configure qobuzconnect2mpd](#configure-qobuzconnect2mpd)):
+
+```conf
+qconnectstatedir = /var/db/qobuzconnect2mpd
+```
+
+Stop the service if it is already running — a second instance cannot bind
+`qconnectport`:
+
+```sh
+service qobuzconnect2mpd stop
+```
+
+### Run the daemon once as the service account
+
+The account has `/usr/sbin/nologin` as its shell, so `su - qobuzconnect2mpd`
+fails with `This account is currently not available.`
+
+If `security/sudo` is installed, use it — it execs the binary directly and does
+not care about the account's shell:
+
+```sh
+sudo -u qobuzconnect2mpd env HOME=/var/db/qobuzconnect2mpd \
+  /usr/local/bin/qobuzconnect2mpd -c /usr/local/etc/qobuzconnect2mpd.conf -L
+```
+
+With base-system `su` only, give the account a shell for the duration and put it
+back afterwards. Quote the command passed to `su -c` so the daemon receives its
+own `-c` argument:
 
 ```sh
 pw usermod qobuzconnect2mpd -s /bin/sh
@@ -153,13 +193,63 @@ pw usermod qobuzconnect2mpd -s /usr/sbin/nologin
 service qobuzconnect2mpd start
 ```
 
-If the service ever starts without a cached token it now exits immediately with
-an error pointing back at this `-L` bootstrap, rather than running silently
-unable to stream.
+`su -m` keeps the invoking environment, including `root`'s `HOME`, which is why
+`HOME` is set explicitly on the command line.
 
-Alternatively, start the service normally and copy the same first-run URL from
-syslog (normally `/var/log/messages`) into your browser. Restart the foreground
-process or service to generate a new URL if the callback expires.
+Do not add `-d` to this run. The login URL is written to stdout only — it never
+goes to `qconnectlogfile` — and daemonising sends stdout to `/dev/null`, losing
+the URL.
+
+### Complete the login in a browser
+
+The daemon prints:
+
+```
+  Not authenticated — open this URL in a browser to log in:
+
+  https://www.qobuz.com/signin/oauth?...
+
+  (after login this device will connect automatically)
+```
+
+Open that URL and log in with your Qobuz account. The redirect target is built
+from the host's LAN address — for example
+`http://192.168.1.20:9093/oauth/callback/<nonce>` — so the browser can be on any
+machine on the same network, not necessarily the FreeBSD host. If `pf` or
+another firewall is active, `qconnectport` must be reachable from the browser.
+
+With `-L` the daemon exits by itself once the token is written, right after the
+confirmation page is returned; without `-L`, stop the foreground daemon with
+Ctrl-C after the page appears. Either way the token is persisted first.
+
+### Verify and start the service
+
+```sh
+ls -l /var/db/qobuzconnect2mpd/user_token
+```
+
+Expect mode `-rw-------` and owner `qobuzconnect2mpd`. Then:
+
+```sh
+service qobuzconnect2mpd start
+```
+
+If the service ever starts without a cached token it exits immediately with an
+error pointing back at this `-L` bootstrap, rather than running silently unable
+to stream.
+
+### If the URL expires or the login fails
+
+The callback path carries a random nonce, accepts exactly one exchange, and
+expires after five minutes. Start the daemon again to generate a fresh URL.
+
+You can also skip the foreground run entirely: start the service normally and
+read the same first-run URL from syslog, normally `/var/log/messages` — the rc
+script runs the daemon under `daemon -S`, which forwards stdout there. Restart
+the service to generate a new URL if that one expires.
+
+If no URL is printed, the daemon already has a valid cached token. Remove
+`/var/db/qobuzconnect2mpd/user_token` to force a fresh login.
 
 ## Enable the service
 
@@ -222,13 +312,20 @@ The rc script runs the process under FreeBSD `daemon(8)` without automatic
 restart and stores the child pid in:
 
 ```sh
-/var/db/qobuzconnect2mpd/qobuzconnect2mpd.pid
+/var/run/qobuzconnect2mpd/qobuzconnect2mpd.pid
 ```
 
-The service account's home (`/var/db/qobuzconnect2mpd`) doubles as the state
-directory: it holds `user_token`, `device.uuid`, and the pidfile. Set
-`qconnectstatedir = /var/db/qobuzconnect2mpd` in the config so the token and a
-stable device identity survive restarts.
+The service account's home (`/var/db/qobuzconnect2mpd`, set as
+`qconnectstatedir`) holds the OAuth token and device UUID so a stable identity
+survives restarts; the pidfile lives separately under `/var/run`. That
+directory is owned by the service account but mode `0755`, and the rc script
+recreates it on every start (`/var/run` does not survive a reboot). Keeping the
+pid outside the `0700` home matters: `rc.subr` reads the pidfile to answer
+`service qobuzconnect2mpd onestatus`, so a pid buried in the home would make an
+unprivileged status check report a running daemon as stopped — which in turn
+misleads anything that polls it, such as the open-media-drc control panel's
+renderer toggle.  Override with `qobuzconnect2mpd_rundir` or
+`qobuzconnect2mpd_pidfile` in `rc.conf` if you need a different location.
 
 ## Logs and troubleshooting
 
