@@ -100,11 +100,12 @@ mpdport = 6600
 qconnectformatid = 27
 ```
 
-Authentication is OAuth-only. Set a persistent token-cache path owned by the
-service account:
+Authentication is OAuth-only. Point the daemon's state directory at the service
+account's home; the OAuth token (`user_token`) and device UUID (`device.uuid`)
+are stored there:
 
 ```conf
-qconnecttokenfile = /var/db/qobuzconnect2mpd/user_token
+qconnectstatedir = /var/db/qobuzconnect2mpd
 ```
 
 The daemon first uses `/session/start` and `/file/url`; segmented CMAF/FLAC
@@ -130,30 +131,31 @@ chmod 640 /usr/local/etc/qobuzconnect2mpd.conf
 Use mode `600` and owner `qobuzconnect2mpd:qobuzconnect2mpd` instead if the
 configuration contains secrets that only the daemon should read.
 
-OAuth does not require running a browser as the service account. The daemon
-prints a one-time login URL, you open that URL in any browser that can reach the
-daemon host, and the running daemon receives the callback and writes the token
-as `qobuzconnect2mpd`.
-
-For the most direct first login, temporarily give the service account a usable
-shell, run the daemon in the foreground as that account, copy the printed OAuth
-URL into your browser, and stop it after the token has been saved. The callback
-URL is valid for five minutes and one successful exchange. The cached token is
-created with mode `0600`.
+A headless service cannot complete a browser login, so it must find a token
+that was cached beforehand. Bootstrap it once with `-L`, running as the service
+account: `-L` prints a one-time login URL, waits while you open it in any
+browser that can reach the daemon host, receives the callback, writes the token
+(mode `0600`) into the state directory, and exits. The callback URL is valid for
+five minutes and one successful exchange. After it exits, start the service
+normally.
 
 Do not use `su - qobuzconnect2mpd`: the account normally has
 `/usr/sbin/nologin` as its shell, which produces `This account is currently not
 available.` Change the shell temporarily and quote the command passed to `su
--c` so the daemon receives its `-c /usr/local/etc/qobuzconnect2mpd.conf`
-arguments.
+-c` so the daemon receives its arguments.
 
 ```sh
 pw usermod qobuzconnect2mpd -s /bin/sh
 su -m qobuzconnect2mpd -c \
   'HOME=/var/db/qobuzconnect2mpd /usr/local/bin/qobuzconnect2mpd \
-  -c /usr/local/etc/qobuzconnect2mpd.conf'
+  -c /usr/local/etc/qobuzconnect2mpd.conf -L'
 pw usermod qobuzconnect2mpd -s /usr/sbin/nologin
+service qobuzconnect2mpd start
 ```
+
+If the service ever starts without a cached token it now exits immediately with
+an error pointing back at this `-L` bootstrap, rather than running silently
+unable to stream.
 
 Alternatively, start the service normally and copy the same first-run URL from
 syslog (normally `/var/log/messages`) into your browser. Restart the foreground
@@ -220,8 +222,13 @@ The rc script runs the process under FreeBSD `daemon(8)` without automatic
 restart and stores the child pid in:
 
 ```sh
-/var/db/qobuzconnect2mpd/.cache/qobuzconnect2mpd/qobuzconnect2mpd.pid
+/var/db/qobuzconnect2mpd/qobuzconnect2mpd.pid
 ```
+
+The service account's home (`/var/db/qobuzconnect2mpd`) doubles as the state
+directory: it holds `user_token`, `device.uuid`, and the pidfile. Set
+`qconnectstatedir = /var/db/qobuzconnect2mpd` in the config so the token and a
+stable device identity survive restarts.
 
 ## Logs and troubleshooting
 

@@ -30,18 +30,28 @@
 //   qconnectsockpath       Unix socket for IPC with upmpdcli
 //                          (default: /var/run/upmpdcli-qconnect.sock)
 //
+//   qconnectmdnsrequired   Fail startup if mDNS can't announce (default: true;
+//                          set false for cloud-only operation)
+//
+//   # Persistent state (OAuth token + device UUID) — one directory:
+//   qconnectstatedir       Directory holding user_token and device.uuid
+//                          (default: $XDG_STATE_HOME or $HOME/.local/state,
+//                          under qobuzconnect2mpd/). Created if missing.
+//
 //   # Qobuz API configuration (authentication uses browser OAuth):
 //   qconnectappid          App ID          (falls back to qobuzappid)
 //   qconnectcfvalue        App secret      (falls back to qobuzcfvalue)
-//   qconnecttokenfile      OAuth token cache path (default: XDG/HOME data dir)
+//   qconnecttokenfile      OAuth token path (default: <qconnectstatedir>/user_token)
 //
 //   # MPD connection (reused from main upmpdcli config):
 //   mpdhost / mpdport / mpdpassword
 //
 // Usage:
-//   qconnect2mpd [-c configfile] [-d] [-v|-vv]
+//   qconnect2mpd [-c configfile] [-d] [-L] [-o statusfile] [-v|-vv]
 //     -c  path to upmpdcli config file
 //     -d  daemonise (fork to background)
+//     -L  bootstrap: complete the browser OAuth login, cache the token, exit
+//     -o  now-playing status file path
 //     -v  enable debug logging (same as qconnectloglevel=debug)
 //     -vv enable high-frequency trace logging
 
@@ -49,6 +59,7 @@
 #include "qclog.hxx"
 
 #include <cctype>
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +69,9 @@
 #include <string>
 #include <chrono>
 #include <thread>
+#include <pwd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 // Definitions for globals declared in qclog.hxx
@@ -91,12 +105,50 @@ static int cfgGetInt(ConfSimple& cfg, const std::string& key, int dflt) {
     return dflt;
 }
 
+static bool cfgGetBool(ConfSimple& cfg, const std::string& key, bool dflt) {
+    std::string val;
+    if (!cfg.get(key, val) || val.empty()) return dflt;
+    for (char& c : val) c = static_cast<char>(std::tolower(
+                                static_cast<unsigned char>(c)));
+    return !(val == "0" || val == "false" || val == "no" || val == "off");
+}
+
+// Create a directory and any missing parents (like `mkdir -p`), mode 0700.
+static bool makeDirs(const std::string& path, mode_t mode) {
+    if (path.empty()) return false;
+    for (size_t i = 1; i < path.size(); ++i) {
+        if (path[i] == '/') {
+            std::string sub = path.substr(0, i);
+            if (::mkdir(sub.c_str(), mode) != 0 && errno != EEXIST) return false;
+        }
+    }
+    return ::mkdir(path.c_str(), mode) == 0 || errno == EEXIST;
+}
+
+// Resolve the single directory that holds all persistent per-device state
+// (the OAuth token and the device UUID). An explicit 'qconnectstatedir' wins;
+// otherwise follow the XDG state convention, keyed on the running account.
+static std::string resolveStateDir(ConfSimple& cfg) {
+    std::string configured = cfgGet(cfg, "qconnectstatedir");
+    if (!configured.empty()) return configured;
+    if (const char* xdg = std::getenv("XDG_STATE_HOME"); xdg && *xdg)
+        return std::string(xdg) + "/qobuzconnect2mpd";
+    if (const char* home = std::getenv("HOME"); home && *home)
+        return std::string(home) + "/.local/state/qobuzconnect2mpd";
+    if (const struct passwd* pw = ::getpwuid(::geteuid());
+        pw && pw->pw_dir && pw->pw_dir[0] == '/' &&
+        std::strcmp(pw->pw_dir, "/nonexistent") != 0)
+        return std::string(pw->pw_dir) + "/.local/state/qobuzconnect2mpd";
+    return {};
+}
+
 // ---- Entry point ------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
     std::string config_file = "/etc/upmpdcli.conf";
     std::string status_file_arg;
     bool daemonise = false;
+    bool login_only = false;
     int verbosity = 0;
 
     for (int i = 1; i < argc; ++i) {
@@ -104,6 +156,8 @@ int main(int argc, char* argv[]) {
             config_file = argv[++i];
         } else if (!strcmp(argv[i], "-d")) {
             daemonise = true;
+        } else if (!strcmp(argv[i], "-L")) {
+            login_only = true;
         } else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
             status_file_arg = argv[++i];
         } else if (argv[i][0] == '-' && argv[i][1] == 'v' &&
@@ -118,12 +172,13 @@ int main(int argc, char* argv[]) {
             if (verbosity < 2) verbosity = 2;
         } else {
             std::cerr << "Usage: " << argv[0]
-                      << " [-c configfile] [-d] [-o statusfile] [-v|-vv]\n";
+                      << " [-c configfile] [-d] [-L] [-o statusfile] [-v|-vv]\n";
             return 1;
         }
     }
 
-    if (daemonise) {
+    // -L is an interactive bootstrap: never fork away from the terminal.
+    if (daemonise && !login_only) {
         if (daemon(0, 0) < 0) {
             std::cerr << "daemon() failed: " << strerror(errno) << "\n";
             return 1;
@@ -184,6 +239,15 @@ int main(int argc, char* argv[]) {
     // Network interface
     qcfg.iface = cfgGet(cfg, "qconnectiface");
 
+    // mDNS is required for LAN discovery unless the operator runs cloud-only.
+    qcfg.mdns_required = cfgGetBool(cfg, "qconnectmdnsrequired", true);
+
+    // Runtime mode: a TTY lets a missing token be resolved via browser OAuth in
+    // place; a headless service must have a cached token (bootstrap with -L).
+    qcfg.login_only  = login_only;
+    qcfg.interactive = login_only ||
+                       ::isatty(STDIN_FILENO) || ::isatty(STDOUT_FILENO);
+
     // IPC socket — empty disables IPC (requires upmpdcli Phase 2 integration)
     qcfg.upmpdcli_sock = cfgGet(cfg, "qconnectsockpath", "");
 
@@ -222,36 +286,68 @@ int main(int argc, char* argv[]) {
                                  cfgGet(cfg, "qobuzcfvalue"));
     qcfg.token_file   = cfgGet(cfg, "qconnecttokenfile");
 
-    // UUID: persist across restarts by reading/writing a state file
-    std::string state_path = cfgGet(cfg, "cachedir",
-                                     "/var/cache/upmpdcli")
-                             + "/qconnect.uuid";
+    // Single state directory: holds the OAuth token and the device UUID.
+    // Created if missing so a fresh install works without manual setup.
+    std::string state_dir = resolveStateDir(cfg);
+    if (state_dir.empty()) {
+        std::cerr << "qobuzconnect2mpd: cannot determine a state directory; "
+                     "set qconnectstatedir in the config\n";
+        return 1;
+    }
+    if (!makeDirs(state_dir, 0700)) {
+        std::cerr << "qobuzconnect2mpd: cannot create state directory "
+                  << state_dir << ": " << strerror(errno) << "\n";
+        return 1;
+    }
+    qcfg.state_dir = state_dir;
+    LOGSTD("qobuzconnect2mpd: state dir: " << state_dir << "\n");
+
+    // UUID persists across restarts so the device keeps a stable identity in
+    // the Qobuz app (otherwise every restart appears as a new device).
+    std::string uuid_path = state_dir + "/device.uuid";
     {
-        std::ifstream sf(state_path);
+        std::ifstream sf(uuid_path);
         if (sf) std::getline(sf, qcfg.uuid);
     }
-    // QcManager generates a UUID if empty; save it after creation
+    // QcManager generates a UUID if empty; it is saved after start().
 
     // ---- Start manager -----------------------------------------------------
     QcManager mgr(qcfg);
 
-    // Persist the (possibly new) UUID
-    {
-        // Re-read the uuid after manager constructor may have generated it
-        // We can't easily access it from here, so just write after start.
-    }
-
     if (!mgr.start()) {
-        std::cerr << "qconnect2mpd: startup failed\n";
+        std::cerr << "qobuzconnect2mpd: startup failed\n";
         return 1;
     }
 
-    LOGINF("qconnect2mpd: started, UUID=" << mgr.uuid() << "\n");
+    LOGINF("qobuzconnect2mpd: started, UUID=" << mgr.uuid() << "\n");
 
     // Persist UUID to state file (may have been generated by QcManager)
     {
-        std::ofstream sf(state_path);
+        std::ofstream sf(uuid_path);
         if (sf) sf << mgr.uuid() << "\n";
+    }
+
+    // -L bootstrap: wait for the browser login to complete, cache the token,
+    // then exit so the operator can start the service normally.
+    if (login_only) {
+        LOGSTD("qobuzconnect2mpd: -L bootstrap — waiting for browser login "
+               "(up to 5 minutes)...\n");
+        int waited = 0;
+        while (!g_quit && !mgr.authenticated() && waited < 300) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            ++waited;
+        }
+        int rc = 0;
+        if (mgr.authenticated()) {
+            LOGSTD("qobuzconnect2mpd: authenticated — token cached in "
+                   << state_dir << ". You can now start the service.\n");
+        } else {
+            std::cerr << "qobuzconnect2mpd: login not completed within the "
+                         "timeout; token not cached\n";
+            rc = 1;
+        }
+        mgr.stop();
+        return rc;
     }
 
     // ---- Main loop ---------------------------------------------------------

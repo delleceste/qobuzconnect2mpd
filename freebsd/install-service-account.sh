@@ -27,5 +27,6 @@ if ! /usr/sbin/pw usershow "$user" >/dev/null 2>&1; then
 		-s /usr/sbin/nologin
 fi
 
+# The home directory doubles as the state directory (qconnectstatedir):
+# it holds user_token, device.uuid, and the pidfile. One flat, private dir.
 /usr/bin/install -d -o "$user" -g "$group" -m 0700 "$homedir"
-/usr/bin/install -d -o "$user" -g "$group" -m 0755 "$homedir/.cache/qobuzconnect2mpd"

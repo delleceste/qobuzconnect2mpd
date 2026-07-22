@@ -169,13 +169,30 @@ reflects the current session only.
 
 ## Authentication
 
-User authentication is OAuth-only. By default, the resulting token is cached
-at `~/.local/share/qconnect2mpd/user_token` with mode `0600`; use
-`qconnecttokenfile` to select a service-account path. Subsequent runs reuse it
-without re-authenticating. The token directory must be owned by the daemon's
-effective user.
+User authentication is OAuth-only. All persistent per-device state — the OAuth
+token (`user_token`) and the device UUID (`device.uuid`) — lives in a single
+state directory set by `qconnectstatedir`. When unset it defaults to
+`$XDG_STATE_HOME/qobuzconnect2mpd` (else `$HOME/.local/state/qobuzconnect2mpd`);
+under a service account, point it at the account's writable home (e.g.
+`/var/db/qobuzconnect2mpd`). The directory is created automatically with mode
+`0700` and must be owned by the daemon's effective user. Set `qconnecttokenfile`
+only to place the token somewhere other than `<qconnectstatedir>/user_token`.
+Subsequent runs reuse the cached token without re-authenticating.
 
-If no cached token is available, the daemon prints an OAuth URL at startup:
+A **headless service cannot complete a browser login**, so it requires a token
+that was already cached. Bootstrap it once, interactively, then start the
+service:
+
+```
+qobuzconnect2mpd -c /usr/local/etc/qobuzconnect2mpd.conf -L
+```
+
+`-L` brings up just enough to complete the OAuth flow, caches the token in the
+state directory, and exits. If a non-interactive service starts with no cached
+token it now fails loudly with this instruction instead of idling unusable.
+
+When run interactively without a cached token, the daemon prints an OAuth URL at
+startup:
 
 ```
   Not authenticated — open this URL in a browser to log in:

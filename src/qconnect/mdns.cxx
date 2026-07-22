@@ -196,16 +196,45 @@ bool MdnsAnnouncer::openSocket() {
     }
 #endif
 
-    // Bind to MDNS_PORT on all interfaces so we receive incoming queries
-    struct sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(MDNS_PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(m_sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        LOGERR("MdnsAnnouncer: bind() failed: " << strerror(errno) << "\n");
-        close(m_sock);
-        m_sock = -1;
-        return false;
+    // Bind to MDNS_PORT so we receive queries and answer from the canonical
+    // mDNS source port. Sharing the port with the system responder relies on
+    // SO_REUSEADDR (Linux multicast reuse, no UID restriction) and SO_REUSEPORT
+    // (FreeBSD/macOS). If the wildcard bind is still refused — e.g. a Linux
+    // SO_REUSEPORT group owned by a different uid, such as avahi vs. a user
+    // service — retry against the mDNS group address. Its distinct (addr,port)
+    // tuple is accepted where the wildcard is not, and the socket's local port
+    // is still MDNS_PORT so outgoing announcements use the correct source port.
+    auto bindTo = [&](in_addr_t bind_addr) -> int {
+        struct sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_port        = htons(MDNS_PORT);
+        addr.sin_addr.s_addr = bind_addr;
+        return bind(m_sock, reinterpret_cast<struct sockaddr*>(&addr),
+                    sizeof(addr));
+    };
+    if (bindTo(INADDR_ANY) < 0) {
+        int wildcard_errno = errno;
+        struct in_addr group{};
+        inet_pton(AF_INET, MDNS_GROUP, &group);
+        bool bound = wildcard_errno == EADDRINUSE && bindTo(group.s_addr) == 0;
+        if (bound) {
+            LOGINF("MdnsAnnouncer: sharing UDP port " << MDNS_PORT
+                   << " with the system mDNS responder via the group address\n");
+        } else {
+            if (wildcard_errno == EADDRINUSE) {
+                LOGERR("MdnsAnnouncer: cannot bind UDP port " << MDNS_PORT
+                       << " (held by another mDNS responder, e.g. avahi-daemon, "
+                       "mDNSResponder or kdeconnect). Identify it with: "
+                       "ss -lunp | grep " << MDNS_PORT << "  (Linux) or "
+                       "sockstat -4 -l | grep " << MDNS_PORT << "  (FreeBSD)\n");
+            } else {
+                LOGERR("MdnsAnnouncer: bind() failed: "
+                       << strerror(wildcard_errno) << "\n");
+            }
+            close(m_sock);
+            m_sock = -1;
+            return false;
+        }
     }
 
     // Join the mDNS multicast group

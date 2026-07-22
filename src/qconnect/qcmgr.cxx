@@ -216,20 +216,16 @@ QcManager::QcManager(const QcConfig& cfg) : m_cfg(cfg) {
 
 QcManager::~QcManager() { stop(); }
 
-// Returns the path used to persist the OAuth user_auth_token across restarts.
-static std::string tokenFilePath() {
-    const char* data_home = getenv("XDG_DATA_HOME");
-    if (data_home && *data_home)
-        return std::string(data_home) + "/qconnect2mpd/user_token";
-    const char* home = getenv("HOME");
-    if (home && *home)
-        return std::string(home) + "/.local/share/qconnect2mpd/user_token";
-    const struct passwd* account = ::getpwuid(::geteuid());
-    if (account && account->pw_dir && account->pw_dir[0] == '/' &&
-        std::strcmp(account->pw_dir, "/nonexistent") != 0) {
-        return std::string(account->pw_dir) +
-               "/.local/share/qconnect2mpd/user_token";
-    }
+bool QcManager::authenticated() const {
+    return m_api && !m_api->userToken().empty();
+}
+
+// Path used to persist the OAuth user_auth_token across restarts. An explicit
+// 'qconnecttokenfile' wins; otherwise it lives in the single state directory
+// alongside the device UUID (resolved in main()).
+static std::string tokenFilePath(const QcConfig& cfg) {
+    if (!cfg.token_file.empty()) return cfg.token_file;
+    if (!cfg.state_dir.empty())  return cfg.state_dir + "/user_token";
     return {};
 }
 
@@ -292,12 +288,27 @@ bool QcManager::start() {
 
     // OAuth is the only user authentication path. The token is cached so login
     // is a one-time interactive step.
-    std::string tok_file = m_cfg.token_file.empty()
-        ? tokenFilePath() : m_cfg.token_file;
+    std::string tok_file = tokenFilePath(m_cfg);
     if (tok_file.empty()) {
-        LOGERR("QcManager: no token cache path; set qconnecttokenfile\n");
+        LOGERR("QcManager: no token cache path; set qconnectstatedir or "
+               "qconnecttokenfile\n");
     } else {
         m_api->loadToken(tok_file);
+    }
+
+    // A headless service cannot complete the browser OAuth flow (the login URL
+    // would only go to the log, and the daemon would idle unusable). Fail loudly
+    // with the exact bootstrap command instead of silently doing nothing.
+    if (m_api->userToken().empty() && !m_cfg.interactive && !m_cfg.login_only) {
+        LOGERR("QcManager: not authenticated and no cached Qobuz token"
+               << (tok_file.empty() ? std::string()
+                                     : std::string(" at ") + tok_file) << ".\n"
+               "  This service cannot stream until it is authenticated.\n"
+               "  Bootstrap once, interactively, then restart the service:\n"
+               "      qobuzconnect2mpd -c <configfile> -L\n");
+        m_fatal_error.store(true, std::memory_order_relaxed);
+        stop();
+        return false;
     }
 
     // ---- MPD controller ----------------------------------------------------
@@ -306,8 +317,12 @@ bool QcManager::start() {
     if (!m_mpd->connect()) {
         LOGSTD("qconnect2mpd: MPD connect FAILED ("
                << m_cfg.mpd_host << ":" << m_cfg.mpd_port << ")\n");
-        stop();
-        return false;
+        // -L only needs OAuth; don't block token bootstrap on MPD availability.
+        if (!m_cfg.login_only) {
+            stop();
+            return false;
+        }
+        LOGSTD("qconnect2mpd: continuing without MPD for -L bootstrap\n");
     }
     LOGSTD("qconnect2mpd: MPD connected OK ("
            << m_cfg.mpd_host << ":" << m_cfg.mpd_port << ")\n");
@@ -365,6 +380,8 @@ bool QcManager::start() {
                                 "/qobuz-segmented");
 
     // If not yet authenticated, print the OAuth URL so the user can log in.
+    // Only reachable interactively or under -L (a headless service already
+    // aborted above), so the URL lands somewhere a human can act on it.
     if (needs_oauth && !oauth_path.empty() && !m_api->appId().empty()) {
         std::string ip    = localIpAddr();
         std::string redir = "http://" + ip + ":" + std::to_string(m_cfg.http_port)
@@ -380,12 +397,35 @@ bool QcManager::start() {
     m_queue_load_thread = std::thread(&QcManager::queueLoadLoop, this);
 
     // ---- mDNS announcer ----------------------------------------------------
+    // LAN discovery depends on this; a silent failure leaves the device either
+    // invisible or showing a stale name in the app. Retry a few times (covers a
+    // socket briefly held after a quick restart), then treat a persistent
+    // failure as fatal unless the operator opted into cloud-only operation.
     m_mdns = std::make_unique<MdnsAnnouncer>(
         m_cfg.uuid, m_cfg.friendly_name,
         m_cfg.http_port, m_cfg.iface);
-    if (!m_mdns->start()) {
-        LOGERR("QcManager: mDNS announcer failed to start\n");
-        // Non-fatal: HTTP still works for manual connections
+    bool mdns_ok = false;
+    for (int attempt = 1; attempt <= 3 && !mdns_ok; ++attempt) {
+        if (m_mdns->start()) { mdns_ok = true; break; }
+        LOGERR("QcManager: mDNS announcer failed to start (attempt "
+               << attempt << "/3)\n");
+        if (attempt < 3)
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    if (!mdns_ok) {
+        if (m_cfg.mdns_required && !m_cfg.login_only) {
+            LOGERR("QcManager: mDNS announcer could not bind UDP port 5353 — "
+                   "the device will be undiscoverable on the LAN.\n"
+                   "  Another mDNS responder is holding the port. Identify it "
+                   "with:  sockstat -4 -l | grep 5353\n"
+                   "  Free that port (e.g. stop avahi/kdeconnect), or set "
+                   "'qconnectmdnsrequired = false' for cloud-only operation.\n");
+            m_fatal_error.store(true, std::memory_order_relaxed);
+            stop();
+            return false;
+        }
+        LOGERR("QcManager: mDNS unavailable; continuing without LAN discovery "
+               "(qconnectmdnsrequired=false). Relying on the cloud WebSocket.\n");
     }
 
     // ---- IPC with upmpdcli (optional) --------------------------------------

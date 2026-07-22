@@ -34,7 +34,7 @@ load_rc_config "$name"
 # The pidfile lives in the service account's state directory because /var/run
 # is not writable after rc.subr drops privileges.
 : ${qobuzconnect2mpd_config:="@QOBUZCONNECT2MPD_CONFIG@"}
-: ${qobuzconnect2mpd_pidfile:="${qobuzconnect2mpd_homedir}/.cache/qobuzconnect2mpd/qobuzconnect2mpd.pid"}
+: ${qobuzconnect2mpd_pidfile:="${qobuzconnect2mpd_homedir}/qobuzconnect2mpd.pid"}
 
 # rc.subr's su -m does not update HOME; export it so the daemon resolves any
 # home-relative paths (cache, status/log files) correctly.

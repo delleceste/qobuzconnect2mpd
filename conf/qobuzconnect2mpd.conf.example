@@ -28,6 +28,11 @@ qconnectformatid = 27
 # non-loopback interface).
 #qconnectiface =
 
+# mDNS is how the Qobuz app discovers the device on the LAN. If the announcer
+# cannot bind UDP port 5353 (another mDNS responder is holding it) startup
+# fails loudly. Set to false only for cloud-only operation (no LAN discovery).
+#qconnectmdnsrequired = true
+
 # Path to the now-playing status file (two lines: title+timing, format info).
 # Updated atomically every second while playing. Same as the -o command-line
 # option; -o takes precedence if both are set.
@@ -48,8 +53,19 @@ qconnectlogfile = /tmp/qconnect2mpd.log
 # qconnect2mpd notifies upmpdcli with PLAYING/STOPPED events.
 #qconnectsockpath = /var/run/upmpdcli-qconnect.sock
 
+# Persistent state directory — holds the OAuth token (user_token) and the
+# device UUID (device.uuid). One flat directory, created automatically if
+# missing. Under a service account set it to the account's writable home so a
+# stable device identity and cached login survive restarts.
+# Default when unset: $XDG_STATE_HOME/qobuzconnect2mpd, else
+# $HOME/.local/state/qobuzconnect2mpd.
+qconnectstatedir = /var/db/qobuzconnect2mpd
+
 # Qobuz authentication uses the browser OAuth flow and a locally cached token.
-# Set an explicit writable path when the daemon runs under a service account.
-#qconnecttokenfile = /var/db/qobuzconnect2mpd/user_token
+# Bootstrap the token once (opens a login URL, waits, then exits):
+#     qobuzconnect2mpd -c /usr/local/etc/qobuzconnect2mpd.conf -L
+# By default the token is stored as <qconnectstatedir>/user_token; override the
+# full path here only if you need it somewhere else.
+#qconnecttokenfile =
 #qconnectappid =
 #qconnectcfvalue =

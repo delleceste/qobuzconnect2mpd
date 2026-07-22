@@ -59,7 +59,22 @@ struct QcConfig {
     std::string api_base_url{"https://www.qobuz.com/api.json/0.2"};
     std::string app_id;
     std::string app_secret;     // XOR-decoded secret
-    std::string token_file;     // OAuth token cache (empty = XDG/HOME default)
+    std::string token_file;     // OAuth token cache (empty = <state_dir>/user_token)
+
+    // Persistent state directory. Holds the OAuth token and the device UUID.
+    // Resolved once in main() (config 'qconnectstatedir', else XDG/HOME).
+    std::string state_dir;
+
+    // Fail startup loudly if the mDNS announcer cannot bind (LAN discovery).
+    // Set false ('qconnectmdnsrequired = false') for cloud-only operation.
+    bool        mdns_required{true};
+
+    // stdin/stdout is a terminal: allows completing the browser OAuth flow in
+    // place. When false (headless service) a missing token is a fatal error.
+    bool        interactive{false};
+
+    // -L bootstrap mode: bring up just enough to complete OAuth, then exit.
+    bool        login_only{false};
 
     // IPC with upmpdcli (Unix socket path, empty = disable)
     std::string upmpdcli_sock;
@@ -103,6 +118,9 @@ public:
 
     // Retrieve the UUID (may differ from config if it was generated at construction)
     const std::string& uuid() const { return m_cfg.uuid; }
+
+    // True once a usable Qobuz OAuth token is loaded (cached or just obtained).
+    bool authenticated() const;
 
 private:
     // Called by HttpHandler when the Qobuz app sends credentials
