@@ -360,7 +360,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (mgr.hasFatalError()) {
-        LOGERR("qconnect2mpd: WebSocket connection lost — exiting (systemd will restart)\n");
+        LOGERR("qconnect2mpd: WebSocket connection lost — exiting "
+               "(the service manager will restart it)\n");
         mgr.stop();
         return 1;
     }

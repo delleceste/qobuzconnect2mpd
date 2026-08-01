@@ -310,16 +310,33 @@ service qobuzconnect2mpd stop
 service qobuzconnect2mpd restart
 ```
 
-The rc script runs the process under FreeBSD `daemon(8)` without automatic
-restart and stores the child pid in:
+The rc script runs the process under FreeBSD `daemon(8)` in supervised mode
+(`-R`), so the daemon is respawned a few seconds after it exits, matching
+`Restart=on-failure` in the systemd unit. Tune the delay with
+`qobuzconnect2mpd_restart_delay` in `rc.conf` (default `3` seconds).
+
+This is a backstop, not the normal recovery path. The Qobuz cloud closes the
+WebSocket periodically (the `qws` JWT is short-lived); the daemon handles that
+itself — it mints a fresh JWT from the cached OAuth token and rebuilds the
+session, logging `WebSocket connection lost — reconnecting`. The supervisor
+only matters for failures it cannot recover from in-process, such as mDNS
+being unable to bind, or a crash.
+
+`service qobuzconnect2mpd stop` signals the supervisor, which forwards SIGTERM
+to the daemon and exits instead of respawning it. Two pidfiles are written —
+the supervisor's, which `rc.subr` tracks, and the daemon's own:
 
 ```sh
-/var/run/qobuzconnect2mpd/qobuzconnect2mpd.pid
+/var/run/qobuzconnect2mpd/qobuzconnect2mpd.pid        # daemon(8) supervisor
+/var/run/qobuzconnect2mpd/qobuzconnect2mpd-child.pid  # qobuzconnect2mpd
 ```
+
+The supervisor pid is the one `rc.subr` must signal: sending SIGTERM to the
+child would only make the supervisor start a fresh one.
 
 The service account's home (`/var/db/qobuzconnect2mpd`, set as
 `qconnectstatedir`) holds the OAuth token and device UUID so a stable identity
-survives restarts; the pidfile lives separately under `/var/run`. That
+survives restarts; the pidfiles live separately under `/var/run`. That
 directory is owned by the service account but mode `0755`, and the rc script
 recreates it on every start (`/var/run` does not survive a reboot). Keeping the
 pid outside the `0700` home matters: `rc.subr` reads the pidfile to answer

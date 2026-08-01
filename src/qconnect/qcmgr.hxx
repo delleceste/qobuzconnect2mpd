@@ -112,8 +112,10 @@ public:
 
     bool isRunning() const { return m_running.load(); }
 
-    // True when the WebSocket connection was lost unexpectedly.
-    // main() uses this to exit with code 1 so systemd can restart the service.
+    // True when a subsystem failed in a way the daemon cannot recover from
+    // in-process (e.g. mDNS could not bind). main() uses this to exit with
+    // code 1 so the service manager can restart the service. Losing the cloud
+    // WebSocket is *not* one of these: it is retried internally.
     bool hasFatalError() const { return m_fatal_error.load(); }
 
     // Retrieve the UUID (may differ from config if it was generated at construction)
@@ -125,6 +127,14 @@ public:
 private:
     // Called by HttpHandler when the Qobuz app sends credentials
     void onConnect(ConnectCredentials creds);
+
+    // Cloud WebSocket (re)connection. The daemon mints its own credentials
+    // from the cached OAuth token, so it can re-establish the session on its
+    // own — the phone is only needed for the very first authentication.
+    bool connectCloudWebSocket();
+    void requestReconnect();
+    void reconnectLoop();
+    void stopReconnectWorker();
 
     // Called by WSession callbacks
     void onSetState(uint64_t command_id, PlayingState ps, uint32_t position_ms,
@@ -264,6 +274,15 @@ private:
         std::deque<size_t>      remaining_indices;        // Load continuation
         bool                    load_started{false};
     };
+    // Cloud WebSocket reconnection worker. The reconnect must not run on the
+    // WSession callback thread that reports the loss: re-establishing the
+    // session joins that very thread.
+    std::mutex                m_reconnect_mutex;
+    std::condition_variable   m_reconnect_cv;
+    std::thread               m_reconnect_thread;
+    bool                      m_reconnect_stop{true};
+    bool                      m_reconnect_pending{false};
+
     std::mutex                m_queue_load_mutex;
     std::condition_variable   m_queue_load_cv;
     std::thread               m_queue_load_thread;

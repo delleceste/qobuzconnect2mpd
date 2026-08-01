@@ -359,14 +359,8 @@ bool QcManager::start() {
                         LOGERR("QcManager: OAuth token could not be persisted\n");
                         return false;
                     }
-                    std::string ws_endpoint, ws_jwt;
-                    if (m_api->fetchQwsToken(ws_endpoint, ws_jwt)) {
-                        LOGINF("QcManager: cloud JWT obtained after OAuth — connecting\n");
-                        ConnectCredentials cloud_creds;
-                        cloud_creds.ws_endpoint = ws_endpoint;
-                        cloud_creds.ws_jwt      = ws_jwt;
-                        onConnect(std::move(cloud_creds));
-                    }
+                    LOGINF("QcManager: OAuth complete — connecting to the cloud\n");
+                    if (!connectCloudWebSocket()) requestReconnect();
                     return true;
                 });
         }
@@ -431,20 +425,24 @@ bool QcManager::start() {
     // ---- IPC with upmpdcli (optional) --------------------------------------
     if (!m_cfg.upmpdcli_sock.empty()) startIpcServer();
 
+    // Worker that re-establishes the cloud WebSocket after a drop. Started
+    // before the first connect attempt so that attempt can hand off to it.
+    {
+        std::lock_guard<std::mutex> lk(m_reconnect_mutex);
+        m_reconnect_stop = false;
+        m_reconnect_pending = false;
+    }
+    m_reconnect_thread = std::thread(&QcManager::reconnectLoop, this);
+
     // Proactively connect to the Qobuz Connect cloud WebSocket by fetching a
     // JWT via POST /qws/createToken.  This makes the device visible from any
     // network without requiring the phone to be on the same LAN first.
     // mDNS continues to work as a fallback for same-network direct discovery.
     if (!m_api->userToken().empty()) {
-        std::string ws_endpoint, ws_jwt;
-        if (m_api->fetchQwsToken(ws_endpoint, ws_jwt)) {
-            LOGINF("QcManager: cloud JWT obtained — connecting to WebSocket\n");
-            ConnectCredentials cloud_creds;
-            cloud_creds.ws_endpoint = ws_endpoint;
-            cloud_creds.ws_jwt      = ws_jwt;
-            onConnect(std::move(cloud_creds));
-        } else {
-            LOGERR("QcManager: cloud JWT fetch failed — will connect when phone discovers via mDNS\n");
+        if (!connectCloudWebSocket()) {
+            LOGERR("QcManager: initial cloud connect failed — retrying in the "
+                   "background; mDNS discovery stays available meanwhile\n");
+            requestReconnect();
         }
     } else {
         LOGINF("QcManager: no auth token — waiting for mDNS discovery or OAuth login\n");
@@ -473,6 +471,10 @@ void QcManager::stop() {
     }
 
     stopIpcServer();
+
+    // Before the m_connect_mutex barrier below: the worker calls onConnect,
+    // so joining it first is what makes that barrier conclusive.
+    stopReconnectWorker();
 
     // Wait for a connect request which entered before m_stopping was set. New
     // requests observe m_stopping while holding this same mutex and are ignored.
@@ -685,11 +687,110 @@ void QcManager::onSetActive(bool active) {
 void QcManager::onWsDisconnected(bool error) {
     deactivateRenderer();
     if (error) {
-        LOGERR("QcManager: WebSocket connection lost — exiting so systemd can restart the service\n");
-        m_fatal_error.store(true, std::memory_order_relaxed);
+        LOGERR("QcManager: WebSocket connection lost — reconnecting\n");
+        // Runs on the WSession callback thread. Only signal here: the actual
+        // reconnect tears this session down, which joins this very thread.
+        requestReconnect();
     } else {
         LOGINF("QcManager: WebSocket session ended (replaced or stopped)\n");
     }
+}
+
+// ---- Cloud WebSocket (re)connection ----------------------------------------
+
+// The Qobuz cloud drops idle-ish WebSockets on its own schedule (and the qws
+// JWT has a limited lifetime), so a session loss is routine rather than fatal.
+// The daemon mints fresh credentials from the cached OAuth token, so it can
+// rebuild the session without the phone and without a process restart — which
+// would also needlessly tear down MPD, mDNS and the HTTP endpoint.
+bool QcManager::connectCloudWebSocket() {
+    if (m_stopping.load(std::memory_order_acquire)) return false;
+    if (!m_api || m_api->userToken().empty()) return false;
+
+    std::string ws_endpoint, ws_jwt;
+    if (!m_api->fetchQwsToken(ws_endpoint, ws_jwt)) return false;
+
+    LOGINF("QcManager: cloud JWT obtained — connecting to WebSocket\n");
+    ConnectCredentials cloud_creds;
+    cloud_creds.ws_endpoint = ws_endpoint;
+    cloud_creds.ws_jwt      = ws_jwt;
+    onConnect(std::move(cloud_creds));
+
+    std::lock_guard<std::mutex> lk(m_session_mutex);
+    return m_ws != nullptr;
+}
+
+void QcManager::requestReconnect() {
+    {
+        std::lock_guard<std::mutex> lk(m_reconnect_mutex);
+        if (m_reconnect_stop) return;
+        m_reconnect_pending = true;
+    }
+    m_reconnect_cv.notify_all();
+}
+
+void QcManager::reconnectLoop() {
+    constexpr int BACKOFF_INITIAL_S = 2;
+    constexpr int BACKOFF_MAX_S     = 60;
+    int backoff = BACKOFF_INITIAL_S;
+
+    std::chrono::steady_clock::time_point last_attempt{};
+
+    std::unique_lock<std::mutex> lk(m_reconnect_mutex);
+    while (!m_reconnect_stop) {
+        m_reconnect_cv.wait(lk, [this] {
+            return m_reconnect_stop || m_reconnect_pending;
+        });
+        if (m_reconnect_stop) break;
+        m_reconnect_pending = false;
+
+        // Without an OAuth token the daemon cannot mint a JWT. mDNS and the
+        // HTTP endpoint are still up, so the phone can hand us credentials.
+        if (!m_api || m_api->userToken().empty()) {
+            LOGERR("QcManager: cannot reconnect without an OAuth token — "
+                   "waiting for the Qobuz app to connect\n");
+            continue;
+        }
+
+        // Throttle before the attempt, not after it. A session that is
+        // accepted and then dropped immediately reports success every time,
+        // so a delay applied only on the failure path would never fire and
+        // the loop would spin on handshakes.
+        const auto now = std::chrono::steady_clock::now();
+        const auto gap = std::chrono::seconds(backoff);
+        if (last_attempt.time_since_epoch().count() && now - last_attempt < gap) {
+            m_reconnect_cv.wait_for(lk, gap - (now - last_attempt),
+                                    [this] { return m_reconnect_stop; });
+            if (m_reconnect_stop) break;
+        }
+        last_attempt = std::chrono::steady_clock::now();
+
+        lk.unlock();
+        bool ok = connectCloudWebSocket();
+        lk.lock();
+        if (m_reconnect_stop) break;
+
+        if (ok) {
+            LOGINF("QcManager: cloud WebSocket re-established\n");
+            backoff = BACKOFF_INITIAL_S;
+            continue;
+        }
+
+        backoff = std::min(backoff * 2, BACKOFF_MAX_S);
+        LOGERR("QcManager: reconnect failed — retrying in " << backoff << "s\n");
+        // Re-arm: nothing else will signal us, the drop is already known.
+        m_reconnect_pending = true;
+    }
+}
+
+void QcManager::stopReconnectWorker() {
+    {
+        std::lock_guard<std::mutex> lk(m_reconnect_mutex);
+        m_reconnect_stop = true;
+        m_reconnect_pending = false;
+    }
+    m_reconnect_cv.notify_all();
+    if (m_reconnect_thread.joinable()) m_reconnect_thread.join();
 }
 
 void QcManager::onSetState(uint64_t command_id, PlayingState ps,
@@ -1870,8 +1971,17 @@ void QcManager::queueLoadLoop() {
 }
 
 void QcManager::stopQueueLoadWorker() {
-    m_queue_load_stop = true;
-    m_queue_load_generation.fetch_add(1, std::memory_order_relaxed);
+    // The stop flag has to be set under m_queue_load_mutex even though it is
+    // atomic: queueLoadLoop tests it as part of its condition_variable
+    // predicate. Setting it without the lock loses the wakeup when the worker
+    // has just evaluated the predicate but has not yet parked — notify_all()
+    // then reaches nobody, the worker sleeps forever and the join() below
+    // hangs shutdown.
+    {
+        std::lock_guard<std::mutex> lk(m_queue_load_mutex);
+        m_queue_load_stop = true;
+        m_queue_load_generation.fetch_add(1, std::memory_order_relaxed);
+    }
     m_queue_load_cv.notify_all();
     if (m_queue_load_thread.joinable())
         m_queue_load_thread.join();

@@ -943,7 +943,20 @@ bool QobuzApi::fetchQwsToken(std::string& out_endpoint, std::string& out_jwt) {
         return false;
     }
 
-    LOGINF("QobuzApi::fetchQwsToken: ok, endpoint=" << out_endpoint << "\n");
+    // The qws JWT is short-lived and the cloud closes the socket when it
+    // lapses. Log the remaining life so an otherwise unexplained session drop
+    // can be matched against token expiry.
+    const int64_t exp = jwt_payload.get("exp", 0).asInt64();
+    if (exp > 0) {
+        const int64_t now = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        LOGINF("QobuzApi::fetchQwsToken: ok, endpoint=" << out_endpoint
+               << ", JWT valid for " << (exp - now) << "s\n");
+    } else {
+        LOGINF("QobuzApi::fetchQwsToken: ok, endpoint=" << out_endpoint
+               << " (no expiry reported)\n");
+    }
     return true;
 }
 
