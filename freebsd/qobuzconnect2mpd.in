@@ -73,6 +73,7 @@ required_files="${qobuzconnect2mpd_config}"
 command_args="-f -S -T ${name} -R ${qobuzconnect2mpd_restart_delay} -P ${qobuzconnect2mpd_pidfile} -p ${qobuzconnect2mpd_child_pidfile} -t ${name} -- ${BINDIR}/qobuzconnect2mpd -c ${qobuzconnect2mpd_config} ${qobuzconnect2mpd_flags}"
 
 start_precmd="qobuzconnect2mpd_precmd"
+start_postcmd="qobuzconnect2mpd_postcmd"
 
 qobuzconnect2mpd_precmd()
 {
@@ -88,6 +89,30 @@ qobuzconnect2mpd_precmd()
 	# 0755, and recreated on every start because /var/run does not survive a
 	# reboot: the pids must stay readable so an unprivileged `onestatus` works.
 	/usr/bin/install -d -o "${qobuzconnect2mpd_user}" -g "${qobuzconnect2mpd_group}" -m 0755 "${qobuzconnect2mpd_rundir}"
+}
+
+qobuzconnect2mpd_postcmd()
+{
+	# Runs as root, after daemon(8) has been started.  A 0755 rundir is not
+	# enough on its own: daemon(8) creates the pidfiles themselves 0600
+	# (libutil's pidfile_open hardcodes that mode), so rc.subr's
+	# check_pidfile -- which runs as the invoking user, not as root -- still
+	# could not read them, and `service qobuzconnect2mpd status` reported a
+	# running service as stopped.  Relax them to 0644; a pid is already
+	# visible in ps(1), so this discloses nothing new.
+	# daemon(8) forks before writing them, hence the short poll.
+	local _i=0
+	while [ ${_i} -lt 20 ]; do
+		if [ -s "${qobuzconnect2mpd_pidfile}" ] &&
+		   [ -s "${qobuzconnect2mpd_child_pidfile}" ]; then
+			break
+		fi
+		/bin/sleep 0.1
+		_i=$((_i + 1))
+	done
+	/bin/chmod 0644 "${qobuzconnect2mpd_pidfile}" \
+		"${qobuzconnect2mpd_child_pidfile}" 2>/dev/null
+	return 0
 }
 
 run_rc_command "$1"
