@@ -621,6 +621,10 @@ void QcManager::onConnect(ConnectCredentials creds) {
 
 void QcManager::onWsConnected() {
     LOGINF("QcManager: WebSocket session connected\n");
+    // SessionState is received only after Qobuz has accepted the cloud JWT
+    // minted with our OAuth user token. Keep this at LOGSTD so service health
+    // checks have an unambiguous success line even at the default log level.
+    LOGSTD("qobuzconnect2mpd: Qobuz plugin connected\n");
 }
 
 void QcManager::cancelQueueOperations() {

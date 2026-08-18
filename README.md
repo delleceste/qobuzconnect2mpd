@@ -102,6 +102,7 @@ On start the daemon prints:
 qconnect2mpd: config: /etc/upmpdcli.conf
 qconnect2mpd: MPD localhost:6600
 qconnect2mpd: MPD connected OK (localhost:6600)
+qobuzconnect2mpd: Qobuz plugin connected
 ```
 
 ### Now-playing console output
@@ -146,6 +147,7 @@ When `qconnectlogfile` is set, timestamped entries are written for:
 
 ```
 2026-05-15 14:32:01 [OUT] qconnect2mpd: MPD connected OK (localhost:6600)
+2026-05-15 14:32:02 [OUT] qobuzconnect2mpd: Qobuz plugin connected
 2026-05-15 14:32:14 [INF] QobuzApi: track /tmp/qobuzconnect2mpd-1001/cache/track_415828162_27_1234_1.flac [44100,16,2] reconstructing 31 encrypted Qobuz audio segments (initialization segment 0 already parsed)
 2026-05-15 14:32:15 [INF] track /tmp/qobuzconnect2mpd-1001/cache/track_415828162_27_1234_1.flac [44100,16,2] playing: Aphex Twin - Xtal
 2026-05-15 14:32:17 [INF] QobuzApi: track /tmp/qobuzconnect2mpd-1001/cache/track_415828162_27_1234_1.flac [44100,16,2] complete: 31/31 segments, 116118901 bytes
