@@ -118,13 +118,21 @@ static bool cfgGetBool(ConfSimple& cfg, const std::string& key, bool dflt) {
 // Create a directory and any missing parents (like `mkdir -p`), mode 0700.
 static bool makeDirs(const std::string& path, mode_t mode) {
     if (path.empty()) return false;
-    for (size_t i = 1; i < path.size(); ++i) {
-        if (path[i] == '/') {
-            std::string sub = path.substr(0, i);
-            if (::mkdir(sub.c_str(), mode) != 0 && errno != EEXIST) return false;
-        }
+    // Nothing but slashes denotes the root, which always exists. Trailing ones
+    // are trimmed so the walk below does not re-mkdir the leaf as a component.
+    const size_t end = path.find_last_not_of('/');
+    if (end == std::string::npos) return true;
+    const std::string dir = path.substr(0, end + 1);
+    for (size_t i = 1; i < dir.size(); ++i) {
+        // Skip empty components: HOME="/" joined with a relative tail gives
+        // "//...", whose first component is "/", and mkdir("/") reports EISDIR
+        // rather than EEXIST -- which aborted the whole walk and left that
+        // misleading errno in the caller's error message.
+        if (dir[i] != '/' || dir[i - 1] == '/') continue;
+        std::string sub = dir.substr(0, i);
+        if (::mkdir(sub.c_str(), mode) != 0 && errno != EEXIST) return false;
     }
-    return ::mkdir(path.c_str(), mode) == 0 || errno == EEXIST;
+    return ::mkdir(dir.c_str(), mode) == 0 || errno == EEXIST;
 }
 
 // Resolve the single directory that holds all persistent per-device state
