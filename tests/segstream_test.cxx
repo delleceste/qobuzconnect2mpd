@@ -1,5 +1,6 @@
 #include "segstream.hxx"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -8,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -88,6 +90,60 @@ bool testRetryableFailure() {
     CHECK(!waitForSegmentedTrack(second, ignored, 100, &error));
     CHECK(segmentedTrackFailed(second, &error));
     releaseSegmentedTrackDownload(second);
+    return true;
+}
+
+// The web panel's feedback line is only as good as this snapshot: it must name
+// the track being reconstructed and how far along it is, while the work is
+// still in flight.
+bool testDownloadProgressSnapshot() {
+    using namespace QConnect;
+    auto plan = makeImmediatePlan(4242, "fLaC");
+    plan->url_template = "invalid-scheme://segment/$SEGMENT$";
+    plan->segment_byte_lens = {1, 1, 1};
+
+    auto handle = acquireSegmentedTrackDownload(plan);
+    CHECK(handle != nullptr);
+
+    // The fetch fails and is retried with a backoff, so the job stays in the
+    // scheduler long enough to be observed.
+    bool seen = false;
+    for (int i = 0; i < 200 && !seen; ++i) {
+        for (const auto& p : segmentedDownloadProgress()) {
+            if (p.track_id != 4242) continue;
+            CHECK(p.segments_total == 3);
+            CHECK(p.segments_done <= p.segments_total);
+            CHECK(p.isPlayback());
+            seen = true;
+            break;
+        }
+        if (!seen)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(seen);
+
+    clearSegmentedDownloadFailure();
+    CHECK(!segmentedLastDownloadFailure().valid());
+
+    uint64_t ignored = 0;
+    std::string error;
+    CHECK(!waitForSegmentedTrack(handle, ignored, 4000, &error));
+    releaseSegmentedTrackDownload(handle);
+    cancelSegmentedTrackDownload(plan);
+
+    // A finished (here: failed) job is no longer owed work, so it drops out of
+    // the snapshot and the panel stops claiming something is downloading.
+    for (const auto& p : segmentedDownloadProgress())
+        CHECK(p.track_id != 4242);
+
+    // The failure itself must outlive the job, or a once-a-second status
+    // reader would never see why the music stopped coming.
+    const auto failure = segmentedLastDownloadFailure();
+    CHECK(failure.valid());
+    CHECK(failure.error.find("segment") != std::string::npos);
+    CHECK(failure.ageSeconds() >= 0);
+    clearSegmentedDownloadFailure();
+    CHECK(!segmentedLastDownloadFailure().valid());
     return true;
 }
 
@@ -185,6 +241,7 @@ bool testVisibleCacheLifecycle() {
 int main() {
     if (!testGrowingCacheRead() ||
         !testRetryableFailure() ||
+        !testDownloadProgressSnapshot() ||
         !testCompletedCacheLru() ||
         !testRegistryRetention() ||
         !testVisibleCacheLifecycle())
