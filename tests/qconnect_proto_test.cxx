@@ -417,6 +417,65 @@ void testPlaybackErrorAndAutoplayQueue() {
               messages[0].mute_volume.muted,
           "fresh command-47 mute payload lost");
 
+    // Unmute travels as an empty body (None = not muted), and must still be
+    // reported as a present command so the renderer restores the volume.
+    Bytes unmute_message;
+    appendVarintField(unmute_message, 1, 47);
+    appendLengthField(unmute_message, 47, Bytes{});
+    messages.clear();
+    check(parseFrame(payloadFrame(unmute_message), messages),
+          "unmute-volume frame did not parse");
+    check(messages.size() == 1 &&
+              messages[0].type == MsgType::CMD_MUTE_VOLUME &&
+              messages[0].mute_volume.has_muted &&
+              !messages[0].mute_volume.muted,
+          "empty command-47 body did not decode as unmute");
+
+    // SrvrRndrSetShuffleMode (46) carries one optional bool. Shuffle-on sets
+    // it explicitly; shuffle-off arrives as an empty body and must still be
+    // decoded as a present "off" so the renderer stops tracking shuffle.
+    Bytes shuffle_on_body;
+    appendVarintField(shuffle_on_body, 1, 1);
+    Bytes shuffle_on_message;
+    appendVarintField(shuffle_on_message, 1, 46);
+    appendLengthField(shuffle_on_message, 46, shuffle_on_body);
+    messages.clear();
+    check(parseFrame(payloadFrame(shuffle_on_message), messages),
+          "set-shuffle-mode frame did not parse");
+    check(messages.size() == 1 &&
+              messages[0].type == MsgType::CMD_SET_SHUFFLE_MODE &&
+              messages[0].shuffle_mode.has_shuffle_on &&
+              messages[0].shuffle_mode.shuffle_on,
+          "command-46 shuffle-on payload lost");
+
+    Bytes shuffle_off_message;
+    appendVarintField(shuffle_off_message, 1, 46);
+    appendLengthField(shuffle_off_message, 46, Bytes{});
+    messages.clear();
+    check(parseFrame(payloadFrame(shuffle_off_message), messages),
+          "set-shuffle-mode off frame did not parse");
+    check(messages.size() == 1 &&
+              messages[0].type == MsgType::CMD_SET_SHUFFLE_MODE &&
+              messages[0].shuffle_mode.has_shuffle_on &&
+              !messages[0].shuffle_mode.shuffle_on,
+          "empty command-46 body did not decode as shuffle off");
+
+    // SrvrCtrlShuffleModeSet (96) is a multi-purpose broadcast: it also
+    // carries queue and autoplay fields, so a body without a shuffle field
+    // must stay "no opinion" rather than defaulting to off.
+    Bytes shuffle_set_body;
+    appendVarintField(shuffle_set_body, 6, 1); // autoplay_mode only
+    Bytes shuffle_set_message;
+    appendVarintField(shuffle_set_message, 1, 96);
+    appendLengthField(shuffle_set_message, 96, shuffle_set_body);
+    messages.clear();
+    check(parseFrame(payloadFrame(shuffle_set_message), messages),
+          "shuffle-mode-set frame did not parse");
+    check(messages.size() == 1 &&
+              messages[0].type == MsgType::SRVRC_SHUFFLE_MODE_SET &&
+              !messages[0].shuffle_mode.has_shuffle_on,
+          "message-96 without a shuffle field must not imply shuffle off");
+
     Bytes main_track;
     appendVarintField(main_track, 1, 10);
     Bytes autoplay_track;

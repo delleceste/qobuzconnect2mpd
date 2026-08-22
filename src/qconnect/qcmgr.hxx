@@ -335,8 +335,6 @@ private:
     std::atomic<bool> m_queue_loading{false};
     std::atomic<bool> m_shuffle_on{false};
     std::atomic<int>  m_loop_mode{static_cast<int>(LoopMode::OFF)};
-    std::atomic<bool> m_session_has_track_index{false};
-    std::atomic<uint32_t> m_session_track_index{0};
 
     // IPC
     int          m_ipc_sock{-1};

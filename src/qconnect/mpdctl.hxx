@@ -141,7 +141,12 @@ public:
 
     // ---- State -------------------------------------------------------------
 
-    MpdState getState();
+    // Current MPD state. When `ok` is non-null it is set to false if MPD could
+    // not be reached or refused the status command, in which case the returned
+    // state is default-constructed and must not be read as real values — a
+    // default state carries volume -1 ("no mixer") and queue_len 0 ("empty
+    // queue"), both of which are indistinguishable from genuine readings.
+    MpdState getState(bool* ok = nullptr);
 
     // Register a callback that fires on every MPD event (player/queue/mixer).
     void setStateCallback(MpdStateCallback cb);
@@ -151,7 +156,7 @@ private:
     void closeConnection();
     bool ensureConnected();
     void eventLoop();
-    MpdState fetchState();
+    bool fetchState(MpdState& out);
 
     std::string m_host;
     int         m_port;

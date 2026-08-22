@@ -574,8 +574,8 @@ bool decodeMsgSessionState(const uint8_t* d, size_t len, MsgSessionState& out) {
                 decodeQueueVersion(fd, fl, out.queue_version); break;
         case 4:
             if (!readVarint(d,len,pos,v)) return false;
-            out.track_index = static_cast<uint32_t>(v);
-            out.has_track_index = true;
+            out.field4 = static_cast<uint32_t>(v);
+            out.has_field4 = true;
             break;
         default: if (!skipField(d, len, pos, wt)) return false; break;
         }
@@ -873,8 +873,19 @@ bool decodeQueueVersionOnly(const uint8_t* d, size_t len, QueueVersion& out) {
     return true;
 }
 
+// default_off: treat a missing shuffle field as "shuffle off". Set only for
+// SrvrRndrSetShuffleMode (46), whose entire payload is that one optional bool
+// — a capture of the sibling RndrSrvrVolumeMuted (29) shows the official
+// client encoding "false" as a present-but-empty body, so absence is the
+// negative value, not "no opinion". SrvrCtrlShuffleModeSet (96) also carries
+// queue/autoplay fields and can legitimately arrive without a shuffle
+// opinion, so it keeps requiring the field to be present.
 bool decodeMsgShuffleMode(const uint8_t* d, size_t len, MsgShuffleMode& out,
-                          int shuffle_field) {
+                          int shuffle_field, bool default_off) {
+    if (default_off) {
+        out.shuffle_on = false;
+        out.has_shuffle_on = true;
+    }
     size_t pos = 0;
     while (pos < len) {
         int fn; uint8_t wt;
@@ -973,7 +984,8 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
             }
             break;
         case MsgType::CMD_SET_SHUFFLE_MODE:
-            if (!decodeMsgShuffleMode(fd, fl, msg.shuffle_mode, 1)) return false;
+            if (!decodeMsgShuffleMode(fd, fl, msg.shuffle_mode, 1,
+                                      /*default_off=*/true)) return false;
             break;
         case MsgType::CMD_SET_LOOP_MODE:
             if (!decodeMsgLoopMode(fd, fl, msg.loop_mode)) return false;
@@ -1037,7 +1049,8 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
             if (!decodeMsgQueueReordered(fd, fl, msg.tracks_reordered)) return false;
             break;
         case MsgType::SRVRC_SHUFFLE_MODE_SET:
-            if (!decodeMsgShuffleMode(fd, fl, msg.shuffle_mode, 3)) return false;
+            if (!decodeMsgShuffleMode(fd, fl, msg.shuffle_mode, 3,
+                                      /*default_off=*/false)) return false;
             break;
         case MsgType::SRVRC_LOOP_MODE_SET:
             if (!decodeMsgLoopMode(fd, fl, msg.loop_mode)) return false;
@@ -1047,6 +1060,10 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
                     fd, fl, msg.tracks_added_from_autoplay)) return false;
             break;
         case MsgType::CMD_MUTE_VOLUME: {
+            // Protocol convention (see buildVolumeMuted): None (no field) =
+            // not muted, Some(true) = muted. An unmute command therefore
+            // arrives as an empty body, which still has to be dispatched.
+            msg.mute_volume.has_muted = true;
             size_t p = 0;
             while (p < fl) {
                 int fn2; uint8_t wt2; uint64_t v;

@@ -231,10 +231,22 @@ struct MsgMuteVolume {
 
 struct MsgSessionState {
     Bytes        session_uuid;  // 16 bytes
+    // Field 2. qonductor calls this session_id, qbz calls it
+    // active_renderer_id; a capture shows the server sending 0xFFFF...FF (the
+    // -1 sentinel) when no renderer is active. We only ever echo it back in
+    // CtrlSrvrAskForRendererState, which the server accepts, so the naming
+    // does not matter to us.
     uint64_t     session_id{0};
     QueueVersion queue_version;
-    uint32_t     track_index{0};
-    bool         has_track_index{false};
+    // Field 4. Previously decoded as a queue start index. It is not one:
+    // qonductor's ws-session-debug-while-playing capture carries field4=3 in
+    // the same exchange where the renderer reports current_queue_index=1 and
+    // playing_state=Paused (PLAYING_STATE_PAUSED == 3). qbz reads it as
+    // playing_state; LOOP_MODE_REPEAT_ALL is also 3, so one capture cannot
+    // separate those two readings. Decoded for logging only — never use it to
+    // position playback until its meaning is settled.
+    uint32_t     field4{0};
+    bool         has_field4{false};
 };
 
 struct MsgRendererStateUpdated {

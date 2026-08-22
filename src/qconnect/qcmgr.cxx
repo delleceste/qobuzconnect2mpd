@@ -936,7 +936,13 @@ void QcManager::onSetState(uint64_t command_id, PlayingState ps,
 
 void QcManager::onSetVolume(uint32_t volume, int32_t delta) {
     if (!m_mpd || !m_ws_active.load(std::memory_order_relaxed)) return;
-    MpdState st = m_mpd->getState();
+    bool have_state = false;
+    MpdState st = m_mpd->getState(&have_state);
+    if (!have_state) {
+        LOGERR("QcManager: could not read MusicPD state; "
+               "dropping remote volume command\n");
+        return;
+    }
     if (st.volume < 0) {
         LOGINF("QcManager: MusicPD has no mixer; ignoring remote volume command\n");
         if (auto ws = currentWSession()) ws->reportVolume(100);
@@ -960,8 +966,14 @@ void QcManager::onSetVolume(uint32_t volume, int32_t delta) {
 
 void QcManager::onMuteVolume(bool muted) {
     if (!m_mpd || !m_ws_active.load(std::memory_order_relaxed)) return;
-    MpdState state = m_mpd->getState();
+    bool have_state = false;
+    MpdState state = m_mpd->getState(&have_state);
     auto ws = currentWSession();
+    if (!have_state) {
+        LOGERR("QcManager: could not read MusicPD state; "
+               "dropping remote mute command\n");
+        return;
+    }
     if (state.volume < 0) {
         LOGINF("QcManager: MusicPD has no mixer; ignoring remote mute command\n");
         if (ws) ws->reportMuted(false);
@@ -988,11 +1000,11 @@ void QcManager::onMuteVolume(bool muted) {
 }
 
 void QcManager::onSessionState(const MsgSessionState& state) {
-    m_session_has_track_index.store(state.has_track_index,
-                                    std::memory_order_relaxed);
-    if (state.has_track_index)
-        m_session_track_index.store(state.track_index,
-                                    std::memory_order_relaxed);
+    // Field 4 used to seed the queue start position. It is not a track index
+    // (see MsgSessionState), so nothing acts on it; log it while its meaning
+    // is still open.
+    if (state.has_field4)
+        LOGDEB("QcManager: SessionState field4=" << state.field4 << "\n");
 }
 
 void QcManager::onQueueState(const MsgQueueState& queue) {
@@ -1090,10 +1102,11 @@ void QcManager::onQueueState(const MsgQueueState& queue) {
                 break;
             }
         }
-    } else if (m_session_has_track_index.exchange(false,
-                                                   std::memory_order_relaxed)) {
-        start_idx = m_session_track_index.load(std::memory_order_relaxed);
     }
+    // A snapshot with no current item starts at the top of the queue. There is
+    // no server-supplied start index: SessionState field 4 was used here, but
+    // it is not a track index (see MsgSessionState) and made playback jump to
+    // whatever that field happened to carry.
     enqueueQueueLoad(effective_tracks, start_idx, queue.queue_version, false);
 }
 
@@ -2413,7 +2426,15 @@ void QcManager::refreshMpdState() {
     if (!m_mpd || !m_ws_active.load(std::memory_order_relaxed) ||
         m_queue_loading.load(std::memory_order_relaxed))
         return;
-    onMpdState(m_mpd->getState());
+    // Same rule as MpdCtl's event loop: a failed status read yields a default
+    // state that onMpdState would mistake for an externally emptied queue.
+    bool have_state = false;
+    MpdState st = m_mpd->getState(&have_state);
+    if (!have_state) {
+        LOGDEB("QcManager: skipping state refresh, MusicPD status unavailable\n");
+        return;
+    }
+    onMpdState(st);
 }
 
 void QcManager::prioritizeCurrentDownloads() {

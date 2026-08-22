@@ -633,11 +633,11 @@ bool MpdCtl::setLoopMode(bool repeat, bool single) {
 
 // ---- State ------------------------------------------------------------------
 
-MpdState MpdCtl::fetchState() {
-    MpdState out;
-    if (!m_conn) return out;
+bool MpdCtl::fetchState(MpdState& out) {
+    out = MpdState{};
+    if (!m_conn) return false;
     struct mpd_status* st = mpd_run_status(m_conn);
-    if (!st) return out;
+    if (!st) return false;
 
     switch (mpd_status_get_state(st)) {
     case MPD_STATE_PLAY:  out.status = MpdState::Status::PLAY;  break;
@@ -660,13 +660,15 @@ MpdState MpdCtl::fetchState() {
         out.channels = format->channels;
     }
     mpd_status_free(st);
-    return out;
+    return true;
 }
 
-MpdState MpdCtl::getState() {
+MpdState MpdCtl::getState(bool* ok) {
     std::lock_guard<std::mutex> lk(m_conn_mutex);
-    if (!ensureConnected()) return {};
-    return fetchState();
+    MpdState out;
+    bool fetched = ensureConnected() && fetchState(out);
+    if (ok) *ok = fetched;
+    return out;
 }
 
 void MpdCtl::setStateCallback(MpdStateCallback cb) {
@@ -774,11 +776,24 @@ void MpdCtl::eventLoop() {
 
         if (m_stop) break;
 
-        // Fetch current MPD state
+        // Fetch current MPD state. A failed fetch yields a default state whose
+        // queue_len is 0 and volume -1; reporting that would look exactly like
+        // "the queue was cleared behind our back, and there is no mixer", so
+        // wait for the next tick instead of broadcasting a fabricated state.
         MpdState st;
+        bool fetch_ok;
         {
             std::lock_guard<std::mutex> lk(m_conn_mutex);
-            if (ensureConnected()) st = fetchState();
+            fetch_ok = ensureConnected() && fetchState(st);
+        }
+        if (!fetch_ok) {
+            // Back off before retrying: MPD emits idle events continuously
+            // while an HTTP stream buffers, so select() returns immediately
+            // and an unthrottled `continue` would spin on the command socket.
+            LOGDEB("MpdCtl: status fetch failed; skipping this tick\n");
+            for (int i = 0; i < 5 && !m_stop.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
         }
 
         auto now = std::chrono::steady_clock::now();
