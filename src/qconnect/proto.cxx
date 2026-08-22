@@ -247,6 +247,106 @@ bool decodeQueueVersion(const uint8_t* d, size_t len, QueueVersion& out) {
     return true;
 }
 
+bool decodeError(const uint8_t* d, size_t len, MsgError& out) {
+    size_t pos = 0;
+    while (pos < len) {
+        int fn; uint8_t wt;
+        if (!readTag(d, len, pos, fn, wt)) return false;
+        const uint8_t* fd; size_t fl;
+        if ((fn == 1 || fn == 2) && wt == WT_LEN) {
+            if (!readLenField(d, len, pos, fd, fl)) return false;
+            std::string value(reinterpret_cast<const char*>(fd), fl);
+            if (fn == 1) out.code = std::move(value);
+            else out.message = std::move(value);
+        } else if (!skipField(d, len, pos, wt)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool decodePlaybackError(const uint8_t* d, size_t len,
+                         MsgPlaybackError& out) {
+    size_t pos = 0;
+    while (pos < len) {
+        int fn; uint8_t wt;
+        if (!readTag(d, len, pos, fn, wt)) return false;
+        const uint8_t* fd; size_t fl;
+        uint64_t v;
+        switch (fn) {
+        case 1:
+            if (!readLenField(d, len, pos, fd, fl) ||
+                !decodeQueueVersion(fd, fl, out.queue_version)) return false;
+            break;
+        case 2:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.queue_item_id = static_cast<int32_t>(v);
+            out.has_queue_item_id = true;
+            break;
+        case 3:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.error_type = static_cast<int32_t>(v);
+            out.has_error_type = true;
+            break;
+        default:
+            if (!skipField(d, len, pos, wt)) return false;
+            break;
+        }
+    }
+    return true;
+}
+
+bool decodeQueueError(const uint8_t* d, size_t len, MsgQueueError& out) {
+    size_t pos = 0;
+    while (pos < len) {
+        int fn; uint8_t wt;
+        if (!readTag(d, len, pos, fn, wt)) return false;
+        const uint8_t* fd; size_t fl;
+        if (wt != WT_LEN) {
+            if (!skipField(d, len, pos, wt)) return false;
+            continue;
+        }
+        if (!readLenField(d, len, pos, fd, fl)) return false;
+        if (fn == 1) {
+            if (!decodeQueueVersion(fd, fl, out.queue_version)) return false;
+        } else if (fn == 2) {
+            out.action_uuid.assign(fd, fd + fl);
+        } else if (fn == 3) {
+            if (!decodeError(fd, fl, out.error)) return false;
+        }
+    }
+    return true;
+}
+
+bool decodeAutoplayMode(const uint8_t* d, size_t len, MsgAutoplayMode& out) {
+    size_t pos = 0;
+    while (pos < len) {
+        int fn; uint8_t wt;
+        if (!readTag(d, len, pos, fn, wt)) return false;
+        uint64_t v;
+        if (fn == 1 && wt == WT_LEN) {
+            const uint8_t* fd; size_t fl;
+            if (!readLenField(d, len, pos, fd, fl) ||
+                !decodeQueueVersion(fd, fl, out.queue_version)) return false;
+        } else if ((fn == 1 || fn == 3) && wt == WT_VARINT) {
+            if (!readVarint(d, len, pos, v)) return false;
+            out.autoplay_on = v != 0;
+            out.has_autoplay_on = true;
+        } else if (fn == 4 && wt == WT_VARINT) {
+            if (!readVarint(d, len, pos, v)) return false;
+            out.autoplay_reset = v != 0;
+            out.has_autoplay_reset = true;
+        } else if (fn == 5 && wt == WT_VARINT) {
+            if (!readVarint(d, len, pos, v)) return false;
+            out.autoplay_loading = v != 0;
+            out.has_autoplay_loading = true;
+        } else if (!skipField(d, len, pos, wt)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool decodeQueueTrackRef(const uint8_t* d, size_t len, QueueTrackRef& out) {
     size_t pos = 0;
     while (pos < len) {
@@ -580,6 +680,23 @@ bool decodeMsgQueueState(const uint8_t* d, size_t len, MsgQueueState& out) {
                 out.shuffled_track_indexes.push_back(static_cast<uint32_t>(v));
             }
             break;
+        case 6:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.autoplay_on = v != 0;
+            out.has_autoplay_on = true;
+            break;
+        case 7:
+            if (!readVarint(d, len, pos, v)) return false;
+            out.autoplay_loading = v != 0;
+            out.has_autoplay_loading = true;
+            break;
+        case 8: {
+            if (!readLenField(d, len, pos, fd, fl)) return false;
+            QueueTrack track;
+            if (!decodeQueueTrack(fd, fl, track)) return false;
+            out.autoplay_tracks.push_back(std::move(track));
+            break;
+        }
         default: if (!skipField(d, len, pos, wt)) return false; break;
         }
     }
@@ -720,6 +837,26 @@ bool decodeMsgQueueReordered(const uint8_t* d, size_t len,
     return true;
 }
 
+bool decodeTracksAddedFromAutoplay(
+        const uint8_t* d, size_t len, MsgTracksAddedFromAutoplay& out) {
+    size_t pos = 0;
+    while (pos < len) {
+        int fn; uint8_t wt;
+        if (!readTag(d, len, pos, fn, wt)) return false;
+        const uint8_t* fd; size_t fl;
+        if (fn == 1 && wt == WT_LEN) {
+            if (!readLenField(d, len, pos, fd, fl) ||
+                !decodeQueueVersion(fd, fl, out.queue_version)) return false;
+        } else if (fn == 2) {
+            if (!decodeQueueItemIds(d, len, pos, wt, out.queue_item_ids))
+                return false;
+        } else if (!skipField(d, len, pos, wt)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool decodeQueueVersionOnly(const uint8_t* d, size_t len, QueueVersion& out) {
     size_t pos = 0;
     while (pos < len) {
@@ -795,10 +932,21 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
         if (!readLenField(d, len, pos, fd, fl)) return false;
 
         Message msg;
-        msg.type = static_cast<MsgType>(fn);
+        // Error and playback-error use envelope fields 2 and 3, while their
+        // declared message_type values are 1 and 2 respectively.  All regular
+        // oneof payloads use the same number for field tag and message type.
+        msg.type = fn == 2 ? MsgType::ERROR
+                 : fn == 3 ? MsgType::PLAYBACK_ERROR
+                           : static_cast<MsgType>(fn);
         bool handled = true;
 
         switch (msg.type) {
+        case MsgType::ERROR:
+            if (!decodeError(fd, fl, msg.error)) return false;
+            break;
+        case MsgType::PLAYBACK_ERROR:
+            if (!decodePlaybackError(fd, fl, msg.playback_error)) return false;
+            break;
         case MsgType::CMD_SET_STATE:
             decodeMsgSetState(fd, fl, msg.set_state); break;
         case MsgType::CMD_SET_ACTIVE:
@@ -862,6 +1010,9 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
                 }
             }
             break;
+        case MsgType::SRVRC_QUEUE_ERROR:
+            if (!decodeQueueError(fd, fl, msg.queue_error)) return false;
+            break;
         case MsgType::SRVRC_QUEUE_STATE:
             if (!decodeMsgQueueState(fd, fl, msg.queue_state)) return false;
             break;
@@ -891,9 +1042,35 @@ bool decodeQConnectMessage(const uint8_t* d, size_t len,
         case MsgType::SRVRC_LOOP_MODE_SET:
             if (!decodeMsgLoopMode(fd, fl, msg.loop_mode)) return false;
             break;
-        case MsgType::SRVRC_QUEUE_VERSION_CHANGED:
-            if (!decodeQueueVersionOnly(
-                    fd, fl, msg.queue_version_changed.queue_version)) return false;
+        case MsgType::SRVRC_TRACKS_ADDED_FROM_AUTOPLAY:
+            if (!decodeTracksAddedFromAutoplay(
+                    fd, fl, msg.tracks_added_from_autoplay)) return false;
+            break;
+        case MsgType::CMD_MUTE_VOLUME: {
+            size_t p = 0;
+            while (p < fl) {
+                int fn2; uint8_t wt2; uint64_t v;
+                if (!readTag(fd, fl, p, fn2, wt2)) return false;
+                if (fn2 == 1 && wt2 == WT_VARINT) {
+                    if (!readVarint(fd, fl, p, v)) return false;
+                    msg.mute_volume.muted = v != 0;
+                    msg.mute_volume.has_muted = true;
+                } else if (!skipField(fd, fl, p, wt2)) {
+                    return false;
+                }
+            }
+            break;
+        }
+        case MsgType::SRVRC_AUTOPLAY_MODE_SET:
+            if (!decodeAutoplayMode(fd, fl, msg.autoplay_mode)) return false;
+            break;
+        case MsgType::SRVRC_AUTOPLAY_TRACKS_LOADED:
+            if (!decodeVersionAndTracks(
+                    fd, fl, msg.autoplay_tracks_loaded.tracks,
+                    msg.autoplay_tracks_loaded.queue_version)) return false;
+            break;
+        case MsgType::SRVRC_AUTOPLAY_TRACKS_REMOVED:
+            if (!decodeMsgQueueRemoved(fd, fl, msg.tracks_removed)) return false;
             break;
         default:
             handled = false; break;
@@ -1103,14 +1280,14 @@ Bytes buildSubscribe(uint64_t msg_id, uint64_t msg_date_ms, QCloudProto proto) {
 
 Bytes buildJoinSession(uint64_t time_ms, int32_t batch_id,
                         const Bytes& session_uuid,
-                        const DeviceInfo& dev, bool is_active,
+                        const DeviceInfo& dev, int32_t reason, bool is_active,
                         const QueueRendererState& state) {
     // RndrSrvrJoinSession { session_uuid=1, device_info=2, reason=3,
     //                       initial_state=4, is_active=5 }
     Bytes msg;
     writeBytesField(msg, 1, session_uuid);
     writeMessageField(msg, 2, encodeDeviceInfo(dev));
-    writeInt32Field(msg, 3, 0); // reason=0 (initial join)
+    writeInt32Field(msg, 3, reason);
     writeMessageField(msg, 4, encodeQueueRendererState(state));
     writeBoolField(msg, 5, is_active);
 
@@ -1212,7 +1389,8 @@ Bytes buildAskQueueState(uint64_t time_ms, int32_t batch_id,
 }
 
 bool parseFrame(const uint8_t* data, size_t len, std::vector<Message>& msgs,
-                uint64_t* payload_msg_date_ms) {
+                uint64_t* payload_msg_date_ms, QwsError* qws_error,
+                QwsDisconnect* qws_disconnect) {
     if (len < 2) return false;
 
     size_t pos = 0;
@@ -1230,11 +1408,61 @@ bool parseFrame(const uint8_t* data, size_t len, std::vector<Message>& msgs,
         return decodePayload(payload, plen, msgs, payload_msg_date_ms);
     case EnvType::AUTHENTICATE:
     case EnvType::SUBSCRIBE:
-    case EnvType::DISCONNECT:
         // Server may echo these; ignore silently
         return true;
+    case EnvType::DISCONNECT:
+        if (qws_disconnect) {
+            size_t disconnect_pos = 0;
+            qws_disconnect->present = true;
+            while (disconnect_pos < plen) {
+                int fn; uint8_t wt;
+                if (!readTag(payload, plen, disconnect_pos, fn, wt))
+                    return false;
+                uint64_t v;
+                if (fn == 1 && wt == WT_VARINT) {
+                    if (!readVarint(payload, plen, disconnect_pos, v))
+                        return false;
+                    qws_disconnect->msg_id = static_cast<uint32_t>(v);
+                } else if (fn == 2 && wt == WT_VARINT) {
+                    if (!readVarint(payload, plen, disconnect_pos, v))
+                        return false;
+                } else if (fn == 3 && wt == WT_VARINT) {
+                    if (!readVarint(payload, plen, disconnect_pos, v))
+                        return false;
+                    qws_disconnect->reconnect = v != 0;
+                    qws_disconnect->has_reconnect = true;
+                } else if (!skipField(payload, plen, disconnect_pos, wt)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     case EnvType::ERROR_MSG:
-        // TODO: log error
+        if (qws_error) {
+            size_t error_pos = 0;
+            qws_error->present = true;
+            while (error_pos < plen) {
+                int fn; uint8_t wt;
+                if (!readTag(payload, plen, error_pos, fn, wt)) return false;
+                uint64_t v;
+                const uint8_t* fd; size_t fl;
+                if (fn == 1 && wt == WT_VARINT) {
+                    if (!readVarint(payload, plen, error_pos, v)) return false;
+                    qws_error->msg_id = static_cast<uint32_t>(v);
+                } else if (fn == 2 && wt == WT_VARINT) {
+                    if (!readVarint(payload, plen, error_pos, v)) return false;
+                } else if (fn == 3 && wt == WT_VARINT) {
+                    if (!readVarint(payload, plen, error_pos, v)) return false;
+                    qws_error->code = static_cast<uint32_t>(v);
+                } else if (fn == 4 && wt == WT_LEN) {
+                    if (!readLenField(payload, plen, error_pos, fd, fl)) return false;
+                    qws_error->description.assign(
+                        reinterpret_cast<const char*>(fd), fl);
+                } else if (!skipField(payload, plen, error_pos, wt)) {
+                    return false;
+                }
+            }
+        }
         return true;
     default:
         return true; // unknown type, ignore

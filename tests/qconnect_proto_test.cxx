@@ -35,6 +35,34 @@ Bytes fromHex(const char* text) {
     return out;
 }
 
+void appendVarint(Bytes& out, uint64_t value) {
+    while (value >= 0x80) {
+        out.push_back(static_cast<uint8_t>((value & 0x7f) | 0x80));
+        value >>= 7;
+    }
+    out.push_back(static_cast<uint8_t>(value));
+}
+
+void appendVarintField(Bytes& out, int field, uint64_t value) {
+    appendVarint(out, static_cast<uint64_t>(field) << 3);
+    appendVarint(out, value);
+}
+
+void appendLengthField(Bytes& out, int field, const Bytes& value) {
+    appendVarint(out, (static_cast<uint64_t>(field) << 3) | 2);
+    appendVarint(out, value.size());
+    out.insert(out.end(), value.begin(), value.end());
+}
+
+Bytes payloadFrame(const Bytes& qconnect_message) {
+    Bytes batch;
+    appendLengthField(batch, 3, qconnect_message);
+    Bytes payload;
+    appendVarintField(payload, 3, 1);
+    appendLengthField(payload, 7, batch);
+    return buildEnvelope(EnvType::PAYLOAD, payload);
+}
+
 bool readVarint(Span input, size_t& position, uint64_t& value) {
     value = 0;
     unsigned shift = 0;
@@ -146,7 +174,7 @@ constexpr const char* QUEUE_INSERT_BEFORE_ZERO =
     "1a02080020ffffffffffffffffff01";
 constexpr const char* QUEUE_CLEARED =
     "061f080110d20918013a1609d20400000000000010071a090859ca05040a02080b";
-constexpr const char* QUEUE_VERSION_CHANGED =
+constexpr const char* TRACKS_ADDED_FROM_AUTOPLAY =
     "0621080110d20918013a1809d20400000000000010071a0b0869ca06060a04080c1002";
 constexpr const char* SHUFFLE_ZERO =
     "0628080110d20918013a1f09d20400000000000010071a12086082060d0a02080d"
@@ -233,11 +261,11 @@ void testGeneratedFixtures() {
     }
     {
         std::vector<Message> messages;
-        const auto& msg = parseOne(QUEUE_VERSION_CHANGED, messages);
-        check(msg.type == MsgType::SRVRC_QUEUE_VERSION_CHANGED,
-              "queue-version-change id is not 105");
-        check(msg.queue_version_changed.queue_version.major == 12,
-              "queue-version-change payload lost");
+        const auto& msg = parseOne(TRACKS_ADDED_FROM_AUTOPLAY, messages);
+        check(msg.type == MsgType::SRVRC_TRACKS_ADDED_FROM_AUTOPLAY,
+              "tracks-added-from-autoplay id is not 105");
+        check(msg.tracks_added_from_autoplay.queue_version.major == 12,
+              "tracks-added-from-autoplay version lost");
     }
     {
         std::vector<Message> messages;
@@ -291,6 +319,160 @@ void testOutboundPresence() {
           "outbound position zero lost");
 }
 
+void testRendererReconnectJoin() {
+    DeviceInfo device;
+    device.uuid = Bytes(16, 1);
+    QueueRendererState state;
+    state.state.playing_state = PlayingState::PLAYING;
+    Bytes frame = buildJoinSession(1000, 1, Bytes(16, 2), device,
+                                   2, true, state);
+    Span payload = envelopePayload(frame);
+    Span batch, qconnect_message, join;
+    check(findLengthField(payload, 7, batch), "missing reconnect batch");
+    check(findLengthField(batch, 3, qconnect_message),
+          "missing reconnect message");
+    check(findLengthField(qconnect_message, 21, join),
+          "missing renderer join body");
+    uint64_t value = 0;
+    check(findVarintField(join, 3, value) && value == 2,
+          "renderer reconnect reason missing");
+    check(findVarintField(join, 5, value) && value == 1,
+          "renderer reconnect active flag missing");
+}
+
+void testQwsErrorFrame() {
+    Bytes payload;
+    appendVarintField(payload, 1, 7);
+    appendVarintField(payload, 2, 9);
+    appendVarintField(payload, 3, 42);
+    appendLengthField(payload, 4, Bytes{'r', 'e', 'j', 'e', 'c', 't'});
+    Bytes frame = buildEnvelope(EnvType::ERROR_MSG, payload);
+    std::vector<Message> messages;
+    QwsError error;
+    check(parseFrame(frame, messages, nullptr, &error),
+          "QWS error frame did not parse");
+    check(error.present && error.msg_id == 7 && error.code == 42,
+          "QWS error scalar fields lost");
+    check(error.description == "reject", "QWS error description lost");
+    Bytes disconnect_payload;
+    appendVarintField(disconnect_payload, 1, 8);
+    appendVarintField(disconnect_payload, 2, 10);
+    appendVarintField(disconnect_payload, 3, 1);
+    Bytes disconnect_frame =
+        buildEnvelope(EnvType::DISCONNECT, disconnect_payload);
+    QwsDisconnect disconnect;
+    check(parseFrame(disconnect_frame, messages, nullptr, nullptr,
+                     &disconnect),
+          "QWS disconnect frame did not parse");
+    check(disconnect.present && disconnect.msg_id == 8 &&
+              disconnect.has_reconnect && disconnect.reconnect,
+          "QWS disconnect fields lost");
+}
+
+void testPlaybackErrorAndAutoplayQueue() {
+    Bytes queue_version;
+    appendVarintField(queue_version, 1, 2);
+    Bytes playback_error;
+    appendLengthField(playback_error, 1, queue_version);
+    appendVarintField(playback_error, 2, 55);
+    appendVarintField(playback_error, 3, 2);
+    Bytes playback_message;
+    appendVarintField(playback_message, 1, 2);
+    appendLengthField(playback_message, 3, playback_error);
+    std::vector<Message> messages;
+    check(parseFrame(payloadFrame(playback_message), messages),
+          "playback error frame did not parse");
+    check(messages.size() == 1 && messages[0].type == MsgType::PLAYBACK_ERROR,
+          "playback error message missing");
+    check(messages[0].playback_error.queue_item_id == 55 &&
+          messages[0].playback_error.error_type == 2,
+          "playback error payload lost");
+
+    Bytes qconnect_error;
+    appendLengthField(qconnect_error, 1, Bytes{'E', '1'});
+    appendLengthField(qconnect_error, 2, Bytes{'b', 'a', 'd'});
+    Bytes error_message;
+    appendVarintField(error_message, 1, 1);
+    appendLengthField(error_message, 2, qconnect_error);
+    messages.clear();
+    check(parseFrame(payloadFrame(error_message), messages),
+          "QConnect error frame did not parse");
+    check(messages.size() == 1 && messages[0].type == MsgType::ERROR,
+          "QConnect error message missing");
+    check(messages[0].error.code == "E1" &&
+              messages[0].error.message == "bad",
+          "QConnect error payload lost");
+
+    Bytes mute;
+    appendVarintField(mute, 1, 1);
+    Bytes mute_message;
+    appendVarintField(mute_message, 1, 47);
+    appendLengthField(mute_message, 47, mute);
+    messages.clear();
+    check(parseFrame(payloadFrame(mute_message), messages),
+          "mute-volume frame did not parse");
+    check(messages.size() == 1 &&
+              messages[0].type == MsgType::CMD_MUTE_VOLUME &&
+              messages[0].mute_volume.has_muted &&
+              messages[0].mute_volume.muted,
+          "fresh command-47 mute payload lost");
+
+    Bytes main_track;
+    appendVarintField(main_track, 1, 10);
+    Bytes autoplay_track;
+    appendVarintField(autoplay_track, 1, 20);
+    Bytes queue_state;
+    appendLengthField(queue_state, 3, main_track);
+    appendVarintField(queue_state, 6, 1);
+    appendLengthField(queue_state, 8, autoplay_track);
+    Bytes queue_message;
+    appendVarintField(queue_message, 1, 90);
+    appendLengthField(queue_message, 90, queue_state);
+    messages.clear();
+    check(parseFrame(payloadFrame(queue_message), messages),
+          "autoplay queue frame did not parse");
+    check(messages.size() == 1 && messages[0].queue_state.tracks.size() == 1 &&
+          messages[0].queue_state.autoplay_tracks.size() == 1,
+          "autoplay queue tracks lost");
+    check(messages[0].queue_state.has_autoplay_on &&
+          messages[0].queue_state.autoplay_on,
+          "autoplay mode lost from queue state");
+
+    Bytes autoplay_mode;
+    appendLengthField(autoplay_mode, 1, queue_version);
+    appendVarintField(autoplay_mode, 3, 1);
+    appendVarintField(autoplay_mode, 4, 1);
+    appendVarintField(autoplay_mode, 5, 0);
+    Bytes autoplay_mode_message;
+    appendVarintField(autoplay_mode_message, 1, 102);
+    appendLengthField(autoplay_mode_message, 102, autoplay_mode);
+    messages.clear();
+    check(parseFrame(payloadFrame(autoplay_mode_message), messages),
+          "autoplay-mode-set frame did not parse");
+    check(messages.size() == 1 && messages[0].autoplay_mode.has_autoplay_on &&
+              messages[0].autoplay_mode.autoplay_on,
+          "new autoplay-mode-set layout lost");
+    check(messages[0].autoplay_mode.has_autoplay_reset &&
+              messages[0].autoplay_mode.autoplay_reset,
+          "autoplay reset flag lost");
+    Bytes promoted;
+    appendLengthField(promoted, 1, queue_version);
+    appendVarintField(promoted, 2, 20);
+    appendVarintField(promoted, 2, 21);
+    Bytes promoted_message;
+    appendVarintField(promoted_message, 1, 105);
+    appendLengthField(promoted_message, 105, promoted);
+    messages.clear();
+    check(parseFrame(payloadFrame(promoted_message), messages),
+          "tracks-added-from-autoplay frame did not parse");
+    check(messages.size() == 1 &&
+              messages[0].type == MsgType::SRVRC_TRACKS_ADDED_FROM_AUTOPLAY,
+          "tracks-added-from-autoplay message missing");
+    check(messages[0].tracks_added_from_autoplay.queue_item_ids ==
+              std::vector<uint64_t>({20, 21}),
+          "tracks-added-from-autoplay IDs lost");
+}
+
 uint64_t payloadMessageId(const Bytes& frame) {
     Span payload = envelopePayload(frame);
     uint64_t id = 0;
@@ -325,6 +507,9 @@ int main() {
     try {
         testGeneratedFixtures();
         testOutboundPresence();
+        testRendererReconnectJoin();
+        testQwsErrorFrame();
+        testPlaybackErrorAndAutoplayQueue();
         testConcurrentMessageIds();
         std::cout << "qconnect protocol fixtures passed\n";
         return 0;

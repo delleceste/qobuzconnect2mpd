@@ -685,8 +685,8 @@ void MpdCtl::eventLoop() {
     // Rate-limiting state: fire callback at most once per POSITION_REPORT_MS
     // during playback, and immediately on real state changes.
     auto last_cb = std::chrono::steady_clock::now();
-    MpdState::Status last_status  = MpdState::Status::UNKNOWN;
-    int              last_queue_pos = -1;
+    MpdState last_state;
+    bool     have_last_state = false;
 
     auto reconnect_idle = [this]() {
         if (m_idle_conn) mpd_connection_free(m_idle_conn);
@@ -789,8 +789,17 @@ void MpdCtl::eventLoop() {
         // before the WSession seek-ack (which carries the correct position).
         // Real state changes (PLAY/PAUSE/track switch) are still forwarded so
         // the phone stays responsive to those events.
-        bool state_changed = (st.status != last_status ||
-                               st.queue_pos != last_queue_pos);
+        bool state_changed = !have_last_state ||
+            st.status != last_state.status ||
+            st.volume != last_state.volume ||
+            st.queue_pos != last_state.queue_pos ||
+            st.queue_id != last_state.queue_id ||
+            st.next_queue_pos != last_state.next_queue_pos ||
+            st.queue_len != last_state.queue_len ||
+            st.duration_ms != last_state.duration_ms ||
+            st.sample_rate != last_state.sample_rate ||
+            st.bits != last_state.bits ||
+            st.channels != last_state.channels;
         {
             uint64_t now_ms = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -811,8 +820,8 @@ void MpdCtl::eventLoop() {
                 if (m_state_cb) m_state_cb(st);
             }
             last_cb        = now;
-            last_status    = st.status;
-            last_queue_pos = st.queue_pos;
+            last_state      = st;
+            have_last_state = true;
         } else if (!m_stop) {
             // MPD fires events continuously during HTTP streaming (buffer /
             // bitrate events).  If we have nothing to report yet, sleep up

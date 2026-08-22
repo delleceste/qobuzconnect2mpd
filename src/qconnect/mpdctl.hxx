@@ -35,7 +35,7 @@ struct MpdState {
     Status   status{Status::UNKNOWN};
     uint32_t position_ms{0};
     uint32_t duration_ms{0};
-    uint32_t volume{0};         // 0-100
+    int      volume{-1};        // 0-100, -1 when MPD has no mixer
     int      queue_pos{-1};     // current song position in queue
     int      queue_id{-1};      // current song MPD id
     int      next_queue_pos{-1}; // MPD's actual next song (honours random)

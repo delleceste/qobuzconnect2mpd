@@ -37,11 +37,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mpd/audio_format.h>
 #include <mutex>
 #include <openssl/rand.h>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 static uint64_t nowMs() {
     using namespace std::chrono;
@@ -61,7 +63,9 @@ static std::string formatMs(uint32_t ms) {
 static std::string compactAudioFormat(const MpdState& state) {
     if (state.sample_rate == 0) return {};
     std::string value = std::to_string(state.sample_rate);
-    if (state.bits > 0) value += "," + std::to_string(state.bits);
+    if (state.bits == MPD_SAMPLE_FORMAT_FLOAT) value += ",float";
+    else if (state.bits == MPD_SAMPLE_FORMAT_DSD) value += ",dsd";
+    else if (state.bits > 0) value += "," + std::to_string(state.bits);
     if (state.channels > 0) value += "," + std::to_string(state.channels);
     return value;
 }
@@ -431,6 +435,9 @@ bool QcManager::start() {
         std::lock_guard<std::mutex> lk(m_reconnect_mutex);
         m_reconnect_stop = false;
         m_reconnect_pending = false;
+        m_reconnect_established = false;
+        m_cloud_session_accepted = false;
+        m_reconnect_generation = m_session_generation.load();
     }
     m_reconnect_thread = std::thread(&QcManager::reconnectLoop, this);
 
@@ -510,6 +517,7 @@ void QcManager::stop() {
         m_track_titles.clear();
         m_track_segment_tokens.clear();
         m_all_queue_item_ids.clear();
+        m_autoplay_item_ids.clear();
     }
     removeAllMaterializedFiles();
 
@@ -525,25 +533,52 @@ void QcManager::run() {
 
 // ---- Qobuz app connection --------------------------------------------------
 
-void QcManager::onConnect(ConnectCredentials creds) {
+bool QcManager::onConnect(
+        ConnectCredentials creds, bool reconnecting,
+        std::optional<uint64_t> expected_generation) {
     std::lock_guard<std::mutex> connect_lk(m_connect_mutex);
     if (m_stopping.load(std::memory_order_acquire)) {
         LOGINF("QcManager: ignoring Qobuz connection during shutdown\n");
-        return;
+        return false;
     }
+
+    const uint64_t observed_generation =
+        m_session_generation.load(std::memory_order_acquire);
+    if (expected_generation && *expected_generation != observed_generation) {
+        LOGINF("QcManager: abandoning stale reconnect attempt for generation "
+               << *expected_generation << "; current generation is "
+               << observed_generation << "\n");
+        return false;
+    }
+    const uint64_t generation = observed_generation + 1;
+    m_session_generation.store(generation, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(m_reconnect_mutex);
+        m_cloud_session_accepted = false;
+    }
+    // Wake a retry which may be throttling for the session just superseded.
+    m_reconnect_cv.notify_all();
 
     LOGINF("QcManager: Qobuz app connected\n");
 
-    // Fully retire an existing renderer session before installing its
-    // replacement. Otherwise its loader and MPD events can leak into the new
-    // WSession before SetActive arrives.
+    // Retire only the transport. A network/JWT reconnect must keep MusicPD and
+    // the Qobuz queue intact until the cloud explicitly deactivates us.
     std::shared_ptr<WSession> old;
+    QueueRendererState initial_state;
+    initial_state.state.playing_state = PlayingState::STOPPED;
+    initial_state.state.buffer_state = BufferState::OK;
+    initial_state.state.has_position = true;
+    initial_state.state.position_timestamp_ms = nowMs();
+    const bool preserve_active =
+        m_ws_active.load(std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(m_session_mutex);
         old = m_ws;
     }
+    const bool rejoining = reconnecting || (old && !old->isConnected());
+
     if (old) {
-        deactivateRenderer();
+        initial_state = old->stateSnapshot();
         {
             std::lock_guard<std::mutex> lk(m_session_mutex);
             if (m_ws == old) m_ws.reset();
@@ -556,50 +591,39 @@ void QcManager::onConnect(ConnectCredentials creds) {
 
     // Build WSession callbacks
     WSessionCallbacks cbs;
-    cbs.on_set_state  = [this](uint64_t command_id, PlayingState ps,
-                                uint32_t pos_ms,
-                                bool has_pos,
-                                const QueueTrackRef& cur) {
-        onSetState(command_id, ps, pos_ms, has_pos, cur);
+    auto bind_current = [this, generation](auto callback) {
+        return [this, generation, callback](auto&&... args) {
+            if (isCurrentSession(generation))
+                (this->*callback)(
+                    std::forward<decltype(args)>(args)...);
+        };
     };
-    cbs.on_set_volume = [this](uint32_t v, int32_t d) {
-        onSetVolume(v, d);
+    cbs.on_set_state = bind_current(&QcManager::onSetState);
+    cbs.on_set_volume = bind_current(&QcManager::onSetVolume);
+    cbs.on_mute_volume = bind_current(&QcManager::onMuteVolume);
+    cbs.on_set_active = bind_current(&QcManager::onSetActive);
+    cbs.on_session_state = bind_current(&QcManager::onSessionState);
+    cbs.on_queue_state = bind_current(&QcManager::onQueueState);
+    cbs.on_queue_load = bind_current(&QcManager::onQueueLoad);
+    cbs.on_queue_cleared = bind_current(&QcManager::onQueueCleared);
+    cbs.on_tracks_inserted = bind_current(&QcManager::onTracksInserted);
+    cbs.on_tracks_added = bind_current(&QcManager::onTracksAdded);
+    cbs.on_tracks_removed = bind_current(&QcManager::onTracksRemoved);
+    cbs.on_tracks_reordered = bind_current(&QcManager::onTracksReordered);
+    cbs.on_shuffle_mode = bind_current(&QcManager::onShuffleMode);
+    cbs.on_loop_mode = bind_current(&QcManager::onLoopMode);
+    cbs.on_autoplay_mode = bind_current(&QcManager::onAutoplayMode);
+    cbs.on_autoplay_tracks_loaded =
+        bind_current(&QcManager::onAutoplayTracksLoaded);
+    cbs.on_autoplay_tracks_removed =
+        bind_current(&QcManager::onAutoplayTracksRemoved);
+    cbs.on_connected = [this, generation]() { onWsConnected(generation); };
+    cbs.on_disconnected = [this, generation](bool error) {
+        onWsDisconnected(generation, error);
     };
-    cbs.on_set_active = [this](bool active) { onSetActive(active); };
-    cbs.on_session_state = [this](const MsgSessionState& state) {
-        onSessionState(state);
-    };
-    cbs.on_queue_state = [this](const MsgQueueState& queue) {
-        onQueueState(queue);
-    };
-    cbs.on_queue_load = [this](const MsgQueueLoadTracks& queue) {
-        onQueueLoad(queue);
-    };
-    cbs.on_queue_cleared = [this](const MsgQueueCleared& queue) {
-        onQueueCleared(queue);
-    };
-    cbs.on_tracks_inserted = [this](const MsgQueueTracksInserted& update) {
-        onTracksInserted(update);
-    };
-    cbs.on_tracks_added = [this](const MsgQueueTracksAdded& update) {
-        onTracksAdded(update);
-    };
-    cbs.on_tracks_removed = [this](const MsgQueueTracksRemoved& update) {
-        onTracksRemoved(update);
-    };
-    cbs.on_tracks_reordered = [this](const MsgQueueTracksReordered& update) {
-        onTracksReordered(update);
-    };
-    cbs.on_shuffle_mode = [this](const MsgShuffleMode& update) {
-        onShuffleMode(update);
-    };
-    cbs.on_loop_mode = [this](const MsgLoopMode& update) {
-        onLoopMode(update);
-    };
-    cbs.on_connected    = [this]() { onWsConnected(); };
-    cbs.on_disconnected = [this](bool error) { onWsDisconnected(error); };
 
-    auto ws = std::make_shared<WSession>(m_devinfo, cbs);
+    auto ws = std::make_shared<WSession>(m_devinfo, cbs, rejoining,
+                                         preserve_active, initial_state);
     {
         // Install ownership before connect() starts its receive/callback
         // threads. A fast SessionState/SetActive callback must be able to find
@@ -613,18 +637,36 @@ void QcManager::onConnect(ConnectCredentials creds) {
             std::lock_guard<std::mutex> lk(m_session_mutex);
             if (m_ws == ws) m_ws.reset();
         }
-        deactivateRenderer();
+        if (!preserve_active)
+            m_ws_active.store(false, std::memory_order_relaxed);
+        requestReconnect(generation);
+        return false;
     }
+    return true;
 }
 
 // ---- WSession callbacks ----------------------------------------------------
 
-void QcManager::onWsConnected() {
+bool QcManager::isCurrentSession(uint64_t generation) const {
+    return !m_stopping.load(std::memory_order_acquire) &&
+           generation == m_session_generation.load(std::memory_order_acquire);
+}
+
+void QcManager::onWsConnected(uint64_t generation) {
+    if (!isCurrentSession(generation)) return;
     LOGINF("QcManager: WebSocket session connected\n");
     // SessionState is received only after Qobuz has accepted the cloud JWT
     // minted with our OAuth user token. Keep this at LOGSTD so service health
     // checks have an unambiguous success line even at the default log level.
     LOGSTD("qobuzconnect2mpd: Qobuz plugin connected\n");
+    {
+        std::lock_guard<std::mutex> lk(m_reconnect_mutex);
+        if (!isCurrentSession(generation)) return;
+        m_reconnect_established = true;
+        m_cloud_session_accepted = true;
+        m_reconnect_pending = false;
+    }
+    m_reconnect_cv.notify_all();
 }
 
 void QcManager::cancelQueueOperations() {
@@ -647,6 +689,13 @@ void QcManager::cancelQueueOperations() {
 
 void QcManager::deactivateRenderer() {
     m_ws_active = false;
+    int muted_volume = m_volume_before_mute.exchange(
+        -1, std::memory_order_relaxed);
+    if (muted_volume >= 0 && m_mpd &&
+        !m_mpd->setVolume(static_cast<uint32_t>(muted_volume))) {
+        LOGERR("QcManager: could not restore MusicPD volume after mute\n");
+    }
+
     cancelQueueOperations();
     bool restored = true;
     std::vector<std::string> stale_paths;
@@ -658,6 +707,7 @@ void QcManager::deactivateRenderer() {
             stale_paths.swap(m_track_local_paths);
             m_queue_item_ids.clear();
             m_all_queue_item_ids.clear();
+            m_autoplay_item_ids.clear();
             m_track_sample_rates.clear();
             m_track_titles.clear();
             m_track_segment_tokens.clear();
@@ -686,15 +736,17 @@ void QcManager::onSetActive(bool active) {
     m_ws_active = true;
     notifyUpmpdcli("PLAYING\n");
     LOGINF("QcManager: renderer active\n");
+    refreshMpdState();
 }
 
-void QcManager::onWsDisconnected(bool error) {
-    deactivateRenderer();
+void QcManager::onWsDisconnected(uint64_t generation, bool error) {
+    if (!isCurrentSession(generation)) return;
     if (error) {
-        LOGERR("QcManager: WebSocket connection lost — reconnecting\n");
+        LOGERR("QcManager: WebSocket connection lost — preserving MusicPD "
+               "playback while reconnecting\n");
         // Runs on the WSession callback thread. Only signal here: the actual
         // reconnect tears this session down, which joins this very thread.
-        requestReconnect();
+        requestReconnect(generation);
     } else {
         LOGINF("QcManager: WebSocket session ended (replaced or stopped)\n");
     }
@@ -707,9 +759,13 @@ void QcManager::onWsDisconnected(bool error) {
 // The daemon mints fresh credentials from the cached OAuth token, so it can
 // rebuild the session without the phone and without a process restart — which
 // would also needlessly tear down MPD, mDNS and the HTTP endpoint.
-bool QcManager::connectCloudWebSocket() {
+bool QcManager::connectCloudWebSocket(
+        bool reconnecting,
+        std::optional<uint64_t> expected_generation) {
     if (m_stopping.load(std::memory_order_acquire)) return false;
     if (!m_api || m_api->userToken().empty()) return false;
+    if (expected_generation && *expected_generation !=
+            m_session_generation.load(std::memory_order_acquire)) return false;
 
     std::string ws_endpoint, ws_jwt;
     if (!m_api->fetchQwsToken(ws_endpoint, ws_jwt)) return false;
@@ -718,17 +774,19 @@ bool QcManager::connectCloudWebSocket() {
     ConnectCredentials cloud_creds;
     cloud_creds.ws_endpoint = ws_endpoint;
     cloud_creds.ws_jwt      = ws_jwt;
-    onConnect(std::move(cloud_creds));
-
-    std::lock_guard<std::mutex> lk(m_session_mutex);
-    return m_ws != nullptr;
+    return onConnect(std::move(cloud_creds), reconnecting,
+                     expected_generation);
 }
 
-void QcManager::requestReconnect() {
+void QcManager::requestReconnect(uint64_t generation) {
+    if (generation == 0)
+        generation = m_session_generation.load(std::memory_order_acquire);
     {
         std::lock_guard<std::mutex> lk(m_reconnect_mutex);
-        if (m_reconnect_stop) return;
+        if (m_reconnect_stop || !isCurrentSession(generation)) return;
+        m_cloud_session_accepted = false;
         m_reconnect_pending = true;
+        m_reconnect_generation = generation;
     }
     m_reconnect_cv.notify_all();
 }
@@ -746,7 +804,18 @@ void QcManager::reconnectLoop() {
             return m_reconnect_stop || m_reconnect_pending;
         });
         if (m_reconnect_stop) break;
+        const uint64_t target_generation = m_reconnect_generation;
         m_reconnect_pending = false;
+
+        if (m_reconnect_established) {
+            backoff = BACKOFF_INITIAL_S;
+            last_attempt = {};
+            m_reconnect_established = false;
+        }
+
+        if (m_cloud_session_accepted || target_generation !=
+                m_session_generation.load(std::memory_order_acquire))
+            continue;
 
         // Without an OAuth token the daemon cannot mint a JWT. mDNS and the
         // HTTP endpoint are still up, so the phone can hand us credentials.
@@ -764,26 +833,39 @@ void QcManager::reconnectLoop() {
         const auto gap = std::chrono::seconds(backoff);
         if (last_attempt.time_since_epoch().count() && now - last_attempt < gap) {
             m_reconnect_cv.wait_for(lk, gap - (now - last_attempt),
-                                    [this] { return m_reconnect_stop; });
+                                    [this, target_generation] {
+                return m_reconnect_stop || m_cloud_session_accepted ||
+                       target_generation != m_session_generation.load(
+                           std::memory_order_acquire);
+            });
             if (m_reconnect_stop) break;
         }
+        if (m_cloud_session_accepted || target_generation !=
+                m_session_generation.load(std::memory_order_acquire))
+            continue;
         last_attempt = std::chrono::steady_clock::now();
 
         lk.unlock();
-        bool ok = connectCloudWebSocket();
+        bool ok = connectCloudWebSocket(true, target_generation);
         lk.lock();
         if (m_reconnect_stop) break;
 
         if (ok) {
-            LOGINF("QcManager: cloud WebSocket re-established\n");
-            backoff = BACKOFF_INITIAL_S;
+            LOGINF("QcManager: cloud WebSocket transport re-established; "
+                   "waiting for SESSION_STATE acceptance\n");
+            backoff = std::min(backoff * 2, BACKOFF_MAX_S);
             continue;
         }
+
+        if (m_cloud_session_accepted || target_generation !=
+                m_session_generation.load(std::memory_order_acquire))
+            continue;
 
         backoff = std::min(backoff * 2, BACKOFF_MAX_S);
         LOGERR("QcManager: reconnect failed — retrying in " << backoff << "s\n");
         // Re-arm: nothing else will signal us, the drop is already known.
         m_reconnect_pending = true;
+        m_reconnect_generation = target_generation;
     }
 }
 
@@ -792,6 +874,7 @@ void QcManager::stopReconnectWorker() {
         std::lock_guard<std::mutex> lk(m_reconnect_mutex);
         m_reconnect_stop = true;
         m_reconnect_pending = false;
+        m_cloud_session_accepted = false;
     }
     m_reconnect_cv.notify_all();
     if (m_reconnect_thread.joinable()) m_reconnect_thread.join();
@@ -853,15 +936,55 @@ void QcManager::onSetState(uint64_t command_id, PlayingState ps,
 
 void QcManager::onSetVolume(uint32_t volume, int32_t delta) {
     if (!m_mpd || !m_ws_active.load(std::memory_order_relaxed)) return;
+    MpdState st = m_mpd->getState();
+    if (st.volume < 0) {
+        LOGINF("QcManager: MusicPD has no mixer; ignoring remote volume command\n");
+        if (auto ws = currentWSession()) ws->reportVolume(100);
+        return;
+    }
+    bool applied;
     if (delta != 0) {
-        MpdState st = m_mpd->getState();
-        int new_vol = static_cast<int>(st.volume) + delta;
+        int new_vol = st.volume + delta;
         if (new_vol < 0)   new_vol = 0;
         if (new_vol > 100) new_vol = 100;
-        m_mpd->setVolume(static_cast<uint32_t>(new_vol));
+        applied = m_mpd->setVolume(static_cast<uint32_t>(new_vol));
     } else {
-        m_mpd->setVolume(volume);
+        applied = m_mpd->setVolume(std::min(volume, 100U));
     }
+    if (applied) m_volume_before_mute.store(-1, std::memory_order_relaxed);
+    if (!applied) {
+        LOGERR("QcManager: MusicPD rejected remote volume command\n");
+        refreshMpdState();
+    }
+}
+
+void QcManager::onMuteVolume(bool muted) {
+    if (!m_mpd || !m_ws_active.load(std::memory_order_relaxed)) return;
+    MpdState state = m_mpd->getState();
+    auto ws = currentWSession();
+    if (state.volume < 0) {
+        LOGINF("QcManager: MusicPD has no mixer; ignoring remote mute command\n");
+        if (ws) ws->reportMuted(false);
+        return;
+    }
+
+    int target = state.volume;
+    if (muted) {
+        int unset = -1;
+        m_volume_before_mute.compare_exchange_strong(
+            unset, state.volume, std::memory_order_relaxed);
+        target = 0;
+    } else {
+        int saved = m_volume_before_mute.exchange(-1,
+                                                   std::memory_order_relaxed);
+        if (saved >= 0) target = saved;
+    }
+    if (!m_mpd->setVolume(static_cast<uint32_t>(std::clamp(target, 0, 100)))) {
+        LOGERR("QcManager: MusicPD rejected remote mute command\n");
+        refreshMpdState();
+        return;
+    }
+    if (ws) ws->reportMuted(muted);
 }
 
 void QcManager::onSessionState(const MsgSessionState& state) {
@@ -901,6 +1024,15 @@ void QcManager::onQueueState(const MsgQueueState& queue) {
             LOGERR("QcManager: ignored invalid shuffled queue permutation\n");
         }
     }
+    effective_tracks.insert(effective_tracks.end(), queue.autoplay_tracks.begin(),
+                            queue.autoplay_tracks.end());
+    {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        m_autoplay_item_ids.clear();
+        m_autoplay_item_ids.reserve(queue.autoplay_tracks.size());
+        for (const auto& track : queue.autoplay_tracks)
+            m_autoplay_item_ids.push_back(track.queue_item_id);
+    }
     if (effective_tracks.empty()) {
         MsgQueueCleared cleared;
         cleared.queue_version = queue.queue_version;
@@ -908,12 +1040,13 @@ void QcManager::onQueueState(const MsgQueueState& queue) {
         return;
     }
 
-    bool same = false;
+    bool same = !m_queue_resync_pending.exchange(false,
+                                                  std::memory_order_relaxed);
     uint64_t current_qid = 0;
     bool has_current = false;
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        same = effective_tracks.size() == m_all_queue_item_ids.size();
+        same = same && effective_tracks.size() == m_all_queue_item_ids.size();
         if (same) {
             for (size_t i = 0; i < effective_tracks.size(); ++i) {
                 if (effective_tracks[i].queue_item_id != m_all_queue_item_ids[i]) {
@@ -968,6 +1101,10 @@ void QcManager::onQueueLoad(const MsgQueueLoadTracks& queue) {
     if (!m_ws_active.load(std::memory_order_relaxed)) return;
     if (queue.has_shuffle_on)
         m_shuffle_on.store(queue.shuffle_on, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        m_autoplay_item_ids.clear();
+    }
     // QueueLoadTracks is the controller's replace-and-play action. QueueState
     // is only a snapshot and deliberately uses the non-playing path above.
     enqueueQueueLoad(queue.tracks,
@@ -991,6 +1128,7 @@ void QcManager::onQueueCleared(const MsgQueueCleared& update) {
         stale_paths.swap(m_track_local_paths);
         m_queue_item_ids.clear();
         m_all_queue_item_ids.clear();
+        m_autoplay_item_ids.clear();
         m_track_sample_rates.clear();
         m_track_titles.clear();
         m_track_segment_tokens.clear();
@@ -1197,6 +1335,62 @@ void QcManager::onLoopMode(const MsgLoopMode& update) {
     }
 }
 
+void QcManager::onAutoplayMode(const MsgAutoplayMode& update) {
+    if (!m_ws_active.load(std::memory_order_relaxed) ||
+        !update.has_autoplay_on) return;
+    LOGINF("QcManager: autoplay " << (update.autoplay_on ? "enabled" : "disabled")
+           << "\n");
+    // Mode changes may add or discard the server's separate autoplay tail.
+    // Pull the complete authoritative snapshot instead of guessing that delta.
+    requestQueueResync("autoplay mode changed", false);
+}
+
+void QcManager::onAutoplayTracksLoaded(
+        const MsgAutoplayTracksLoaded& update) {
+    if (!m_ws_active.load(std::memory_order_relaxed) || update.tracks.empty())
+        return;
+    std::vector<QueueTrack> new_tracks;
+    {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        for (const auto& track : update.tracks) {
+            auto autoplay = std::find(m_autoplay_item_ids.begin(),
+                                      m_autoplay_item_ids.end(),
+                                      track.queue_item_id);
+            if (autoplay == m_autoplay_item_ids.end()) {
+                m_autoplay_item_ids.push_back(track.queue_item_id);
+                if (std::find(m_all_queue_item_ids.begin(),
+                              m_all_queue_item_ids.end(),
+                              track.queue_item_id) == m_all_queue_item_ids.end())
+                    new_tracks.push_back(track);
+            }
+        }
+    }
+    if (new_tracks.empty()) return;
+    MsgQueueTracksAdded added;
+    added.queue_version = update.queue_version;
+    added.tracks = std::move(new_tracks);
+    onTracksAdded(added);
+}
+
+void QcManager::onAutoplayTracksRemoved(
+        const MsgQueueTracksRemoved& update) {
+    std::vector<uint64_t> removed_ids;
+    {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        for (uint64_t qid : update.queue_item_ids) {
+            auto autoplay = std::find(m_autoplay_item_ids.begin(),
+                                      m_autoplay_item_ids.end(), qid);
+            if (autoplay == m_autoplay_item_ids.end()) continue;
+            m_autoplay_item_ids.erase(autoplay);
+            removed_ids.push_back(qid);
+        }
+    }
+    if (removed_ids.empty()) return;
+    MsgQueueTracksRemoved filtered = update;
+    filtered.queue_item_ids = std::move(removed_ids);
+    onTracksRemoved(filtered);
+}
+
 // ---- MPD state callback ----------------------------------------------------
 
 void QcManager::onMpdState(const MpdState& st) {
@@ -1207,9 +1401,15 @@ void QcManager::onMpdState(const MpdState& st) {
     auto ws = currentWSession();
     if (!ws) return;
     {
+        std::unique_lock<std::mutex> apply_lk(m_queue_apply_mutex,
+                                              std::try_to_lock);
+        if (!apply_lk.owns_lock())
+            return; // MPD event sampled while our own atomic queue commit runs
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        if (st.queue_len != static_cast<int>(m_queue_item_ids.size()))
-            return; // transient MPD event sampled across an atomic queue commit
+        if (st.queue_len != static_cast<int>(m_queue_item_ids.size())) {
+            requestQueueResync("MusicPD queue changed outside Qobuz Connect");
+            return;
+        }
     }
     prioritizeDownloads(st);
 
@@ -1259,10 +1459,12 @@ void QcManager::onMpdState(const MpdState& st) {
     std::string decoded_format;
     if (st.status != MpdState::Status::STOP && st.sample_rate > 0) {
         std::ostringstream stream;
-        if (st.bits > 0 && st.bits < 32)
-            stream << static_cast<unsigned>(st.bits) << " bit / ";
-        else if (st.bits == 32)
+        if (st.bits == MPD_SAMPLE_FORMAT_FLOAT)
             stream << "float / ";
+        else if (st.bits == MPD_SAMPLE_FORMAT_DSD)
+            stream << "DSD / ";
+        else if (st.bits > 0)
+            stream << static_cast<unsigned>(st.bits) << " bit / ";
         if (st.sample_rate % 1000 == 0) {
             stream << st.sample_rate / 1000 << " kHz";
         } else {
@@ -1343,7 +1545,9 @@ void QcManager::onMpdState(const MpdState& st) {
            << " qitem=" << qrs.state.current_queue_item_id << "\n");
 
     ws->reportState(qrs);
-    ws->reportVolume(st.volume);
+    ws->reportVolume(st.volume >= 0 && st.volume <= 100
+                         ? static_cast<uint32_t>(st.volume)
+                         : 100U);
 
     // Report file quality when track changes
     if (st.queue_pos >= 0) {
@@ -1700,6 +1904,9 @@ void QcManager::queueLoadLoop() {
                     releaseSegmentTokenIfUnused(token);
                 if (!queueLoadAborted(op.generation))
                     LOGERR("QcManager: incomplete queue insertion was not applied\n");
+                if (!queueLoadAborted(op.generation))
+                    requestQueueResync(
+                        "stream resolution failed during queue mutation", false);
                 continue;
             }
 
@@ -2188,6 +2395,18 @@ void QcManager::completeSetState(uint64_t command_id) {
 
 void QcManager::commitQueueVersion(const QueueVersion& version) {
     if (auto ws = currentWSession()) ws->commitQueueVersion(version);
+}
+
+void QcManager::requestQueueResync(const char* reason, bool force_reload) {
+    bool first = true;
+    if (force_reload) {
+        first = !m_queue_resync_pending.exchange(true,
+                                                  std::memory_order_relaxed);
+    }
+    if (first)
+        LOGERR("QcManager: requesting authoritative queue state: " << reason
+               << "\n");
+    if (auto ws = currentWSession()) ws->requestQueueState();
 }
 
 void QcManager::refreshMpdState() {

@@ -61,6 +61,8 @@ enum class QCloudProto : int32_t {
 
 enum class MsgType : int32_t {
     UNKNOWN = 0,
+    ERROR = 1,
+    PLAYBACK_ERROR = 2,
     // Renderer -> Server  (21-29) — verified against qonductor proto
     RNDR_JOIN_SESSION          = 21,
     RNDR_DEVICE_INFO_UPDATED   = 22,
@@ -78,7 +80,7 @@ enum class MsgType : int32_t {
     CMD_SET_MAX_QUALITY        = 44,
     CMD_SET_LOOP_MODE          = 45,
     CMD_SET_SHUFFLE_MODE       = 46,
-    CMD_SET_AUTOPLAY_MODE      = 47,
+    CMD_MUTE_VOLUME            = 47,
     // Controller -> Server  (61-80) — verified against qonductor proto
     CTRL_JOIN_SESSION          = 61,
     CTRL_SET_PLAYER_STATE      = 62,
@@ -123,7 +125,7 @@ enum class MsgType : int32_t {
     SRVRC_AUTOPLAY_MODE_SET    = 102,
     SRVRC_AUTOPLAY_TRACKS_LOADED = 103,
     SRVRC_AUTOPLAY_TRACKS_REMOVED = 104,
-    SRVRC_QUEUE_VERSION_CHANGED  = 105,
+    SRVRC_TRACKS_ADDED_FROM_AUTOPLAY = 105,
 };
 
 // ---- Common enums and structs ------------------------------------------------
@@ -222,6 +224,11 @@ struct MsgSetVolume {
     int32_t  volume_delta{0};   // relative adjustment; 0 if absolute
 };
 
+struct MsgMuteVolume {
+    bool muted{false};
+    bool has_muted{false};
+};
+
 struct MsgSessionState {
     Bytes        session_uuid;  // 16 bytes
     uint64_t     session_id{0};
@@ -258,9 +265,14 @@ struct QueueTrack {
 struct MsgQueueState {
     QueueVersion           queue_version;
     std::vector<QueueTrack> tracks;
+    std::vector<QueueTrack> autoplay_tracks;
     std::vector<uint32_t>  shuffled_track_indexes;
     bool                   shuffle_on{false};
     bool                   has_shuffle_on{false};
+    bool                   autoplay_on{false};
+    bool                   has_autoplay_on{false};
+    bool                   autoplay_loading{false};
+    bool                   has_autoplay_loading{false};
 };
 
 struct MsgQueueLoadTracks {
@@ -317,17 +329,55 @@ struct MsgLoopMode {
     bool     has_mode{false};
 };
 
-struct MsgQueueVersionChanged {
+struct MsgError {
+    std::string code;
+    std::string message;
+};
+
+struct MsgPlaybackError {
     QueueVersion queue_version;
+    int32_t      queue_item_id{0};
+    int32_t      error_type{0};
+    bool         has_queue_item_id{false};
+    bool         has_error_type{false};
+};
+
+struct MsgQueueError {
+    QueueVersion queue_version;
+    Bytes        action_uuid;
+    MsgError     error;
+};
+
+struct MsgAutoplayMode {
+    QueueVersion queue_version;
+    bool autoplay_on{false};
+    bool has_autoplay_on{false};
+    bool autoplay_reset{false};
+    bool has_autoplay_reset{false};
+    bool autoplay_loading{false};
+    bool has_autoplay_loading{false};
+};
+
+struct MsgAutoplayTracksLoaded {
+    QueueVersion            queue_version;
+    std::vector<QueueTrack> tracks;
+};
+
+struct MsgTracksAddedFromAutoplay {
+    QueueVersion          queue_version;
+    std::vector<uint64_t> queue_item_ids;
 };
 
 // All parsed inbound data in one union-like struct.
 // Only the field matching .type is populated.
 struct Message {
     MsgType                type{MsgType::UNKNOWN};
+    MsgError               error;
+    MsgPlaybackError       playback_error;
     MsgSetState            set_state;
     MsgSetActive           set_active;
     MsgSetVolume           set_volume;
+    MsgMuteVolume          mute_volume;
     MsgShuffleMode         shuffle_mode;
     MsgLoopMode            loop_mode;
     MsgSessionState        session_state;
@@ -342,7 +392,24 @@ struct Message {
     MsgQueueTracksAdded    tracks_added;
     MsgQueueTracksRemoved  tracks_removed;
     MsgQueueTracksReordered tracks_reordered;
-    MsgQueueVersionChanged queue_version_changed;
+    MsgTracksAddedFromAutoplay tracks_added_from_autoplay;
+    MsgQueueError          queue_error;
+    MsgAutoplayMode        autoplay_mode;
+    MsgAutoplayTracksLoaded autoplay_tracks_loaded;
+};
+
+struct QwsError {
+    uint32_t    msg_id{0};
+    uint32_t    code{0};
+    std::string description;
+    bool        present{false};
+};
+
+struct QwsDisconnect {
+    uint32_t msg_id{0};
+    bool     reconnect{false};
+    bool     has_reconnect{false};
+    bool     present{false};
 };
 
 // ---- Encoder API ------------------------------------------------------------
@@ -367,7 +434,7 @@ Bytes buildCtrlJoinSession(uint64_t time_ms, int32_t batch_id,
 
 Bytes buildJoinSession(uint64_t time_ms, int32_t batch_id,
                        const Bytes& session_uuid,
-                       const DeviceInfo& dev, bool is_active,
+                       const DeviceInfo& dev, int32_t reason, bool is_active,
                        const QueueRendererState& state);
 
 Bytes buildStateUpdated(uint64_t time_ms, int32_t batch_id,
@@ -404,12 +471,17 @@ Bytes buildAskQueueState(uint64_t time_ms, int32_t batch_id,
 // Returns false if data is malformed or type is unrecognised.
 // msgs is appended to (not cleared) so callers may process incrementally.
 bool parseFrame(const uint8_t* data, size_t len, std::vector<Message>& msgs,
-                uint64_t* payload_msg_date_ms = nullptr);
+                uint64_t* payload_msg_date_ms = nullptr,
+                QwsError* qws_error = nullptr,
+                QwsDisconnect* qws_disconnect = nullptr);
 
 // Convenience overload for Bytes
 inline bool parseFrame(const Bytes& data, std::vector<Message>& msgs,
-                       uint64_t* payload_msg_date_ms = nullptr) {
-    return parseFrame(data.data(), data.size(), msgs, payload_msg_date_ms);
+                       uint64_t* payload_msg_date_ms = nullptr,
+                       QwsError* qws_error = nullptr,
+                       QwsDisconnect* qws_disconnect = nullptr) {
+    return parseFrame(data.data(), data.size(), msgs, payload_msg_date_ms,
+                      qws_error, qws_disconnect);
 }
 
 } // namespace QConnect

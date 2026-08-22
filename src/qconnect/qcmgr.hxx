@@ -18,6 +18,7 @@
 
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <mutex>
@@ -126,13 +127,16 @@ public:
 
 private:
     // Called by HttpHandler when the Qobuz app sends credentials
-    void onConnect(ConnectCredentials creds);
+    bool onConnect(ConnectCredentials creds, bool reconnecting = false,
+                   std::optional<uint64_t> expected_generation = std::nullopt);
 
     // Cloud WebSocket (re)connection. The daemon mints its own credentials
     // from the cached OAuth token, so it can re-establish the session on its
     // own — the phone is only needed for the very first authentication.
-    bool connectCloudWebSocket();
-    void requestReconnect();
+    bool connectCloudWebSocket(bool reconnecting = false,
+                               std::optional<uint64_t> expected_generation =
+                                   std::nullopt);
+    void requestReconnect(uint64_t generation = 0);
     void reconnectLoop();
     void stopReconnectWorker();
 
@@ -141,6 +145,7 @@ private:
                     bool has_position,
                     const QueueTrackRef& current_item);
     void onSetVolume(uint32_t volume, int32_t delta);
+    void onMuteVolume(bool muted);
     void onSetActive(bool active);
     void onSessionState(const MsgSessionState& state);
     void onQueueState(const MsgQueueState& queue);
@@ -152,8 +157,12 @@ private:
     void onTracksReordered(const MsgQueueTracksReordered& update);
     void onShuffleMode(const MsgShuffleMode& update);
     void onLoopMode(const MsgLoopMode& update);
-    void onWsConnected();
-    void onWsDisconnected(bool error);
+    void onAutoplayMode(const MsgAutoplayMode& update);
+    void onAutoplayTracksLoaded(const MsgAutoplayTracksLoaded& update);
+    void onAutoplayTracksRemoved(const MsgQueueTracksRemoved& update);
+    bool isCurrentSession(uint64_t generation) const;
+    void onWsConnected(uint64_t generation);
+    void onWsDisconnected(uint64_t generation, bool error);
     void deactivateRenderer();
     void cancelQueueOperations();
     void queueLoadLoop();
@@ -210,6 +219,7 @@ private:
     void refreshMpdState();
     void prioritizeCurrentDownloads();
     void prioritizeDownloads(const MpdState& state);
+    void requestQueueResync(const char* reason, bool force_reload = true);
 
     // IPC with upmpdcli
     bool startIpcServer();
@@ -237,6 +247,7 @@ private:
     // shows sustained position progression on the current track.
     MpdState::Status   m_last_mpd_status{MpdState::Status::UNKNOWN};
     std::atomic<int>   m_last_mpd_queue_pos{-1};
+    std::atomic<int>   m_volume_before_mute{-1};
     uint32_t           m_last_mpd_pos_ms{0};
     int                m_play_progress_samples{0};
     bool               m_playback_ready{false};
@@ -254,6 +265,8 @@ private:
     // Set immediately when onQueueLoad fires so skip can find direction even
     // before URL resolution completes.
     std::vector<uint64_t>     m_all_queue_item_ids;
+    std::vector<uint64_t>     m_autoplay_item_ids;
+    std::atomic<bool>         m_queue_resync_pending{false};
 
     // Async work queue shared by the worker thread and the WS event thread.
     // A Load op clears the deque first (cancelling stale mutations and title
@@ -282,6 +295,10 @@ private:
     std::thread               m_reconnect_thread;
     bool                      m_reconnect_stop{true};
     bool                      m_reconnect_pending{false};
+    bool                      m_reconnect_established{false};
+    bool                      m_cloud_session_accepted{false};
+    uint64_t                  m_reconnect_generation{0};
+    std::atomic<uint64_t>     m_session_generation{0};
 
     std::mutex                m_queue_load_mutex;
     std::condition_variable   m_queue_load_cv;

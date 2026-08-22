@@ -48,6 +48,9 @@ struct WSessionCallbacks {
     // Volume change: absolute volume (0-100), or delta if delta != 0.
     std::function<void(uint32_t /*volume*/, int32_t /*delta*/)> on_set_volume;
 
+    // Mute state (fresh qbz wire command 47).
+    std::function<void(bool /*muted*/)> on_mute_volume;
+
     // Renderer activation/deactivation. Runs on the serialized callback worker.
     std::function<void(bool /*active*/)> on_set_active;
 
@@ -68,6 +71,9 @@ struct WSessionCallbacks {
     std::function<void(const MsgQueueCleared&)>         on_queue_cleared;
     std::function<void(const MsgShuffleMode&)>          on_shuffle_mode;
     std::function<void(const MsgLoopMode&)>             on_loop_mode;
+    std::function<void(const MsgAutoplayMode&)>         on_autoplay_mode;
+    std::function<void(const MsgAutoplayTracksLoaded&)> on_autoplay_tracks_loaded;
+    std::function<void(const MsgQueueTracksRemoved&)>   on_autoplay_tracks_removed;
 };
 
 // Manages one Qobuz Connect session.
@@ -83,7 +89,9 @@ struct WSessionCallbacks {
 
 class WSession {
 public:
-    WSession(const DeviceInfo& devinfo, const WSessionCallbacks& cbs);
+    WSession(const DeviceInfo& devinfo, const WSessionCallbacks& cbs,
+             bool reconnecting = false, bool join_as_active = false,
+             const QueueRendererState& initial_state = {});
     ~WSession();
 
     // Open WebSocket and start event loop.
@@ -102,6 +110,9 @@ public:
     // Report volume change.
     void reportVolume(uint32_t volume);
 
+    // Report whether renderer output is muted.
+    void reportMuted(bool muted);
+
     // Report max audio quality supported.
     void reportMaxQuality(int32_t quality_fmt_id);
 
@@ -110,6 +121,12 @@ public:
 
     // Declare renderer_id as the active renderer (sent after AddRenderer).
     void setActiveRenderer(uint64_t renderer_id);
+
+    // Request an authoritative queue snapshot. Safe from callback/MPD threads.
+    bool requestQueueState();
+
+    // Preserve the last published state across a transport-only reconnect.
+    QueueRendererState stateSnapshot() const;
 
     // Publish a queue version only after the corresponding MusicPD and local
     // queue mutation has committed successfully.
@@ -141,6 +158,8 @@ private:
 
     DeviceInfo        m_devinfo;
     WSessionCallbacks m_cbs;
+    bool              m_reconnecting{false};
+    bool              m_join_as_active{false};
 
     std::string m_ws_jwt;
     std::string m_ws_endpoint;
@@ -181,12 +200,13 @@ private:
     uint64_t m_session_id{0};
     uint64_t m_renderer_id{0};
     bool     m_is_active{false};
+    std::atomic<bool> m_renderer_join_sent{false};
     std::optional<MsgQueueState> m_last_queue_snapshot;
     std::optional<RendererState> m_pending_restore_state;
 
     // Last reported renderer state (used for heartbeats and immediate responses)
     QueueRendererState   m_last_state{};
-    std::mutex           m_state_mutex;
+    mutable std::mutex   m_state_mutex;
     uint64_t             m_set_state_serial{0};
     uint64_t             m_set_state_completed{0};
     // Estimated cloud-time offset (cloud_epoch_ms - local_epoch_ms).

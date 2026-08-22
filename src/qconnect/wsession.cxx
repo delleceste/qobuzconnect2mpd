@@ -59,9 +59,14 @@ uint64_t WSession::alignTimestampMs(uint64_t ts_ms) const {
     return out > 0 ? static_cast<uint64_t>(out) : 0;
 }
 
-WSession::WSession(const DeviceInfo& devinfo, const WSessionCallbacks& cbs)
-    : m_devinfo(devinfo), m_cbs(cbs)
-{}
+WSession::WSession(const DeviceInfo& devinfo, const WSessionCallbacks& cbs,
+                   bool reconnecting, bool join_as_active,
+                   const QueueRendererState& initial_state)
+    : m_devinfo(devinfo), m_cbs(cbs), m_reconnecting(reconnecting),
+      m_join_as_active(join_as_active), m_last_state(initial_state)
+{
+    m_is_active = join_as_active;
+}
 
 WSession::~WSession() { disconnect(); }
 
@@ -430,6 +435,7 @@ void WSession::reportState(const QueueRendererState& state) {
     if (m_last_state.queue_version.present)
         s.queue_version = m_last_state.queue_version;
     m_last_state = s;
+    if (!m_renderer_join_sent.load(std::memory_order_acquire)) return;
     LOGTRC("WSession: reportState pos_ms=" << s.state.current_position_ms
            << " buf=" << static_cast<int>(s.state.buffer_state)
            << " qver=" << s.queue_version.major << "." << s.queue_version.minor << "\n");
@@ -442,18 +448,27 @@ void WSession::reportState(const QueueRendererState& state) {
 
 void WSession::reportVolume(uint32_t volume) {
     if (!m_connected) return;
+    if (!m_renderer_join_sent.load(std::memory_order_acquire)) return;
     int bid = nextBatchId(m_batch_id);
     sendRaw(buildVolumeChanged(nowAlignedMs(), bid, volume));
 }
 
+void WSession::reportMuted(bool muted) {
+    if (!m_connected) return;
+    if (!m_renderer_join_sent.load(std::memory_order_acquire)) return;
+    sendRaw(buildVolumeMuted(nowAlignedMs(), nextBatchId(m_batch_id), muted));
+}
+
 void WSession::reportMaxQuality(int32_t quality_fmt_id) {
     if (!m_connected) return;
+    if (!m_renderer_join_sent.load(std::memory_order_acquire)) return;
     int bid = nextBatchId(m_batch_id);
     sendRaw(buildMaxQualityChanged(nowAlignedMs(), bid, quality_fmt_id));
 }
 
 void WSession::reportFileQuality(int32_t sample_rate_hz) {
     if (!m_connected) return;
+    if (!m_renderer_join_sent.load(std::memory_order_acquire)) return;
     int bid = nextBatchId(m_batch_id);
     sendRaw(buildFileAudioQualityChanged(nowAlignedMs(), bid, sample_rate_hz));
 }
@@ -466,8 +481,26 @@ void WSession::setActiveRenderer(uint64_t renderer_id) {
                                     static_cast<int32_t>(renderer_id)));
 }
 
+bool WSession::requestQueueState() {
+    Bytes session_uuid;
+    {
+        std::lock_guard<std::mutex> lk(m_state_mutex);
+        session_uuid = m_session_uuid;
+    }
+    if (!m_connected || session_uuid.empty()) return false;
+    return sendRaw(buildAskQueueState(nowAlignedMs(), nextBatchId(m_batch_id),
+                                      session_uuid));
+}
+
+QueueRendererState WSession::stateSnapshot() const {
+    std::lock_guard<std::mutex> lk(m_state_mutex);
+    return m_last_state;
+}
+
 bool WSession::sendHeartbeat() {
     if (!m_connected || !m_is_active) return true;
+    if (!m_renderer_join_sent.load(std::memory_order_acquire)) return true;
+
     std::lock_guard<std::mutex> lk(m_state_mutex);
     QueueRendererState state;
     state = m_last_state;
@@ -517,6 +550,8 @@ void WSession::eventLoop() {
 
     auto last_transport_ping = std::chrono::steady_clock::now();
     auto last_heartbeat = last_transport_ping;
+    auto last_transport_pong = last_transport_ping;
+    unsigned outstanding_pings = 0;
     constexpr size_t BUFSIZE = 65536;
     std::vector<uint8_t> buf(BUFSIZE);
     Bytes incoming_frame;
@@ -586,7 +621,11 @@ void WSession::eventLoop() {
                 if (meta->flags & CURLWS_PING) {
                     continue;
                 }
-                if (meta->flags & CURLWS_PONG) continue;
+                if (meta->flags & CURLWS_PONG) {
+                    last_transport_pong = std::chrono::steady_clock::now();
+                    outstanding_pings = 0;
+                    continue;
+                }
 
                 incoming_frame.insert(incoming_frame.end(),
                                       buf.begin(), buf.begin() + recvd);
@@ -594,7 +633,34 @@ void WSession::eventLoop() {
                     !incoming_frame.empty()) {
                     std::vector<Message> msgs;
                     uint64_t rx_msg_date_ms = 0;
-                    if (parseFrame(incoming_frame, msgs, &rx_msg_date_ms)) {
+                    QwsError qws_error;
+                    QwsDisconnect qws_disconnect;
+                    if (parseFrame(incoming_frame, msgs, &rx_msg_date_ms,
+                                   &qws_error, &qws_disconnect)) {
+                        if (qws_error.present) {
+                            LOGERR("WSession: Qobuz cloud error msg_id="
+                                   << qws_error.msg_id << " code=" << qws_error.code
+                                   << " description='" << qws_error.description
+                                   << "'\n");
+                            // An outer QWS error means the frontend rejected this
+                            // authenticated session. Do not leave a rejected socket
+                            // looking healthy; obtain a fresh JWT via the reconnect
+                            // worker and retain MPD playback meanwhile.
+                            m_error_exit = true;
+                            m_stop = true;
+                        }
+                        if (qws_disconnect.present) {
+                            LOGERR("WSession: Qobuz cloud requested disconnect msg_id="
+                                   << qws_disconnect.msg_id << " reconnect="
+                                   << (qws_disconnect.has_reconnect
+                                           ? qws_disconnect.reconnect : true)
+                                   << "\n");
+                            // A logical DISCONNECT can arrive without an
+                            // immediate TCP close. Retire it now instead of
+                            // leaving the renderer stuck on a zombie socket.
+                            m_error_exit = true;
+                            m_stop = true;
+                        }
                         if (rx_msg_date_ms) {
                             int64_t local_now = static_cast<int64_t>(nowMs());
                             int64_t sample_off =
@@ -608,6 +674,7 @@ void WSession::eventLoop() {
                             }
                         }
                         for (const auto& msg : msgs) dispatchMessage(msg);
+                        if (m_stop) break;
                     } else {
                         LOGDEB("WSession: failed to parse frame of "
                                << incoming_frame.size() << " bytes\n");
@@ -621,7 +688,22 @@ void WSession::eventLoop() {
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 now - last_transport_ping).count() >=
             TRANSPORT_PING_INTERVAL_S) {
-            sendTransportPing();
+            constexpr int PONG_TIMEOUT_S =
+                TRANSPORT_PING_INTERVAL_S * 5 / 2;
+            if (outstanding_pings >= 2 &&
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    now - last_transport_pong).count() >= PONG_TIMEOUT_S) {
+                LOGERR("WSession: WebSocket keepalive timed out after "
+                       << outstanding_pings << " unanswered pings\n");
+                m_error_exit = true;
+                break;
+            }
+            if (!sendTransportPing()) {
+                LOGERR("WSession: could not enqueue WebSocket keepalive ping\n");
+                m_error_exit = true;
+                break;
+            }
+            ++outstanding_pings;
             last_transport_ping = now;
         }
         if (std::chrono::duration_cast<std::chrono::seconds>(
@@ -734,8 +816,28 @@ void WSession::dispatchMessage(const Message& msg) {
 
     case MsgType::SRVRC_SESSION_STATE:
         LOGDEB("WSession: SessionState id=" << msg.session_state.session_id << "\n");
-        m_session_uuid = msg.session_state.session_uuid;
+        {
+            std::lock_guard<std::mutex> lk(m_state_mutex);
+            m_session_uuid = msg.session_state.session_uuid;
+        }
         m_session_id   = msg.session_state.session_id;
+        if (!m_renderer_join_sent && !msg.session_state.session_uuid.empty()) {
+            QueueRendererState initial_state = stateSnapshot();
+            initial_state.state.position_timestamp_ms = alignTimestampMs(
+                initial_state.state.position_timestamp_ms);
+
+            const int32_t reason = m_reconnecting ? 2 : 1;
+            m_renderer_join_sent = sendRaw(buildJoinSession(
+                nowAlignedMs(), nextBatchId(m_batch_id),
+                msg.session_state.session_uuid, m_devinfo, reason,
+                m_join_as_active, initial_state));
+            if (m_renderer_join_sent) {
+                LOGINF("WSession: renderer role joined (reason=" << reason
+                       << ", active=" << m_join_as_active << ")\n");
+            } else {
+                LOGERR("WSession: failed to enqueue renderer role join\n");
+            }
+        }
         // Ask server to send current renderer state
         sendRaw(buildAskRendererState(nowAlignedMs(), nextBatchId(m_batch_id),
                                        m_session_id));
@@ -782,10 +884,10 @@ void WSession::dispatchMessage(const Message& msg) {
         if (m_is_active) {
             // Activation handshake (matches qonductor order):
             // 1. VolumeMuted(false)  — field 29, must be sent even with empty body
-            // 2. VolumeChanged       — field 25
-            // 3. MaxAudioQualityChanged — field 28, value is quality level 1-4
+            // 2. MaxAudioQualityChanged — field 28, value is quality level 1-4
+            // QcManager publishes actual MPD volume, or fixed 100 for a
+            // mixerless bit-perfect output, immediately after activation.
             sendRaw(buildVolumeMuted(nowAlignedMs(), nextBatchId(m_batch_id), false));
-            reportVolume(50);  // MPD volume will be reported accurately by MpdCtl later
             // Convert format_id to quality level: 27->4, 7->3, 6->2, 5->1
             int32_t ql = 4;
             if (m_devinfo.max_quality == 7) ql = 3;
@@ -793,10 +895,58 @@ void WSession::dispatchMessage(const Message& msg) {
             else if (m_devinfo.max_quality == 5) ql = 1;
             reportMaxQuality(ql);
             // Request current queue state from server
-            if (!m_session_uuid.empty()) {
-                sendRaw(buildAskQueueState(nowAlignedMs(), nextBatchId(m_batch_id),
-                                            m_session_uuid));
-            }
+            requestQueueState();
+        }
+        break;
+
+    case MsgType::ERROR:
+        LOGERR("WSession: QConnect error code='" << msg.error.code
+               << "' message='" << msg.error.message << "'\n");
+        break;
+
+    case MsgType::PLAYBACK_ERROR:
+        LOGERR("WSession: peer playback error queue_item_id="
+               << msg.playback_error.queue_item_id << " type="
+               << msg.playback_error.error_type << "\n");
+        break;
+
+    case MsgType::SRVRC_QUEUE_ERROR:
+        LOGERR("WSession: queue command rejected code='"
+               << msg.queue_error.error.code << "' message='"
+               << msg.queue_error.error.message
+               << "'; requesting authoritative queue state\n");
+        requestQueueState();
+        break;
+
+    case MsgType::CMD_MUTE_VOLUME:
+        if (msg.mute_volume.has_muted && m_cbs.on_mute_volume) {
+            auto callback = m_cbs.on_mute_volume;
+            bool muted = msg.mute_volume.muted;
+            postCallback([callback, muted] { callback(muted); });
+        }
+        break;
+
+    case MsgType::SRVRC_AUTOPLAY_MODE_SET:
+        if (m_cbs.on_autoplay_mode) {
+            auto callback = m_cbs.on_autoplay_mode;
+            MsgAutoplayMode mode = msg.autoplay_mode;
+            postCallback([callback, mode] { callback(mode); });
+        }
+        break;
+
+    case MsgType::SRVRC_AUTOPLAY_TRACKS_LOADED:
+        if (m_cbs.on_autoplay_tracks_loaded) {
+            auto callback = m_cbs.on_autoplay_tracks_loaded;
+            MsgAutoplayTracksLoaded loaded = msg.autoplay_tracks_loaded;
+            postCallback([callback, loaded] { callback(loaded); });
+        }
+        break;
+
+    case MsgType::SRVRC_AUTOPLAY_TRACKS_REMOVED:
+        if (m_cbs.on_autoplay_tracks_removed) {
+            auto callback = m_cbs.on_autoplay_tracks_removed;
+            MsgQueueTracksRemoved removed = msg.tracks_removed;
+            postCallback([callback, removed] { callback(removed); });
         }
         break;
 
@@ -1024,14 +1174,13 @@ void WSession::dispatchMessage(const Message& msg) {
         }
         break;
 
-    case MsgType::SRVRC_QUEUE_VERSION_CHANGED:
-        LOGDEB("WSession: QueueVersionChanged qver="
-               << msg.queue_version_changed.queue_version.major
-               << "." << msg.queue_version_changed.queue_version.minor << "\n");
-        // This notification contains no queue mutation for QcManager to apply,
-        // so it is already authoritative when received. Keep the monotonic
-        // guard used by completed asynchronous queue operations.
-        commitQueueVersion(msg.queue_version_changed.queue_version);
+    case MsgType::SRVRC_TRACKS_ADDED_FROM_AUTOPLAY:
+        LOGDEB("WSession: TracksAddedFromAutoplay ids="
+               << msg.tracks_added_from_autoplay.queue_item_ids.size()
+               << "; requesting authoritative queue state\n");
+        // This event promotes autoplay items into the main queue but carries
+        // only IDs, not track metadata or their final shuffled positions.
+        requestQueueState();
         break;
 
     case MsgType::SRVRC_RENDERER_STATE_UPD:
