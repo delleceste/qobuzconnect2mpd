@@ -135,6 +135,14 @@ qc_log_test = executable(
 )
 test('qconnect-log', qc_log_test)
 
+qc_activity_test = executable(
+  'qconnect-activity-test',
+  files('tests/qcactivity_test.cxx'),
+  include_directories: include_directories('src/qconnect'),
+  dependencies: dependency('threads'),
+)
+test('qconnect-activity', qc_activity_test)
+
 qc_segstream_test = executable(
   'qconnect-segstream-test',
   files('tests/segstream_test.cxx', 'src/qconnect/segstream.cxx'),

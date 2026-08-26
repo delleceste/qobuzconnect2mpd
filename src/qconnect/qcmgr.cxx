@@ -17,6 +17,7 @@
 
 #include "qcmgr.hxx"
 #include "qclog.hxx"
+#include "qcactivity.hxx"
 #include "mdns.hxx"
 #include "httphandler.hxx"
 #include "wsession.hxx"
@@ -94,6 +95,10 @@ void QcManager::printNowPlaying(const std::string& title,
         m_status_title = title;
     }
     m_status_pos_ms.store(0);
+    // First sound: the wait the activity ring was narrating is over.
+    activityPhase(ActivityPhase::Playing,
+                  title.empty() ? std::string("playback started")
+                                : "playing: " + title);
     writeStatusFile();
 }
 
@@ -112,14 +117,28 @@ void QcManager::writeStatusFile() {
     std::string tmp = m_cfg.status_file + ".tmp";
     std::ofstream f(tmp);
     if (!f) return;
+    // Fixed shape, so a reader can index it: now-playing, decoded format,
+    // activity phase, then the activity ring (oldest first).  Lines 2 and 3
+    // are written even when empty; the format line used to be omitted, which
+    // made every line below it shift.
     if (title.empty()) {
         f << state_tag << "\n";
     } else {
         uint32_t pos_ms = m_status_pos_ms.load();
         uint32_t dur_ms = m_status_dur_ms.load();
         f << state_tag << title << "  [" << formatMs(pos_ms) << " / " << formatMs(dur_ms) << "]\n";
-        if (!fmt_info.empty()) f << fmt_info << "\n";
     }
+    f << fmt_info << "\n";
+    ActivitySnapshot activity = activitySnapshot();
+    // Audible playback wins the big line.  The track already playing keeps
+    // reconstructing segments in the background and the next ones keep
+    // resolving; narrating that where the track name goes would hide the
+    // track for most of its own duration.  The ring below still shows it.
+    if (play_state == 2 &&
+        activity.state != activityPhaseLabel(ActivityPhase::Error))
+        activity.state = activityPhaseLabel(ActivityPhase::Playing);
+    f << "state=" << activity.state << "\n";
+    for (const auto& event : activity.events) f << event << "\n";
     f.close();
     std::rename(tmp.c_str(), m_cfg.status_file.c_str());
 }
@@ -1128,6 +1147,15 @@ void QcManager::onQueueLoad(const MsgQueueLoadTracks& queue) {
 void QcManager::onQueueCleared(const MsgQueueCleared& update) {
     if (!m_ws_active.load(std::memory_order_relaxed)) return;
     LOGINF("QcManager: queue cleared\n");
+    activityIdle();
+    activityNote("queue cleared by the controller");
+    {
+        // The old track is gone: leaving its name on the status line makes a
+        // busy renderer look like a stalled one.
+        std::lock_guard<std::mutex> lk(m_status_mutex);
+        m_status_title.clear();
+        m_status_format_info.clear();
+    }
     cancelQueueOperations();
 
     std::vector<std::string> stale_paths;
@@ -1165,6 +1193,15 @@ void QcManager::enqueueQueueLoad(const std::vector<QueueTrack>& tracks,
     if (start_idx >= tracks.size()) start_idx = 0;
     LOGINF("QcManager: queueing " << tracks.size()
            << " tracks, initial item " << start_idx << "\n");
+    if (play_when_ready) {
+        activityPhase(ActivityPhase::QueueReceived,
+                      "queue received: " + std::to_string(tracks.size()) +
+                      " tracks, starting at item " + std::to_string(start_idx));
+        // Same reason as onQueueCleared: what is on screen is now stale.
+        std::lock_guard<std::mutex> lk(m_status_mutex);
+        m_status_title.clear();
+        m_status_format_info.clear();
+    }
 
     uint64_t generation =
         m_queue_load_generation.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2043,6 +2080,13 @@ void QcManager::queueLoadLoop() {
         size_t track_index = op.remaining_indices.front();
         op.remaining_indices.pop_front();
         const QueueTrack track = op.tracks[track_index];
+        if (op.type == QueueOp::Type::Load && !op.tracks.empty()) {
+            activityProgress(ActivityPhase::Resolving,
+                             "load-" + std::to_string(op.generation),
+                             "resolving stream URL",
+                             op.tracks.size() - op.remaining_indices.size(),
+                             op.tracks.size());
+        }
         std::vector<uint64_t> ids;
         std::vector<int> rates;
         std::vector<std::string> paths, titles, tokens;
@@ -2089,6 +2133,9 @@ void QcManager::queueLoadLoop() {
                             if (!token.empty()) retained_tokens.insert(token);
                         }
                     }
+                    activityPhase(ActivityPhase::Buffering,
+                                  "queue handed to MusicPD, waiting for it to "
+                                  "start");
                     op.load_started = true;
                     first_loaded = true;
                     queue_changed = true;
@@ -2298,6 +2345,8 @@ bool QcManager::applyPlaybackCommandLocked(
         !prepareSegmentedSeek(target_position, restart_track)) {
         m_force_buffering.store(false, std::memory_order_relaxed);
         LOGERR("QcManager: segmented track was not ready for seeking\n");
+        activityPhase(ActivityPhase::Error,
+                      "segmented track was not ready for seeking");
         return false;
     }
     bool select_track =
@@ -2358,6 +2407,10 @@ bool QcManager::prepareSegmentedSeek(int mpd_position,
         LOGERR("QcManager: segmented seek preparation failed: "
                << (error.empty() ? "empty reconstructed stream" : error)
                << "\n");
+        activityPhase(ActivityPhase::Error,
+                      "seek preparation failed: " +
+                      (error.empty() ? std::string("empty reconstructed stream")
+                                     : error));
         return false;
     }
 

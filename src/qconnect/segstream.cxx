@@ -7,6 +7,7 @@
 
 #include "segstream.hxx"
 #include "qclog.hxx"
+#include "qcactivity.hxx"
 
 #include <curl/curl.h>
 #include <openssl/evp.h>
@@ -75,6 +76,14 @@ constexpr size_t kMaxPendingTrackDownloads = 16;
 constexpr size_t kMaxRetainedCachedTracks = 8;
 constexpr uint64_t kMaxRetainedCachedBytes = uint64_t{1024} * 1024 * 1024;
 std::atomic<uint64_t> g_cache_sequence{0};
+
+// True while this download is the one playback is blocked on.  Speculative
+// prefetch of upcoming tracks runs at a lower priority and stays silent: its
+// progress is not what the listener is waiting for.
+static bool isForPlayback(const std::shared_ptr<SegmentedDownloadState>& state) {
+    return state->requested_priority.load(std::memory_order_relaxed) ==
+           static_cast<int>(SegmentedDownloadPriority::Playback);
+}
 
 static std::string makeCachePath(const SegmentedTrackPlan& plan) {
     return segmentedCacheDirectory() + "/track_" +
@@ -517,6 +526,11 @@ static bool openDownloadCache(
            << plan.n_audio_segments()
            << " encrypted Qobuz audio segments"
               " (initialization segment 0 already parsed)\n");
+    if (isForPlayback(state))
+        activityPhase(ActivityPhase::Downloading,
+                      "reconstructing " +
+                      std::to_string(plan.n_audio_segments()) +
+                      " encrypted segments");
     return true;
 }
 
@@ -547,13 +561,22 @@ static bool appendToCache(const std::shared_ptr<SegmentedDownloadState>& state,
 
 static void failDownload(const std::shared_ptr<SegmentedDownloadState>& state,
                          std::string error) {
+    bool announce = false;
+    std::string reported;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (!state->complete && !state->failed) {
             state->failed = true;
             state->error = std::move(error);
+            reported = state->error;
+            // A cancelled download is the normal consequence of the queue
+            // being replaced, not something to report as a failure.
+            announce = !state->cancelled.load(std::memory_order_relaxed) &&
+                       isForPlayback(state);
         }
     }
+    if (announce)
+        activityPhase(ActivityPhase::Error, "download failed: " + reported);
     state->changed.notify_all();
 }
 
@@ -622,6 +645,9 @@ static ReconstructionStep reconstructTrackStep(
         LOGDEB("QobuzApi: track " << state->cache_path << " ["
                << streamFormat(*plan) << "] [segment " << segment << "/"
                << segment_count << "] in progress (" << percent << "%)\n");
+        if (isForPlayback(state))
+            activityProgress(ActivityPhase::Downloading, state->cache_path,
+                             "segment", segment, segment_count);
     }
 
     if (state->next_segment <= plan->n_audio_segments())
@@ -642,6 +668,9 @@ static ReconstructionStep reconstructTrackStep(
            << plan->n_audio_segments() << "/"
            << plan->n_audio_segments() << " segments, "
            << completed_size << " bytes\n");
+    if (isForPlayback(state))
+        activityNote("all " + std::to_string(plan->n_audio_segments()) +
+                     " segments reconstructed, waiting for MusicPD");
     return ReconstructionStep::Finished;
 }
 

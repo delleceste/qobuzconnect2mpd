@@ -128,10 +128,34 @@ When `-o statusfile` is given the daemon writes (and rewrites every second):
 ```
 [playing] Artist Name - Track Title  [1:23 / 4:56]
 16 bit / 44.1 kHz / stereo
+state=LOADING SEGMENT
+11:24:03 queue received: 14 tracks, starting at item 0
+11:24:04 resolving stream URL 1/14 (7%)
+11:24:07 segment 7/52 (13%)
 ```
 
 Line 1 is prefixed with the current playback state: `[playing]`, `[paused]`,
-or `[stopped]`.  The file is updated atomically (temp file + rename) so readers
+or `[stopped]`.  Line 2 is the decoded format, and line 3 the activity phase;
+both are always present, empty when there is nothing to say, so a reader can
+address the file by line number.  Any further lines are the activity ring,
+oldest first: what the daemon is doing in the gap between the controller
+pressing play and the first sound, which is routinely tens of seconds and
+occasionally minutes.
+
+The phases in `state=` are `NEW PLAYLIST RECEIVED`, `RESOLVING STREAM`,
+`LOADING SEGMENT`, `BUFFERING`, `PLAYING` and `ERROR`; it is empty when there
+is nothing in progress.  Only the track playback is waiting on narrates
+itself — speculative prefetch of upcoming tracks stays silent — and segment
+progress rewrites its own ring entry rather than pushing a new one, so a
+52-segment track cannot flush the other phases out of view.
+
+While MusicPD is actually playing, `state=` reports `PLAYING` regardless of
+what is going on underneath (the current track keeps reconstructing, the next
+ones keep resolving) — the phase is meant to explain silence, not to displace
+the track name for most of its own duration.  The ring keeps reporting it.
+`ERROR` is the exception: it is shown even during playback.
+
+The file is updated atomically (temp file + rename) so readers
 never see a partial write.  When the daemon stops it removes the status file.
 Useful for feeding external displays, OSD scripts, or status bars.
 
