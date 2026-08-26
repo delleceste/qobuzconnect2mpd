@@ -128,11 +128,28 @@ When `-o statusfile` is given the daemon writes (and rewrites every second):
 ```
 [playing] Artist Name - Track Title  [1:23 / 4:56]
 16 bit / 44.1 kHz / stereo
+buffering track — segment 4/122 (1.9 MB)
 ```
 
 Line 1 is prefixed with the current playback state: `[playing]`, `[paused]`,
-or `[stopped]`.  The file is updated atomically (temp file + rename) so readers
-never see a partial write.  When the daemon stops it removes the status file.
+or `[stopped]`.  Line 2 is the decoded audio format.
+
+Line 3 is the **activity line**: what the daemon is doing during the gap
+between the phone's play command and the first sound, which is otherwise
+invisible from outside.  It is written only when there is something to say, so
+a track that is simply playing keeps the familiar two-line file:
+
+| Line 3 | Meaning |
+|---|---|
+| `resolving Qobuz stream URLs — track 3/12` | Per-track `/file/url` round-trips; for CMAF tracks this also fetches the init segment that the reconstruction plan is built from |
+| `buffering track — segment 4/122 (1.9 MB)` | The track is being reconstructed segment by segment into its local cache, and MusicPD is not playing yet |
+| `caching ahead — segment 88/122 (14.2 MB)` | Same work, but playback has already started — this is the read-ahead |
+| `… · 2 more queued` | Other tracks the scheduler still owes work on |
+| `waiting for MusicPD to start playing` | Nothing left to download; the remaining wait is MusicPD opening its output |
+| `download failed: segment 5/122: HTTP 403 after 3 attempts` | The last reconstruction failure.  Retained for two minutes (a failed job leaves the scheduler immediately, so a once-a-second reader would otherwise never see it) and dropped as soon as a track starts playing |
+
+The file is updated atomically (temp file + rename) so readers never see a
+partial write.  When the daemon stops it removes the status file.
 Useful for feeding external displays, OSD scripts, or status bars.
 
 ### Log file (`qconnectlogfile`)

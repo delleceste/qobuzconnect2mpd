@@ -545,14 +545,30 @@ static bool appendToCache(const std::shared_ptr<SegmentedDownloadState>& state,
     return true;
 }
 
+// Last reconstruction failure, kept process-wide.  A failed job leaves the
+// scheduler's queues at once, so a status reader polling once a second would
+// otherwise almost never catch one: the whole point of reporting it is that
+// the listener is sitting in front of silence wondering what went wrong.
+static std::mutex g_last_failure_mu;
+static SegmentedDownloadFailure g_last_failure;
+
 static void failDownload(const std::shared_ptr<SegmentedDownloadState>& state,
                          std::string error) {
+    bool recorded = false;
+    std::string kept;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         if (!state->complete && !state->failed) {
             state->failed = true;
             state->error = std::move(error);
+            kept = state->error;
+            recorded = true;
         }
+    }
+    if (recorded && !kept.empty()) {
+        std::lock_guard<std::mutex> lock(g_last_failure_mu);
+        g_last_failure.error = std::move(kept);
+        g_last_failure.when = std::chrono::steady_clock::now();
     }
     state->changed.notify_all();
 }
@@ -682,7 +698,7 @@ public:
             std::lock_guard<std::mutex> lock(m_mutex);
             m_stopping = true;
             for (const auto& job : m_pending) states.push_back(job.state);
-            for (const auto& state : m_running) states.push_back(state);
+            for (const auto& job : m_running) states.push_back(job.state);
             m_pending.clear();
         }
         for (const auto& state : states) {
@@ -764,6 +780,64 @@ public:
         trimCacheLocked();
     }
 
+    // Snapshot of every reconstruction the scheduler still owes work on.
+    // Deliberately two passes: the jobs are collected under m_mutex and then
+    // read under each state's own mutex, so no thread ever holds both at once
+    // (the worker takes them in that same order, never nested).
+    std::vector<SegmentedDownloadProgress> progress() {
+        struct Entry {
+            std::shared_ptr<SegmentedTrackPlan> plan;
+            std::shared_ptr<SegmentedDownloadState> state;
+            bool running{false};
+        };
+        std::vector<Entry> entries;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            entries.reserve(m_pending.size() + m_running.size());
+            for (const auto& job : m_running)
+                entries.push_back(Entry{job.plan, job.state, true});
+            for (const auto& job : m_pending) {
+                // A track alternates between running and pending once per
+                // segment; report it once, as running.
+                auto known = std::find_if(
+                    entries.begin(), entries.end(),
+                    [&](const Entry& e) { return e.state == job.state; });
+                if (known == entries.end())
+                    entries.push_back(Entry{job.plan, job.state, false});
+            }
+        }
+
+        std::vector<SegmentedDownloadProgress> out;
+        out.reserve(entries.size());
+        for (const auto& entry : entries) {
+            if (!entry.plan || !entry.state) continue;
+            SegmentedDownloadProgress p;
+            p.track_id = entry.plan->track_id;
+            p.segments_total = entry.plan->n_audio_segments();
+            p.running = entry.running;
+            p.priority = entry.state->requested_priority.load(
+                std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> state_lock(entry.state->mutex);
+                // next_segment is the 1-based segment about to be fetched.
+                p.segments_done = entry.state->next_segment > 0
+                    ? entry.state->next_segment - 1 : 0;
+                p.bytes = entry.state->available;
+                p.failed = entry.state->failed;
+                p.error = entry.state->error;
+            }
+            if (p.segments_done > p.segments_total)
+                p.segments_done = p.segments_total;
+            out.push_back(std::move(p));
+        }
+        std::stable_sort(out.begin(), out.end(),
+                         [](const SegmentedDownloadProgress& lhs,
+                            const SegmentedDownloadProgress& rhs) {
+                             return lhs.priority > rhs.priority;
+                         });
+        return out;
+    }
+
 private:
     struct Job {
         std::shared_ptr<SegmentedTrackPlan> plan;
@@ -800,7 +874,7 @@ private:
                     });
                 job = std::move(*selected);
                 m_pending.erase(selected);
-                m_running.push_back(job.state);
+                m_running.push_back(job);
             }
 
             ReconstructionStep step = ReconstructionStep::Finished;
@@ -827,7 +901,10 @@ private:
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_running.erase(
-                    std::remove(m_running.begin(), m_running.end(), job.state),
+                    std::remove_if(m_running.begin(), m_running.end(),
+                                   [&](const Job& running) {
+                                       return running.state == job.state;
+                                   }),
                     m_running.end());
                 if (step == ReconstructionStep::Continue && !m_stopping &&
                     !failed &&
@@ -906,7 +983,9 @@ private:
     bool m_stopping{false};
     uint64_t m_sequence{0};
     std::deque<Job> m_pending;
-    std::vector<std::shared_ptr<SegmentedDownloadState>> m_running;
+    // Jobs, not bare states: reporting progress needs the plan alongside the
+    // state to know how many segments the track has in total.
+    std::vector<Job> m_running;
     std::vector<CacheEntry> m_cache;
     std::vector<std::thread> m_workers;
 };
@@ -986,6 +1065,20 @@ SegmentedDownloadHandle scheduleSegmentedTrackDownload(
             plan->m_download_state.reset();
     }
     return pin_reader ? state : SegmentedDownloadHandle{};
+}
+
+SegmentedDownloadFailure segmentedLastDownloadFailure() {
+    std::lock_guard<std::mutex> lock(g_last_failure_mu);
+    return g_last_failure;
+}
+
+void clearSegmentedDownloadFailure() {
+    std::lock_guard<std::mutex> lock(g_last_failure_mu);
+    g_last_failure = SegmentedDownloadFailure{};
+}
+
+std::vector<SegmentedDownloadProgress> segmentedDownloadProgress() {
+    return downloadScheduler().progress();
 }
 
 void startSegmentedTrackDownload(

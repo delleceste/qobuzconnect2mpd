@@ -94,7 +94,74 @@ void QcManager::printNowPlaying(const std::string& title,
         m_status_title = title;
     }
     m_status_pos_ms.store(0);
+    // A track reached MusicPD, so whatever failed before is history: drop it
+    // rather than let it shadow the activity line for its full retention.
+    clearSegmentedDownloadFailure();
     writeStatusFile();
+}
+
+void QcManager::setStatusActivity(std::string activity) {
+    {
+        std::lock_guard<std::mutex> lk(m_status_mutex);
+        if (m_status_activity == activity) return;
+        m_status_activity = std::move(activity);
+    }
+    // Write immediately rather than waiting for the next statusLoop tick: the
+    // point of these phases is that they are short-lived and would otherwise
+    // pass unseen.
+    writeStatusFile();
+}
+
+static std::string humanBytes(uint64_t bytes) {
+    char buf[32];
+    if (bytes >= uint64_t{1} << 20)
+        snprintf(buf, sizeof(buf), "%.1f MB",
+                 static_cast<double>(bytes) / static_cast<double>(1u << 20));
+    else
+        snprintf(buf, sizeof(buf), "%.0f kB",
+                 static_cast<double>(bytes) / 1024.0);
+    return buf;
+}
+
+std::string QcManager::composeActivityLine() const {
+    std::string phase;
+    {
+        std::lock_guard<std::mutex> lk(m_status_mutex);
+        phase = m_status_activity;
+    }
+
+    // A failure is what the listener most needs to see, and it outlives the
+    // job that produced it — but only report a recent one, so yesterday's
+    // network hiccup does not shadow today's playback.
+    const auto failure = segmentedLastDownloadFailure();
+    if (failure.valid() && failure.ageSeconds() <= 120)
+        return "download failed: " + failure.error;
+
+    // Otherwise report the most urgent reconstruction; the list is already
+    // ordered playback-first.
+    const bool buffering = m_status_buffering.load(std::memory_order_relaxed);
+    const auto downloads = segmentedDownloadProgress();
+    std::string line;
+    if (!downloads.empty()) {
+        const auto& lead = downloads.front();
+        line = buffering ? "buffering track" : "caching ahead";
+        if (lead.segments_total > 0) {
+            line += " — segment " + std::to_string(lead.segments_done) + "/" +
+                    std::to_string(lead.segments_total);
+        }
+        if (lead.bytes > 0) line += " (" + humanBytes(lead.bytes) + ")";
+        if (downloads.size() > 1) {
+            line += " · " + std::to_string(downloads.size() - 1) +
+                    " more queued";
+        }
+    } else if (!phase.empty()) {
+        line = phase;
+    } else if (buffering) {
+        // Nothing left to download, so the wait is now MusicPD's: opening the
+        // output, and on this box possibly a DRC rate change under it.
+        line = "waiting for MusicPD to start playing";
+    }
+    return line;
 }
 
 void QcManager::writeStatusFile() {
@@ -105,6 +172,7 @@ void QcManager::writeStatusFile() {
         title    = m_status_title;
         fmt_info = m_status_format_info;
     }
+    const std::string activity = composeActivityLine();
     int play_state = m_status_play_state.load();
     const char* state_tag = (play_state == 2) ? "[playing] "
                           : (play_state == 3) ? "[paused] "
@@ -118,8 +186,12 @@ void QcManager::writeStatusFile() {
         uint32_t pos_ms = m_status_pos_ms.load();
         uint32_t dur_ms = m_status_dur_ms.load();
         f << state_tag << title << "  [" << formatMs(pos_ms) << " / " << formatMs(dur_ms) << "]\n";
-        if (!fmt_info.empty()) f << fmt_info << "\n";
     }
+    // Line 2 stays the decoded format and line 3 the activity, so a reader can
+    // address them positionally.  Line 2 is therefore written even when empty
+    // whenever line 3 has something to say.
+    if (!fmt_info.empty() || !activity.empty()) f << fmt_info << "\n";
+    if (!activity.empty()) f << activity << "\n";
     f.close();
     std::rename(tmp.c_str(), m_cfg.status_file.c_str());
 }
@@ -1532,12 +1604,15 @@ void QcManager::onMpdState(const MpdState& st) {
             qrs.state.buffer_state = m_playback_ready
                                      ? BufferState::OK
                                      : BufferState::BUFFERING;
+            m_status_buffering.store(!m_playback_ready,
+                                     std::memory_order_relaxed);
         }
         break;
     case MpdState::Status::PAUSE:
         qrs.state.playing_state = PlayingState::PAUSED;
         qrs.state.buffer_state = BufferState::OK;
         m_force_buffering.store(false, std::memory_order_relaxed);
+        m_status_buffering.store(false, std::memory_order_relaxed);
         m_playback_ready = false;
         m_play_progress_samples = 0;
         break;
@@ -1545,6 +1620,7 @@ void QcManager::onMpdState(const MpdState& st) {
         qrs.state.playing_state = PlayingState::STOPPED;
         qrs.state.buffer_state = BufferState::OK;
         m_force_buffering.store(false, std::memory_order_relaxed);
+        m_status_buffering.store(false, std::memory_order_relaxed);
         m_playback_ready = false;
         m_play_progress_samples = 0;
         break;
@@ -1604,9 +1680,22 @@ std::vector<std::string> QcManager::resolveStreamUrls(
     out_titles.reserve(tracks.size());
     out_segment_tokens.clear();
     out_segment_tokens.reserve(tracks.size());
+    // getStreamUrl() is a Qobuz round-trip per track, and for CMAF tracks it
+    // also fetches the init segment to build the reconstruction plan.  With a
+    // whole album queued that is the first chunk of the wait after pressing
+    // play, so report it rather than leaving the panel blank.
+    struct ActivityGuard {
+        QcManager* mgr;
+        ~ActivityGuard() { mgr->setStatusActivity({}); }
+    } activity_guard{this};
+
+    size_t resolved = 0;
     for (const auto& t : tracks) {
         if (queueLoadAborted(generation))
             break;
+        setStatusActivity("resolving Qobuz stream URLs — track " +
+                          std::to_string(++resolved) + "/" +
+                          std::to_string(tracks.size()));
         TrackStreamInfo info;
         if (m_api->getStreamUrl(t.track_id, m_cfg.format_id, info) &&
             !info.stream_url.empty()) {

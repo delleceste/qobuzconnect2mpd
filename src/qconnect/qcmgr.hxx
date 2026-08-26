@@ -200,6 +200,13 @@ private:
                          const std::string& audio_format);
     void writeStatusFile();
     void statusLoop();
+    // Third status-file line: what the daemon is doing between "play pressed
+    // on the phone" and "music comes out".  Everything up to that point is
+    // invisible otherwise — Qobuz API round-trips, then segment-by-segment
+    // reconstruction of the track — which is exactly the window a listener
+    // wonders whether anything is happening at all.
+    void setStatusActivity(std::string activity);
+    std::string composeActivityLine() const;
 
     void enqueueQueueLoad(const std::vector<QueueTrack>& tracks,
                           uint32_t start_idx,
@@ -313,6 +320,10 @@ private:
     // Status file
     std::string           m_status_title;
     std::string           m_status_format_info;
+    std::string           m_status_activity;
+    // Mirrors the BUFFERING state reported to the Qobuz app, so the status
+    // file can say so without reaching into the report path's own locking.
+    std::atomic<bool>     m_status_buffering{false};
     std::atomic<uint32_t> m_status_pos_ms{0};
     std::atomic<uint32_t> m_status_dur_ms{0};
     std::atomic<int>      m_status_play_state{0}; // 0=unknown 1=stopped 2=playing 3=paused

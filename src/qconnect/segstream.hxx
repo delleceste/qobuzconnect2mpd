@@ -6,6 +6,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -31,6 +32,49 @@ enum class SegmentedDownloadPriority {
 };
 
 using SegmentedDownloadHandle = std::shared_ptr<SegmentedDownloadState>;
+
+// One track the download scheduler still owes work on, as reported by
+// segmentedDownloadProgress().  This is what "buffering" actually means here:
+// a Qobuz CMAF track is reconstructed segment by segment into a local cache
+// file, and MusicPD reads that cache through the local proxy as it grows.
+struct SegmentedDownloadProgress {
+    uint32_t    track_id{0};
+    size_t      segments_done{0};
+    size_t      segments_total{0};
+    uint64_t    bytes{0};        // reconstructed FLAC bytes available so far
+    int         priority{0};     // SegmentedDownloadPriority
+    bool        running{false};  // a worker is fetching a segment right now
+    bool        failed{false};
+    std::string error;
+
+    bool isPlayback() const {
+        return priority >= static_cast<int>(SegmentedDownloadPriority::Playback);
+    }
+};
+
+// Reconstructions still in flight, most urgent first (playback ahead of
+// speculative prefetch).  Finished and idle tracks are omitted, so an empty
+// result means nothing is downloading.  Safe to call from any thread.
+std::vector<SegmentedDownloadProgress> segmentedDownloadProgress();
+
+// The most recent reconstruction failure, retained after the failed job has
+// left the scheduler.  A status reader polling once a second would otherwise
+// miss it entirely: a failed download disappears from the snapshot above the
+// moment it fails, which is exactly when someone wants to know about it.
+struct SegmentedDownloadFailure {
+    std::string error;
+    std::chrono::steady_clock::time_point when{};
+
+    bool valid() const { return !error.empty(); }
+    // Seconds since it happened; 0 when there has been no failure.
+    long ageSeconds() const {
+        if (!valid()) return 0;
+        return std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - when).count();
+    }
+};
+SegmentedDownloadFailure segmentedLastDownloadFailure();
+void clearSegmentedDownloadFailure();
 
 // Everything needed to fetch+decrypt the audio segments of one Qobuz CMAF
 // track on demand.  Built by buildSegmentedTrackPlan() from the /file/url
