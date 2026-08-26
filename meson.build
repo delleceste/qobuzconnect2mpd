@@ -143,6 +143,13 @@ qc_activity_test = executable(
 )
 test('qconnect-activity', qc_activity_test)
 
+qc_playback_policy_test = executable(
+  'qconnect-playback-policy-test',
+  files('tests/playbackpolicy_test.cxx'),
+  include_directories: include_directories('src/qconnect'),
+)
+test('qconnect-playback-policy', qc_playback_policy_test)
+
 qc_segstream_test = executable(
   'qconnect-segstream-test',
   files('tests/segstream_test.cxx', 'src/qconnect/segstream.cxx'),

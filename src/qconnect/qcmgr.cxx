@@ -18,6 +18,7 @@
 #include "qcmgr.hxx"
 #include "qclog.hxx"
 #include "qcactivity.hxx"
+#include "playbackpolicy.hxx"
 #include "mdns.hxx"
 #include "httphandler.hxx"
 #include "wsession.hxx"
@@ -2303,8 +2304,9 @@ bool QcManager::applyPlaybackCommandLocked(
                                      : before.queue_pos;
     if (has_target && target_position < 0) return false;
 
-    // Selecting a different item at position zero already starts it at the
-    // beginning. Do not wait for complete reconstruction just to seek to zero.
+    // Position zero never needs a measured Content-Length. Selecting another
+    // item already starts it at the beginning; re-selecting the current item
+    // below restarts it without asking MPD to seek a growing HTTP stream.
     const bool track_switch_at_start =
         has_position && position_ms == 0 && has_target &&
         target_position != before.queue_pos;
@@ -2314,10 +2316,15 @@ bool QcManager::applyPlaybackCommandLocked(
     const bool previous_track =
         has_position && position_ms == 0 && !has_target &&
         before.position_ms < 3000 && before.queue_pos > 0;
+    bool restart_at_start = false;
     if (previous_track) {
         target_position = before.queue_pos - 1;
         has_position = false;
     } else if (track_switch_at_start) {
+        has_position = false;
+    } else if (has_position &&
+               !positionNeedsExactLength(has_position, position_ms)) {
+        restart_at_start = true;
         has_position = false;
     }
 
@@ -2351,6 +2358,7 @@ bool QcManager::applyPlaybackCommandLocked(
     }
     bool select_track =
         previous_track ||
+        restart_at_start ||
         (has_target && target_position != before.queue_pos) ||
         (has_position && before.status == MpdState::Status::STOP &&
          target_position >= 0);
