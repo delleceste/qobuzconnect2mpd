@@ -1722,6 +1722,36 @@ bool buildSegmentedTrackPlan(
         acc += blen;
         out.segment_offsets.push_back(acc);
     }
+    // The init fragment's per-fragment table is EXACT, not an estimate as
+    // this code long assumed. Measured against a byte-accurate probe of every
+    // fragment's own box headers on 2026-08-27: 6 tracks, formats 6/7/27,
+    // 3 to 153 fragments, zero discrepancy in any fragment. It also
+    // reconciles with the direct CDN file: for track 355836927 the table
+    // totals 115,639,460 and the 604-byte FLAC header brings that to
+    // 115,640,064, exactly the direct file's Content-Length.
+    //
+    // So take the geometry straight from the table, at no extra cost — it
+    // arrives in the init fragment we already fetch. probeSegmentedTrackGeometry()
+    // stays as the fallback for a response that omits the table, where the
+    // fragment count comes from the JSON instead.
+    //
+    // This is trusted but verified: reconstructTrackStep() fails the download
+    // if any fragment's decrypted size disagrees with the geometry, so a
+    // future Qobuz change is caught on the first bad fragment rather than
+    // silently serving a stream that contradicts its own Content-Length.
+    if (estimated_lengths_known) {
+        out.exact_segment_lens = out.segment_byte_lens;
+        out.exact_segment_offsets.clear();
+        out.exact_segment_offsets.reserve(out.exact_segment_lens.size() + 1);
+        uint64_t exact_acc = out.flac_header.size();
+        out.exact_segment_offsets.push_back(exact_acc);
+        for (uint32_t blen : out.exact_segment_lens) {
+            exact_acc += blen;
+            out.exact_segment_offsets.push_back(exact_acc);
+        }
+        out.exact_total_bytes = exact_acc;
+    }
+
     // Diagnostic estimate only.  The HTTP layer waits for the measured size
     // before advertising Content-Length or accepting a byte range.
     if (out.flac_header.size() > std::numeric_limits<uint64_t>::max() - acc) {

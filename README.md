@@ -89,12 +89,18 @@ long the stream is (`FlacInput::Length` → `InputStream::KnownSize`), and
 without a `Content-Length` on the *first* response it gives up with
 `Decoder failed to seek`. A stream still being reassembled cannot answer.
 
-The way out is that each fragment's header states how long its audio is, and
-that header sits at the front. Fetching roughly 64 KB of each fragment — under
-1% of a track — yields every fragment's exact length in about a second and a
-half, and therefore the exact total. The proxy can then publish a real
-`Content-Length` immediately, MPD can seek, the cache is preallocated and
-written out of order, and a seek downloads only the fragment it lands in.
+The way out is that the init fragment carries a table of every fragment's
+exact length. That table is authoritative — verified byte-for-byte against a
+direct measurement of each fragment's own box headers across six tracks, three
+formats and 3 to 153 fragments, with no discrepancy — so the exact total is
+known from the one small request that starts playback anyway. The proxy
+publishes a real `Content-Length` immediately, MPD can seek, the cache is
+preallocated and written out of order, and a seek downloads only the fragment
+it lands in.
+
+If a response ever omits that table, each fragment's length can still be read
+from a ~64 KB prefix of the fragment itself, at roughly 10 seconds for a long
+track. That is the fallback, not the normal path.
 
 ## Dependencies
 

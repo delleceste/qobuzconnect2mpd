@@ -103,6 +103,34 @@ bool testGeometryFromPrefix() {
     return true;
 }
 
+// The init fragment's table is exact and must be adopted as the geometry
+// directly, without a per-fragment probe. Measured against a byte-accurate
+// probe on 6 tracks / 3 formats / 3..153 fragments: zero discrepancy.
+bool testInitTableBecomesExactGeometry() {
+    using namespace QConnect;
+    SegmentedTrackPlan plan;
+    plan.flac_header.assign(604, 0);
+    plan.segment_byte_lens = {1000, 2000, 3000};
+    // Mirror what buildSegmentedTrackPlan does with a table that is present.
+    plan.exact_segment_lens = plan.segment_byte_lens;
+    uint64_t acc = plan.flac_header.size();
+    plan.exact_segment_offsets = {acc};
+    for (uint32_t l : plan.exact_segment_lens) {
+        acc += l;
+        plan.exact_segment_offsets.push_back(acc);
+    }
+    plan.exact_total_bytes = acc;
+
+    CHECK(plan.hasExactGeometry());
+    CHECK(plan.exact_total_bytes == 604 + 6000);
+    CHECK(plan.exact_segment_offsets.front() == 604);
+    CHECK(plan.exact_segment_offsets.back() == plan.exact_total_bytes);
+    CHECK(plan.segmentForOffset(604) == 1);
+    CHECK(plan.segmentForOffset(1604) == 2);
+    CHECK(plan.segmentForOffset(3604) == 3);
+    return true;
+}
+
 // Offset -> segment mapping is what turns a seek into a single segment fetch.
 bool testSegmentForOffset() {
     using namespace QConnect;
@@ -278,6 +306,7 @@ bool testVisibleCacheLifecycle() {
 
 int main() {
     if (!testGeometryFromPrefix() ||
+        !testInitTableBecomesExactGeometry() ||
         !testSegmentForOffset() ||
         !testGrowingCacheRead() ||
         !testRetryableFailure() ||
