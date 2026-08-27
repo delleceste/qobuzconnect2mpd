@@ -1614,7 +1614,10 @@ void QcManager::onMpdState(const MpdState& st) {
     // Report file quality when track changes
     if (st.queue_pos >= 0) {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        if (static_cast<size_t>(st.queue_pos) < m_track_sample_rates.size())
+        // 0 means "not resolved yet"; resolveDirectToken() reports the real
+        // rate when the URL is minted.
+        if (static_cast<size_t>(st.queue_pos) < m_track_sample_rates.size() &&
+            m_track_sample_rates[st.queue_pos] > 0)
             ws->reportFileQuality(m_track_sample_rates[st.queue_pos]);
     }
 
@@ -1703,6 +1706,29 @@ std::vector<std::string> QcManager::resolveStreamUrls(
     for (const auto& t : tracks) {
         if (queueLoadAborted(generation))
             break;
+        // Direct mode resolves nothing here. upmpdcli does the same: its
+        // queue entries are permanent paths built from the track id, and
+        // getFileUrl is called from exactly one place, per GET
+        // (qobuz-app.py:195). Sample rate, bit depth and title come from the
+        // catalogue listing there; here they arrive via the title backfill
+        // that already runs for every track, and the quality actually served
+        // is reported from resolveDirectToken() when the URL is minted.
+        //
+        // This also removes one Qobuz round-trip per track from queue load,
+        // and moves the 27->7->6->5 format ladder to play time, where it sees
+        // current availability rather than availability an hour ago.
+        if (m_cfg.stream_mode == StreamMode::Direct) {
+            urls.push_back("http://127.0.0.1:" +
+                           std::to_string(m_cfg.http_port) + "/qobuz-direct/" +
+                           registerDirectToken(t.track_id, m_cfg.format_id));
+            out_item_ids.push_back(t.queue_item_id);
+            out_sample_rates.push_back(0);   // learned when the URL is minted
+            out_local_paths.push_back(std::string());
+            out_segment_tokens.push_back(std::string());
+            out_titles.push_back(std::string());  // filled by title backfill
+            continue;
+        }
+
         TrackStreamInfo info;
         if (m_api->getStreamUrl(t.track_id, m_cfg.format_id, info) &&
             !info.stream_url.empty()) {
@@ -1711,13 +1737,12 @@ std::vector<std::string> QcManager::resolveStreamUrls(
                 removeMaterializedFile(info.local_path);
                 break;
             }
-            // A direct response carries a signed CDN URL that expires in an
-            // hour. Keep its metadata, discard the URL, and hand MusicPD a
-            // token that this daemon re-resolves on every GET; see
-            // registerDirectToken().
+            // Reached only in auto/segmented mode. A direct URL that turns
+            // up here still must not be parked in MusicPD's queue: it
+            // expires in an hour. Keep the metadata, discard the URL, hand
+            // over a token instead. tokenForTrack() already ends in ".flac",
+            // which MusicPD uses as a decoder hint, so do not append another.
             if (info.segment_token.empty()) {
-                // tokenForTrack() already ends in ".flac" — MusicPD uses the
-                // extension as a decoder hint, so do not append a second one.
                 urls.push_back("http://127.0.0.1:" +
                                std::to_string(m_cfg.http_port) +
                                "/qobuz-direct/" +
@@ -2276,7 +2301,8 @@ void QcManager::queueLoadLoop() {
             m_seg_registry.retainOnly(retained_tokens);
             commitQueueVersion(op.queue_version);
             if (auto ws = currentWSession())
-                ws->reportFileQuality(rates.front());
+                if (!rates.empty() && rates.front() > 0)
+                    ws->reportFileQuality(rates.front());
         }
         if (queue_changed) {
             prioritizeCurrentDownloads();
