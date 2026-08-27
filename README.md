@@ -10,15 +10,91 @@ mDNS), you cast a track or queue to it, and the audio plays through MPD.
 1. The daemon advertises itself on the LAN using mDNS (Bonjour/Avahi-style).
 2. The Qobuz app discovers it and opens a WebSocket session to the Qobuz
    Connect cloud relay.
-3. When the user presses Play, the daemon resolves the track through Qobuz's
-   authenticated `/file/url` API and loads a playable URL into MPD's queue.
+3. The daemon puts a permanent token URL of its own into MPD's queue. When MPD
+   opens it, the daemon resolves the track through Qobuz's authenticated API
+   and redirects MPD to the content delivery network.
 4. Playback state (play/pause/seek/track change) is kept in sync between
    the app and MPD in both directions.
 
-HiRes and lossless CMAF/FLAC streams are reconstructed into a shared growing
-cache and served to MPD by a lightweight built-in HTTP proxy. Downloads use two
-bounded workers; the current and next MusicPD items take priority over queue
-prefetch work.
+By default MPD fetches the audio from Qobuz's CDN itself and no sample passes
+through this daemon. A fallback path for Qobuz's encrypted fragmented streams
+is built in but off; see the background below and `qconnectstreammode`.
+
+## Background: CDN, Akamai, CMAF
+
+Three terms turn up throughout this README, the logs, and the stream URLs. In
+plain terms:
+
+### CDN and Akamai — where the file comes from
+
+A **CDN** (Content Delivery Network) is a rented network of servers scattered
+worldwide holding copies of files, so you download from one near you instead of
+from the company's own machines. **Akamai** runs one of the biggest, and Qobuz
+pays them to do its shipping. That is why every audio URL looks like:
+
+```
+https://streaming-qobuz-std.akamaized.net/file?...
+        ─────────────────────────────────
+        Akamai's domain, not Qobuz's
+```
+
+Qobuz's API answers *where is this track*; Akamai does the delivering. The
+`hmac=` and `etsp=` parameters on the end are Qobuz's signature and an expiry
+timestamp, which Akamai checks so links cannot be shared freely. `etsp` is why
+this daemon never parks a resolved URL in MPD's queue: after 3600 seconds
+Akamai answers `410 Gone`.
+
+### The two ways Qobuz hands over a track
+
+**One file.** `track/getFileUrl` returns a link to an ordinary FLAC file on
+Akamai. MPD downloads it like any file on a web server, and jumping to the
+middle is a standard HTTP byte-range request. This is the default path here,
+and it is what upmpdcli uses.
+
+**The track cut into pieces.** `/file/url` returns a recipe instead of a file:
+a URL template, a fragment count and a decryption key. The track has been cut
+into numbered fragments which must be fetched, decrypted and reassembled by the
+client. That is CMAF.
+
+### CMAF — what it actually is
+
+**Common Media Application Format**, an MPEG standard for exactly that
+chopping-up; the same idea video streaming services use. Each fragment is a
+small container — a header describing the contents, then the audio:
+
+```
+┌────────┬──────────────────────┬─────────────────────────────┐
+│ styp   │ uuid                 │ mdat                        │
+│ "I am  │ Qobuz's table: where │ the audio itself,           │
+│ a      │ the audio starts and │ AES-CTR encrypted           │
+│ frag-  │ how long each frame  │                             │
+│ ment"  │ is                   │                             │
+└────────┴──────────────────────┴─────────────────────────────┘
+```
+
+Streaming services like it because fragments cache well on a CDN and each one
+is encrypted with a session-derived key. A plain file can be downloaded and
+kept; fragments need the key, and the key expires. Copy protection is the
+motive.
+
+### Why this matters to a MusicPD bridge
+
+MPD expects a *file*. The one-file path is a file, so MPD simply works,
+seeking included. CMAF is not a file, so this daemon has to fetch fragments,
+decrypt them, reassemble them and present the result to MPD over a loopback
+HTTP server as if it were a file.
+
+That pretence has one hard requirement. Before MPD can seek, libFLAC asks how
+long the stream is (`FlacInput::Length` → `InputStream::KnownSize`), and
+without a `Content-Length` on the *first* response it gives up with
+`Decoder failed to seek`. A stream still being reassembled cannot answer.
+
+The way out is that each fragment's header states how long its audio is, and
+that header sits at the front. Fetching roughly 64 KB of each fragment — under
+1% of a track — yields every fragment's exact length in about a second and a
+half, and therefore the exact total. The proxy can then publish a real
+`Content-Length` immediately, MPD can seek, the cache is preallocated and
+written out of order, and a seek downloads only the fragment it lands in.
 
 ## Dependencies
 
@@ -328,43 +404,77 @@ item; remaining tracks are added incrementally. Remove, insert, reorder,
 shuffle, clear, and explicit queue-version updates are acknowledged only after
 the corresponding local state has committed.
 
-MusicPD's FLAC decoder needs an exact HTTP length before it can seek. Direct
-CDN URLs supply one, so seeks are immediate and are simply passed through to
-MusicPD.
+Nothing is resolved against Qobuz at queue-load time on the default path.
+MusicPD's queue holds `/qobuz-direct/<token>` entries built from the track id
+alone, and a track's signed CDN URL is minted when MusicPD opens it. That keeps
+queue loading free of one API round-trip per track, and it makes a stale URL
+impossible: a signed URL is only ever seconds old when it is used. Titles
+arrive through the metadata backfill, and the quality actually served is
+reported when the URL is minted.
 
-Under `qconnectstreammode = segmented` or `auto` this does not hold: a
-reconstructed CMAF stream has no length until it is complete, so the first seek
-on an incomplete track waits for its prioritized reconstruction, reopens the
-queue item with the measured length, and only then applies the requested
-position. The renderer reports buffering throughout, and on a long hi-res track
-that wait is minutes. This is the reason `direct` is the default. Segment proxy
-URLs use opaque per-process tokens rather than predictable track IDs because the
-discovery HTTP listener is reachable on the LAN.
+MusicPD's FLAC decoder needs an exact HTTP length before it can seek. Direct
+CDN URLs supply one, so seeks are immediate and are simply passed through. A
+seek makes MusicPD reopen the queue URI, so it resolves again and gets a fresh
+URL — seeking still works after the queue has sat paused for hours.
+
+Under `qconnectstreammode = segmented` or `auto`, the length is established by
+measuring each fragment's exact reconstructed size from a short prefix of its
+box headers before anything is served (see *Background* above). Seeks are then
+ordinary byte ranges, and one blocks only for the fragment holding the target
+offset. If that measurement fails for a track, the track still plays but is not
+seekable until it has fully downloaded. Proxy URLs on both paths use opaque
+per-process tokens rather than predictable track IDs, because the discovery
+HTTP listener is reachable on the LAN.
 
 ## Bit-perfect audio chain
 
-`qobuzconnect2mpd` does not transcode or apply DSP. The default direct-URL path
-passes Qobuz's original stream to MPD untouched; the optional segmented path
-decrypts Qobuz's CMAF fragments and reconstructs an equivalent FLAC stream.
-Actual
+`qobuzconnect2mpd` does not transcode or apply DSP. On the default direct path
+it does not even carry the audio: it answers MusicPD with a `302` to the CDN,
+and MusicPD downloads the same file a reference client would. Verified
+2026-08-27 as byte-identical, container and decoded PCM, against upmpdcli's own
+resolution method — see
+[BIT-PERFECT-PARITY-WITH-UPMPDCLI.md](BIT-PERFECT-PARITY-WITH-UPMPDCLI.md). The
+optional segmented path decrypts Qobuz's CMAF fragments and reconstructs an
+equivalent FLAC stream; it is not covered by that verification. Actual
 DAC output still depends on the selected MusicPD output, mixer, resampler, and
 hardware. See [BIT-PERFECT-PARITY-WITH-UPMPDCLI.md](BIT-PERFECT-PARITY-WITH-UPMPDCLI.md)
 for the current verification scope and a decoded-PCM comparison procedure.
 
 ### Pipeline overview
 
+Default path — `qconnectstreammode = direct`. No audio crosses this daemon:
+
+```
+MPD  ──GET /qobuz-direct/<token>──►  [ qobuzconnect2mpd ]   — httphandler.cxx
+                                          │ resolve track/getFileUrl (fresh)
+     ◄────────302 Location─────────────────┘
+     │
+     └──GET──►  Akamai CDN  ──►  the original FLAC, unmodified
+                                  Content-Length + byte ranges from the CDN
+    ▼
+MPD (libFLAC decoder)                      — lossless PCM
+    ▼
+ALSA `hw:N,M` (direct kernel path)
+    ▼
+DAC
+```
+
+Fallback path — `qconnectstreammode = segmented` or `auto`:
+
 ```
 Qobuz CDN
-    │  encrypted CMAF/FLAC segments (AES-CTR)
+    │  encrypted CMAF/FLAC fragments (AES-CTR)
     ▼
 [ qobuzconnect2mpd ]                       — segstream.cxx
+    │  0. Measure every fragment's exact length from a 64KB prefix
+    │     of its box headers, in parallel, before serving anything
     │  1. AES-CTR decrypt   → byte-identical plaintext
     │  2. Pull FLAC frames out of `mdat`
-    │  3. Prepend the STREAMINFO header from the init segment
+    │  3. Prepend the STREAMINFO header from the init fragment
     ▼
 HTTP proxy on 127.0.0.1:9093              — httphandler.cxx
-    │  shared growing cache, no transcoding
-    │  measured Content-Length and byte ranges after completion
+    │  sparse cache written at known offsets, no transcoding
+    │  exact Content-Length and byte ranges from the first response
     ▼
 MPD (libFLAC decoder)                      — lossless PCM
     ▼
