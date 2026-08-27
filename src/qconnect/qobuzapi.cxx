@@ -135,6 +135,21 @@ std::string QobuzApi::buildRequestSignature(const std::string& method_prefix,
     return hexString(digest, digest_len);
 }
 
+StreamMode streamModeFromString(const std::string& v) {
+    if (v == "segmented") return StreamMode::Segmented;
+    if (v == "auto")      return StreamMode::Auto;
+    return StreamMode::Direct;
+}
+
+const char* streamModeName(StreamMode m) {
+    switch (m) {
+    case StreamMode::Segmented: return "segmented";
+    case StreamMode::Auto:      return "auto";
+    case StreamMode::Direct:    break;
+    }
+    return "direct";
+}
+
 bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
                               TrackStreamInfo& out) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -142,22 +157,53 @@ bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
         LOGERR("QobuzApi::getStreamUrl: no OAuth user token\n");
         return false;
     }
+    const bool want_direct    = m_stream_mode != StreamMode::Segmented;
+    const bool want_segmented = m_stream_mode != StreamMode::Direct;
+
     bool refreshed_credentials = false;
 retry_after_refresh:
-    bool have_stream_session = ensureStreamSession();
-    if (!have_stream_session) {
-        LOGERR("QobuzApi: unable to establish stream session for /file/url, will try legacy endpoint\n");
+    // The CMAF flow needs a stream session; the direct endpoint does not, so
+    // do not pay for one (or log about it) unless segmented is reachable.
+    bool have_stream_session = false;
+    if (want_segmented) {
+        have_stream_session = ensureStreamSession();
+        if (!have_stream_session && want_direct) {
+            LOGINF("QobuzApi: no stream session for /file/url; direct endpoint only\n");
+        } else if (!have_stream_session) {
+            LOGERR("QobuzApi: unable to establish stream session for /file/url\n");
+        }
     }
 
-    // Try requested format, then fall back to lower qualities. Prefer the new
-    // /file/url API, but keep the legacy endpoint as a fallback because Qobuz
-    // changes this flow often and the renderer is useless if no URL reaches MPD.
+    // Try the requested format, then fall back to lower qualities.
+    //
+    // Direct /track/getFileUrl is preferred: it hands MPD a signed CDN URL
+    // with a Content-Length and byte-range support, which is the only shape
+    // libFLAC can seek. The CMAF /file/url flow produces a reconstructed
+    // stream of unknown length that MPD cannot seek until it is complete, so
+    // it is a fallback for the day Qobuz retires the direct endpoint rather
+    // than the normal path. See 'qconnectstreammode'.
     static const int fallback_fmts[] = {27, 7, 6, 5};
     for (int fmt : fallback_fmts) {
         if (fmt > format_id) continue;
 
-        long file_code = 0;
+        if (want_direct) {
+            long legacy_code = 0;
+            if (tryGetStreamUrl(track_id, fmt, out, &legacy_code))
+                return true;
+            if (legacy_code == 400 && !refreshed_credentials) {
+                LOGINF("QobuzApi: getFileUrl signature rejected; refreshing app credentials and retrying\n");
+                if (fetchAppCredentials()) {
+                    m_app_secret.clear();
+                    m_stream_session_id.clear();
+                    m_stream_session_expires_at = 0;
+                    refreshed_credentials = true;
+                    goto retry_after_refresh;
+                }
+            }
+        }
+
         if (have_stream_session) {
+            long file_code = 0;
             if (tryFileUrl(track_id, fmt, out, &file_code))
                 return true;
             if (file_code == 400 && !refreshed_credentials) {
@@ -169,20 +215,6 @@ retry_after_refresh:
                     refreshed_credentials = true;
                     goto retry_after_refresh;
                 }
-            }
-        }
-
-        long legacy_code = 0;
-        if (tryGetStreamUrl(track_id, fmt, out, &legacy_code))
-            return true;
-        if (legacy_code == 400 && !refreshed_credentials) {
-            LOGINF("QobuzApi: legacy getFileUrl signature rejected; refreshing app credentials and retrying\n");
-            if (fetchAppCredentials()) {
-                m_app_secret.clear();
-                m_stream_session_id.clear();
-                m_stream_session_expires_at = 0;
-                refreshed_credentials = true;
-                goto retry_after_refresh;
             }
         }
     }
@@ -378,6 +410,17 @@ bool QobuzApi::planSegmentedTrack(const Json::Value& root, uint32_t track_id,
                                   *plan, &err)) {
         LOGERR("QobuzApi: plan track " << track_id << " failed: " << err << "\n");
         return false;
+    }
+
+    // Measure the exact reconstructed length before serving anything: this
+    // costs ~64KB per segment and is what lets the proxy publish a real
+    // Content-Length, without which MusicPD's FLAC decoder cannot seek.
+    // Failure is not fatal — playback still works, just unseekable.
+    std::string geom_err;
+    if (!probeSegmentedTrackGeometry(*plan, &geom_err)) {
+        LOGERR("QobuzApi: track " << track_id
+               << ": exact geometry unavailable (" << geom_err
+               << "); this track will not be seekable\n");
     }
 
     std::string token = SegmentedTrackRegistry::tokenForTrack(

@@ -301,6 +301,13 @@ bool QcManager::start() {
                                         m_cfg.app_id,
                                         m_cfg.app_secret);
     m_api->setSegmentedRegistry(&m_seg_registry);
+    m_api->setStreamMode(m_cfg.stream_mode);
+    if (m_cfg.stream_mode != StreamMode::Direct) {
+        LOGINF("QcManager: stream mode '"
+               << streamModeName(m_cfg.stream_mode)
+               << "' — segmented tracks are seekable only when their exact"
+                  " geometry can be measured\n");
+    }
 
     // Both values are required to sign stream URL requests. Fetch a complete
     // pair when either half of the configured pair is missing.
@@ -360,6 +367,10 @@ bool QcManager::start() {
         m_api->appId(),
         [this](ConnectCredentials c) { onConnect(std::move(c)); });
     m_http->setSegmentedRegistry(&m_seg_registry);
+    m_http->setDirectResolver(
+        [this](const std::string& token, std::string& url_out) {
+            return resolveDirectToken(token, url_out);
+        });
 
     const bool needs_oauth = m_api->userToken().empty();
     std::string oauth_path;
@@ -1603,7 +1614,10 @@ void QcManager::onMpdState(const MpdState& st) {
     // Report file quality when track changes
     if (st.queue_pos >= 0) {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
-        if (static_cast<size_t>(st.queue_pos) < m_track_sample_rates.size())
+        // 0 means "not resolved yet"; resolveDirectToken() reports the real
+        // rate when the URL is minted.
+        if (static_cast<size_t>(st.queue_pos) < m_track_sample_rates.size() &&
+            m_track_sample_rates[st.queue_pos] > 0)
             ws->reportFileQuality(m_track_sample_rates[st.queue_pos]);
     }
 
@@ -1618,6 +1632,53 @@ void QcManager::onMpdState(const MpdState& st) {
     case MpdState::Status::STOP:  m_status_play_state.store(1); break;
     default:                      m_status_play_state.store(0); break;
     }
+}
+
+// ---- Direct-stream tokens ---------------------------------------------------
+//
+// Qobuz's signed CDN URLs expire after an hour (the `etsp` query parameter).
+// Putting them straight into MusicPD's queue means a long album's later
+// tracks, or any track after a long pause, is fetched with a dead URL and
+// comes back HTTP 410. Both reference implementations avoid this the same
+// way and neither has any URL-refresh machinery: upmpdcli parks a permanent
+// "<prefix>/track/version/1/trackId/N" path in MusicPD's queue and resolves
+// it per GET (translateurl -> trackuri -> getFileUrl -> 302), and qbz stores
+// no URL at all, resolving in start_track_stream when the controller says
+// play. This does the same: MusicPD gets a token, the URL is minted seconds
+// before the bytes are read.
+std::string QcManager::registerDirectToken(uint32_t track_id, int format_id) {
+    std::string token = SegmentedTrackRegistry::tokenForTrack(track_id,
+                                                              format_id);
+    std::lock_guard<std::mutex> lk(m_direct_mutex);
+    m_direct_tokens[token] = {track_id, format_id};
+    return token;
+}
+
+bool QcManager::resolveDirectToken(const std::string& token,
+                                   std::string& url_out) {
+    uint32_t track_id = 0;
+    int format_id = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_direct_mutex);
+        auto it = m_direct_tokens.find(token);
+        if (it == m_direct_tokens.end()) return false;
+        track_id = it->second.first;
+        format_id = it->second.second;
+    }
+    if (!m_api) return false;
+    TrackStreamInfo info;
+    if (!m_api->getStreamUrl(track_id, format_id, info) ||
+        info.stream_url.empty()) {
+        LOGERR("QcManager: could not resolve stream URL for track "
+               << track_id << "\n");
+        return false;
+    }
+    // Report the quality actually being served, which is only known now.
+    if (info.sampling_rate > 0) {
+        if (auto ws = currentWSession()) ws->reportFileQuality(info.sampling_rate);
+    }
+    url_out = info.stream_url;
+    return true;
 }
 
 // ---- Stream URL resolution --------------------------------------------------
@@ -1645,6 +1706,29 @@ std::vector<std::string> QcManager::resolveStreamUrls(
     for (const auto& t : tracks) {
         if (queueLoadAborted(generation))
             break;
+        // Direct mode resolves nothing here. upmpdcli does the same: its
+        // queue entries are permanent paths built from the track id, and
+        // getFileUrl is called from exactly one place, per GET
+        // (qobuz-app.py:195). Sample rate, bit depth and title come from the
+        // catalogue listing there; here they arrive via the title backfill
+        // that already runs for every track, and the quality actually served
+        // is reported from resolveDirectToken() when the URL is minted.
+        //
+        // This also removes one Qobuz round-trip per track from queue load,
+        // and moves the 27->7->6->5 format ladder to play time, where it sees
+        // current availability rather than availability an hour ago.
+        if (m_cfg.stream_mode == StreamMode::Direct) {
+            urls.push_back("http://127.0.0.1:" +
+                           std::to_string(m_cfg.http_port) + "/qobuz-direct/" +
+                           registerDirectToken(t.track_id, m_cfg.format_id));
+            out_item_ids.push_back(t.queue_item_id);
+            out_sample_rates.push_back(0);   // learned when the URL is minted
+            out_local_paths.push_back(std::string());
+            out_segment_tokens.push_back(std::string());
+            out_titles.push_back(std::string());  // filled by title backfill
+            continue;
+        }
+
         TrackStreamInfo info;
         if (m_api->getStreamUrl(t.track_id, m_cfg.format_id, info) &&
             !info.stream_url.empty()) {
@@ -1653,7 +1737,20 @@ std::vector<std::string> QcManager::resolveStreamUrls(
                 removeMaterializedFile(info.local_path);
                 break;
             }
-            urls.push_back(info.stream_url);
+            // Reached only in auto/segmented mode. A direct URL that turns
+            // up here still must not be parked in MusicPD's queue: it
+            // expires in an hour. Keep the metadata, discard the URL, hand
+            // over a token instead. tokenForTrack() already ends in ".flac",
+            // which MusicPD uses as a decoder hint, so do not append another.
+            if (info.segment_token.empty()) {
+                urls.push_back("http://127.0.0.1:" +
+                               std::to_string(m_cfg.http_port) +
+                               "/qobuz-direct/" +
+                               registerDirectToken(t.track_id,
+                                                   info.format_id));
+            } else {
+                urls.push_back(info.stream_url);
+            }
             out_item_ids.push_back(t.queue_item_id);
             out_sample_rates.push_back(info.sampling_rate);
             out_local_paths.push_back(info.local_path);
@@ -2204,7 +2301,8 @@ void QcManager::queueLoadLoop() {
             m_seg_registry.retainOnly(retained_tokens);
             commitQueueVersion(op.queue_version);
             if (auto ws = currentWSession())
-                ws->reportFileQuality(rates.front());
+                if (!rates.empty() && rates.front() > 0)
+                    ws->reportFileQuality(rates.front());
         }
         if (queue_changed) {
             prioritizeCurrentDownloads();
@@ -2395,6 +2493,19 @@ bool QcManager::prepareSegmentedSeek(int mpd_position,
 
     auto plan = m_seg_registry.get(token);
     if (!plan) return false;
+
+    // Measured geometry means the proxy already published a real
+    // Content-Length on the first response, so MusicPD's decoder is seekable
+    // as it stands: no reopen, and no waiting for the download.  The Range
+    // request the seek produces blocks only for the one segment that holds
+    // the target offset.
+    if (plan->hasExactGeometry()) {
+        auto pin = acquireSegmentedTrackDownload(
+            plan, SegmentedDownloadPriority::Playback);
+        if (pin) seek_pin = std::move(pin);
+        return true;
+    }
+
     auto download = acquireSegmentedTrackDownload(
         plan, SegmentedDownloadPriority::Playback);
     if (!download) return false;

@@ -17,7 +17,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
+#include <cstdlib>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -48,8 +50,20 @@ struct SegmentedDownloadState {
     std::mutex mutex;
     std::condition_variable changed;
     int fd{-1};
+    // Bytes [0, available) are present.  With exact geometry the cache is
+    // written out of order, so this is the contiguous watermark from the
+    // start, not the number of bytes fetched; segment_present is the real
+    // record of what is on disk.
     uint64_t available{0};
     uint64_t exact_size{0};
+    // Per-segment presence, sized n_audio_segments when the plan has exact
+    // geometry.  Empty for the legacy sequential path.
+    std::vector<uint8_t> segment_present;
+    size_t segments_done{0};
+    // A reader blocked on a byte offset publishes the segment it needs here
+    // so the downloader fetches that one next.  0 = no request.
+    size_t wanted_segment{0};
+    bool header_written{false};
     bool complete{false};
     bool failed{false};
     bool scheduling{true};
@@ -61,6 +75,10 @@ struct SegmentedDownloadState {
     size_t next_segment{1};
     std::string error;
     std::string cache_path;
+    // Retained so readers can map a byte offset onto the segment that holds
+    // it without the caller having to pass the plan back in.  Weak because
+    // the plan owns this state: a shared_ptr here would be a cycle.
+    std::weak_ptr<SegmentedTrackPlan> plan;
 };
 
 namespace {
@@ -120,6 +138,38 @@ static size_t curlWriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) 
     return bytes;
 }
 
+// Captures the Content-Range header value; everything else is ignored.
+static size_t curlHeaderCb(char* ptr, size_t size, size_t nmemb,
+                           void* userdata) {
+    auto* out = static_cast<std::string*>(userdata);
+    const size_t bytes = size * nmemb;
+    static const char kName[] = "content-range:";
+    const size_t name_len = sizeof(kName) - 1;
+    if (bytes > name_len) {
+        bool match = true;
+        for (size_t i = 0; i < name_len; ++i) {
+            if (std::tolower(static_cast<unsigned char>(ptr[i])) != kName[i]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            size_t begin = name_len;
+            while (begin < bytes && (ptr[begin] == ' ' || ptr[begin] == '\t'))
+                ++begin;
+            size_t end = bytes;
+            while (end > begin && (ptr[end - 1] == '\r' || ptr[end - 1] == '\n'))
+                --end;
+            try {
+                out->assign(ptr + begin, end - begin);
+            } catch (...) {
+                return 0;
+            }
+        }
+    }
+    return bytes;
+}
+
 class CurlFetcher {
 public:
     CurlFetcher() : m_curl(curl_easy_init()) {}
@@ -130,11 +180,16 @@ public:
     CurlFetcher(const CurlFetcher&) = delete;
     CurlFetcher& operator=(const CurlFetcher&) = delete;
 
+    // range: nullptr for a whole-object GET, else a byte range such as
+    // "0-65535". full_size_out receives the object's total size, parsed from
+    // Content-Range on a 206 (or Content-Length on a 200).
     bool fetch(const std::string& url,
                const std::vector<std::string>& headers,
                std::vector<uint8_t>& out,
                std::string* err_out = nullptr,
-               const std::atomic<bool>* cancelled = nullptr) {
+               const std::atomic<bool>* cancelled = nullptr,
+               const char* range = nullptr,
+               uint64_t* full_size_out = nullptr) {
         if (!m_curl) {
             if (err_out) *err_out = "curl_easy_init failed";
             return false;
@@ -152,6 +207,12 @@ public:
         curl_easy_setopt(m_curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(m_curl, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(m_curl, CURLOPT_TCP_KEEPALIVE, 1L);
+        std::string content_range;
+        if (range) {
+            curl_easy_setopt(m_curl, CURLOPT_RANGE, range);
+            curl_easy_setopt(m_curl, CURLOPT_HEADERFUNCTION, curlHeaderCb);
+            curl_easy_setopt(m_curl, CURLOPT_HEADERDATA, &content_range);
+        }
         if (cancelled) {
             curl_easy_setopt(m_curl, CURLOPT_NOPROGRESS, 0L);
             curl_easy_setopt(m_curl, CURLOPT_XFERINFOFUNCTION, curlProgressCb);
@@ -184,13 +245,33 @@ public:
             }
             return false;
         }
-        if (code != 200) {
+        if (code != 200 && !(range && code == 206)) {
             if (err_out) {
                 char tmp[32];
                 snprintf(tmp, sizeof(tmp), "HTTP %ld", code);
                 *err_out = tmp;
             }
             return false;
+        }
+        if (full_size_out) {
+            *full_size_out = 0;
+            // "bytes 0-65535/7366949" -> 7366949
+            const size_t slash = content_range.rfind('/');
+            if (slash != std::string::npos && slash + 1 < content_range.size()) {
+                errno = 0;
+                char* end = nullptr;
+                const unsigned long long total = std::strtoull(
+                    content_range.c_str() + slash + 1, &end, 10);
+                if (errno == 0 && end && end != content_range.c_str() + slash + 1)
+                    *full_size_out = static_cast<uint64_t>(total);
+            }
+            if (*full_size_out == 0) {
+                curl_off_t len = 0;
+                if (curl_easy_getinfo(m_curl,
+                                      CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
+                                      &len) == CURLE_OK && len > 0)
+                    *full_size_out = static_cast<uint64_t>(len);
+            }
         }
         if (buf.empty()) {
             if (err_out) *err_out = "empty response";
@@ -382,6 +463,77 @@ static bool parseSegmentCrypto(const std::vector<uint8_t>& data, CmafSegmentCryp
     return true;
 }
 
+// ---- Exact segment geometry (no audio download) -----------------------------
+//
+// decryptSegment() emits exactly the bytes in [data_offset, mdat_end): the
+// encrypted FLAC frames, then any trailing mdat bytes.  AES-CTR is
+// length-preserving, so that span's length IS the decrypted output length and
+// needs neither the content key nor the payload.
+//
+// Both bounds come from box headers at the FRONT of the segment: data_offset
+// from the Qobuz `uuid` box, mdat_end from the `mdat` box header.  A short
+// prefix of each segment therefore yields its exact reconstructed length, and
+// the whole track's exact length and cumulative offsets follow.  That is what
+// lets the proxy answer with a real Content-Length before a single audio byte
+// has been fetched, which is the only thing MusicPD's FLAC decoder needs in
+// order to seek (FlacInput::Length -> InputStream::KnownSize).
+
+struct CmafSegmentGeometry {
+    uint64_t data_offset{0};
+    uint64_t mdat_end{0};
+    uint64_t decrypted_len() const { return mdat_end - data_offset; }
+};
+
+// Parse geometry from a prefix.  full_size is the segment's total size, used
+// only to sanity-check box sizes that extend past the prefix.  Returns false
+// if the prefix is too short to reach the mdat header, which the caller
+// retries with a larger one.
+static bool parseSegmentGeometry(const std::vector<uint8_t>& prefix,
+                                 uint64_t full_size,
+                                 CmafSegmentGeometry& out) {
+    size_t uuid_pos = std::string::npos;
+    size_t pos = 0;
+    while (pos + 8 <= prefix.size()) {
+        const size_t sz = readBoxSize(prefix, pos);
+        if (sz < 8) return false;
+        if (full_size != 0 && sz > full_size - pos) return false;
+        if (memcmp(&prefix[pos + 4], "mdat", 4) == 0) {
+            if (uuid_pos == std::string::npos) return false;
+            const size_t base = uuid_pos + 24;
+            if (base + 8 > prefix.size()) return false;
+            const size_t a = base + 4;
+            const uint32_t data_off_raw =
+                (uint32_t(prefix[a]) << 24) | (uint32_t(prefix[a + 1]) << 16) |
+                (uint32_t(prefix[a + 2]) << 8) | uint32_t(prefix[a + 3]);
+            const uint64_t data_offset =
+                static_cast<uint64_t>(uuid_pos) + data_off_raw;
+            const uint64_t mdat_end = static_cast<uint64_t>(pos) + sz;
+            if (data_offset > mdat_end) return false;
+            if (full_size != 0 && mdat_end > full_size) return false;
+            out.data_offset = data_offset;
+            out.mdat_end = mdat_end;
+            return true;
+        }
+        static const uint8_t QBZ_SEG_UUID[16] = {
+            0x3b,0x42,0x12,0x92,0x56,0xf3,0x5f,0x75,
+            0x92,0x36,0x63,0xb6,0x9a,0x1f,0x52,0xb2
+        };
+        if (memcmp(&prefix[pos + 4], "uuid", 4) == 0 &&
+            pos + 24 <= prefix.size() &&
+            memcmp(&prefix[pos + 8], QBZ_SEG_UUID, 16) == 0) {
+            uuid_pos = pos;
+        }
+        pos += sz;
+    }
+    return false;
+}
+
+// Qobuz's own per-segment table in the init segment is an estimate and must
+// never be used for byte offsets; these prefixes are measured instead.
+constexpr size_t kGeometryProbeBytes = 64 * 1024;
+constexpr size_t kGeometryProbeBytesMax = 1024 * 1024;
+constexpr size_t kGeometryProbeThreads = 8;
+
 static bool deriveSessionKey(const std::string& infos, uint8_t out_key[16]) {
     auto dot = infos.find('.');
     if (dot == std::string::npos) return false;
@@ -521,6 +673,24 @@ static bool openDownloadCache(
         return false;
     }
 
+    if (plan.hasExactGeometry()) {
+        // Preallocate sparse: every segment's offset is already known, so
+        // segments can land in any order and the exact length can be
+        // published before a single audio byte exists.
+        if (::ftruncate(state->fd,
+                        static_cast<off_t>(plan.exact_total_bytes)) != 0) {
+            error = "cannot size cache file: " +
+                    std::string(std::strerror(errno));
+            ::close(state->fd);
+            state->fd = -1;
+            ::unlink(state->cache_path.c_str());
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->segment_present.assign(plan.n_audio_segments(), 0);
+        state->exact_size = plan.exact_total_bytes;
+    }
+
     LOGINF("QobuzApi: track " << state->cache_path << " ["
            << streamFormat(plan) << "] reconstructing "
            << plan.n_audio_segments()
@@ -559,6 +729,43 @@ static bool appendToCache(const std::shared_ptr<SegmentedDownloadState>& state,
     return true;
 }
 
+// Write at an absolute offset in the preallocated cache.  Presence and the
+// contiguous watermark are updated by the caller under the state lock.
+static bool writeCacheAt(const std::shared_ptr<SegmentedDownloadState>& state,
+                         uint64_t offset, const uint8_t* data, size_t size,
+                         std::string& error) {
+    size_t done = 0;
+    while (done < size) {
+        const ssize_t written = ::pwrite(
+            state->fd, data + done, size - done,
+            static_cast<off_t>(offset + done));
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            error = "cache write failed: " + std::string(std::strerror(errno));
+            return false;
+        }
+        done += static_cast<size_t>(written);
+    }
+    return true;
+}
+
+// Recompute how far the stream is contiguously present from byte 0.  Must be
+// called with state->mutex held.
+static void refreshContiguousLocked(
+    const std::shared_ptr<SegmentedTrackPlan>& plan,
+    const std::shared_ptr<SegmentedDownloadState>& state) {
+    if (!state->header_written) {
+        state->available = 0;
+        return;
+    }
+    uint64_t end = plan->flac_header.size();
+    for (size_t i = 0; i < state->segment_present.size(); ++i) {
+        if (!state->segment_present[i]) break;
+        end = plan->exact_segment_offsets[i + 1];
+    }
+    state->available = end;
+}
+
 static void failDownload(const std::shared_ptr<SegmentedDownloadState>& state,
                          std::string error) {
     bool announce = false;
@@ -590,20 +797,52 @@ static ReconstructionStep reconstructTrackStep(
     if (state->cancelled.load(std::memory_order_relaxed))
         return ReconstructionStep::Finished;
 
+    const bool exact = plan->hasExactGeometry();
+
     if (state->fd < 0) {
         if (!openDownloadCache(*plan, state, error)) {
             failDownload(state, std::move(error));
             return ReconstructionStep::Finished;
         }
-        if (!appendToCache(state, plan->flac_header.data(),
-                           plan->flac_header.size(), error)) {
+        if (exact) {
+            if (!writeCacheAt(state, 0, plan->flac_header.data(),
+                              plan->flac_header.size(), error)) {
+                failDownload(state, std::move(error));
+                return ReconstructionStep::Finished;
+            }
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->header_written = true;
+                refreshContiguousLocked(plan, state);
+            }
+            state->changed.notify_all();
+        } else if (!appendToCache(state, plan->flac_header.data(),
+                                  plan->flac_header.size(), error)) {
             failDownload(state, std::move(error));
             return ReconstructionStep::Finished;
         }
     }
 
-    if (state->next_segment <= plan->n_audio_segments()) {
-        const size_t segment = state->next_segment;
+    // Pick the next segment: honour a reader that is blocked on a seek
+    // target, otherwise fill the lowest gap so sequential playback stays
+    // ahead of the decoder.
+    size_t segment = 0;
+    if (exact) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        const size_t wanted = state->wanted_segment;
+        if (wanted >= 1 && wanted <= state->segment_present.size() &&
+            !state->segment_present[wanted - 1]) {
+            segment = wanted;
+        } else {
+            for (size_t i = 0; i < state->segment_present.size(); ++i) {
+                if (!state->segment_present[i]) { segment = i + 1; break; }
+            }
+        }
+    } else if (state->next_segment <= plan->n_audio_segments()) {
+        segment = state->next_segment;
+    }
+
+    if (segment != 0) {
         std::vector<uint8_t> data;
         bool fetched = false;
         for (int attempt = 1; attempt <= kSegmentMaxAttempts; ++attempt) {
@@ -634,24 +873,60 @@ static ReconstructionStep reconstructTrackStep(
         }
         if (state->cancelled.load(std::memory_order_relaxed))
             return ReconstructionStep::Finished;
-        if (!appendToCache(state, data.data(), data.size(), error)) {
-            failDownload(state, std::move(error));
-            return ReconstructionStep::Finished;
+        if (exact) {
+            const uint64_t expected =
+                plan->exact_segment_lens[segment - 1];
+            if (data.size() != expected) {
+                // The measured geometry is what the Content-Length promised.
+                // A mismatch would corrupt every later offset, so stop rather
+                // than serve a stream that does not match its own header.
+                failDownload(state, "segment " + std::to_string(segment) +
+                             " is " + std::to_string(data.size()) +
+                             " bytes, geometry said " +
+                             std::to_string(expected));
+                return ReconstructionStep::Finished;
+            }
+            if (!writeCacheAt(state, plan->exact_segment_offsets[segment - 1],
+                              data.data(), data.size(), error)) {
+                failDownload(state, std::move(error));
+                return ReconstructionStep::Finished;
+            }
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (!state->segment_present[segment - 1]) {
+                    state->segment_present[segment - 1] = 1;
+                    ++state->segments_done;
+                }
+                if (state->wanted_segment == segment) state->wanted_segment = 0;
+                refreshContiguousLocked(plan, state);
+            }
+            state->changed.notify_all();
+        } else {
+            if (!appendToCache(state, data.data(), data.size(), error)) {
+                failDownload(state, std::move(error));
+                return ReconstructionStep::Finished;
+            }
+            ++state->next_segment;
         }
-        ++state->next_segment;
         const size_t segment_count = plan->n_audio_segments();
+        const size_t done = exact ? state->segments_done : segment;
         const unsigned percent = segment_count == 0 ? 100 :
-            static_cast<unsigned>((segment * 100) / segment_count);
+            static_cast<unsigned>((done * 100) / segment_count);
         LOGDEB("QobuzApi: track " << state->cache_path << " ["
                << streamFormat(*plan) << "] [segment " << segment << "/"
                << segment_count << "] in progress (" << percent << "%)\n");
         if (isForPlayback(state))
             activityProgress(ActivityPhase::Downloading, state->cache_path,
-                             "segment", segment, segment_count);
+                             "segment", done, segment_count);
     }
 
-    if (state->next_segment <= plan->n_audio_segments())
+    if (exact) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->segments_done < state->segment_present.size())
+            return ReconstructionStep::Continue;
+    } else if (state->next_segment <= plan->n_audio_segments()) {
         return ReconstructionStep::Continue;
+    }
 
     uint64_t completed_size = 0;
     {
@@ -969,6 +1244,7 @@ SegmentedDownloadHandle scheduleSegmentedTrackDownload(
         if (!state) {
             state = std::make_shared<SegmentedDownloadState>();
             state->cache_path = makeCachePath(*plan);
+            state->plan = plan;
             if (pin_reader)
                 state->readers.store(1, std::memory_order_relaxed);
             plan->m_download_state = state;
@@ -1064,7 +1340,10 @@ bool segmentedTrackExactSize(const SegmentedDownloadHandle& state,
                              uint64_t& size_out) {
     if (!state) return false;
     std::lock_guard<std::mutex> lock(state->mutex);
-    if (!state->complete) return false;
+    // With measured geometry the exact size is known before any audio has
+    // been fetched, which is the whole point: the proxy can publish a real
+    // Content-Length on the first response instead of after the download.
+    if (!state->complete && state->exact_size == 0) return false;
     size_out = state->exact_size;
     return true;
 }
@@ -1122,19 +1401,67 @@ int readSegmentedTrack(const SegmentedDownloadHandle& state,
         return -1;
     }
 
-    uint64_t available = 0;
+    uint64_t readable_end = 0;
     {
         std::unique_lock<std::mutex> lock(state->mutex);
-        if (!state->changed.wait_for(
-                lock, std::chrono::milliseconds(timeout_ms), [&state, offset] {
-                    return state->available > offset || state->complete ||
-                           state->failed;
-                })) {
-            if (err_out) *err_out = "download stalled before requested offset";
-            return -1;
+        const auto plan = state->plan.lock();
+        const bool exact = plan && plan->hasExactGeometry() &&
+                           !state->segment_present.empty();
+        if (exact) {
+            // Random access: only the segment holding `offset` has to be
+            // present, and asking for it moves it to the front of the
+            // download queue.  This is what makes a seek into an
+            // undownloaded track cost one segment instead of the whole file.
+            const size_t segment = plan->segmentForOffset(offset);
+            if (segment == 0) {
+                if (offset >= plan->exact_total_bytes) return 0;
+                // Inside the FLAC header, which is written before anything
+                // else.
+                if (!state->changed.wait_for(
+                        lock, std::chrono::milliseconds(timeout_ms),
+                        [&state] {
+                            return state->header_written || state->failed;
+                        })) {
+                    if (err_out) *err_out = "download stalled before header";
+                    return -1;
+                }
+                readable_end = plan->flac_header.size();
+            } else {
+                if (!state->segment_present[segment - 1]) {
+                    state->wanted_segment = segment;
+                    state->changed.notify_all();
+                    if (!state->changed.wait_for(
+                            lock, std::chrono::milliseconds(timeout_ms),
+                            [&state, segment] {
+                                return state->segment_present[segment - 1] ||
+                                       state->failed;
+                            })) {
+                        if (err_out)
+                            *err_out = "download stalled before requested offset";
+                        return -1;
+                    }
+                }
+                if (state->failed) {
+                    if (err_out) *err_out = state->error;
+                    return -1;
+                }
+                // Read no further than this segment; the next one may be a
+                // hole that reads back as zeroes.
+                readable_end = plan->exact_segment_offsets[segment];
+            }
+        } else {
+            if (!state->changed.wait_for(
+                    lock, std::chrono::milliseconds(timeout_ms),
+                    [&state, offset] {
+                        return state->available > offset || state->complete ||
+                               state->failed;
+                    })) {
+                if (err_out) *err_out = "download stalled before requested offset";
+                return -1;
+            }
+            readable_end = state->available;
         }
-        available = state->available;
-        if (offset >= available) {
+        if (offset >= readable_end) {
             if (state->failed) {
                 if (err_out) *err_out = state->error;
                 return -1;
@@ -1143,7 +1470,7 @@ int readSegmentedTrack(const SegmentedDownloadHandle& state,
         }
     }
 
-    const uint64_t wanted64 = std::min<uint64_t>(capacity, available - offset);
+    const uint64_t wanted64 = std::min<uint64_t>(capacity, readable_end - offset);
     if (offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
         if (err_out) *err_out = "cache offset is too large";
         return -1;
@@ -1412,6 +1739,118 @@ bool buildSegmentedTrackPlan(
 }
 
 // ---- fetchAndDecryptSegment -------------------------------------------------
+
+bool segmentGeometryFromPrefix(const uint8_t* prefix, size_t prefix_len,
+                               uint64_t full_size, uint64_t& out_len) {
+    if (!prefix || prefix_len == 0) return false;
+    const std::vector<uint8_t> bytes(prefix, prefix + prefix_len);
+    CmafSegmentGeometry geom;
+    if (!parseSegmentGeometry(bytes, full_size, geom)) return false;
+    out_len = geom.decrypted_len();
+    return true;
+}
+
+size_t SegmentedTrackPlan::segmentForOffset(uint64_t offset) const {
+    if (exact_segment_offsets.size() < 2) return 0;
+    if (offset < exact_segment_offsets.front()) return 1;
+    if (offset >= exact_segment_offsets.back()) return 0;
+    // First index whose start is > offset; the segment is the one before it.
+    const auto it = std::upper_bound(exact_segment_offsets.begin(),
+                                     exact_segment_offsets.end(), offset);
+    return static_cast<size_t>(it - exact_segment_offsets.begin());
+}
+
+bool probeSegmentedTrackGeometry(SegmentedTrackPlan& plan,
+                                 std::string* err_out) {
+    const size_t count = plan.n_audio_segments();
+    if (count == 0) {
+        if (err_out) *err_out = "no audio segments";
+        return false;
+    }
+
+    std::vector<uint32_t> lens(count, 0);
+    std::atomic<size_t> next_index{0};
+    std::mutex err_mu;
+    std::string first_error;
+
+    auto worker = [&]() {
+        CurlFetcher fetcher;
+        std::vector<uint8_t> prefix;
+        for (;;) {
+            const size_t i = next_index.fetch_add(1, std::memory_order_relaxed);
+            if (i >= count) return;
+            {
+                std::lock_guard<std::mutex> lk(err_mu);
+                if (!first_error.empty()) return;
+            }
+            const std::string url = std::regex_replace(
+                plan.url_template, std::regex("\\$SEGMENT\\$"),
+                std::to_string(i + 1));
+            std::string error;
+            bool measured = false;
+            for (size_t want = kGeometryProbeBytes;
+                 want <= kGeometryProbeBytesMax && !measured; want *= 4) {
+                const std::string range = "0-" + std::to_string(want - 1);
+                uint64_t full_size = 0;
+                if (!fetcher.fetch(url, plan.http_headers, prefix, &error,
+                                   nullptr, range.c_str(), &full_size)) {
+                    break;
+                }
+                CmafSegmentGeometry geom;
+                if (parseSegmentGeometry(prefix, full_size, geom)) {
+                    const uint64_t len = geom.decrypted_len();
+                    if (len == 0 || len > std::numeric_limits<uint32_t>::max()) {
+                        error = "implausible segment length";
+                        break;
+                    }
+                    lens[i] = static_cast<uint32_t>(len);
+                    measured = true;
+                    break;
+                }
+                error = "segment headers not within " +
+                        std::to_string(want) + " bytes";
+                // The server may have returned the whole (small) segment; a
+                // larger range would not add anything.
+                if (prefix.size() < want) break;
+            }
+            if (!measured) {
+                std::lock_guard<std::mutex> lk(err_mu);
+                if (first_error.empty()) {
+                    first_error = "segment " + std::to_string(i + 1) + ": " +
+                                  (error.empty() ? "unmeasurable" : error);
+                }
+                return;
+            }
+        }
+    };
+
+    const size_t nthreads = std::min(kGeometryProbeThreads, count);
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads);
+    for (size_t i = 0; i < nthreads; ++i) threads.emplace_back(worker);
+    for (auto& t : threads) t.join();
+
+    if (!first_error.empty()) {
+        if (err_out) *err_out = first_error;
+        return false;
+    }
+
+    plan.exact_segment_lens = std::move(lens);
+    plan.exact_segment_offsets.clear();
+    plan.exact_segment_offsets.reserve(count + 1);
+    uint64_t acc = plan.flac_header.size();
+    plan.exact_segment_offsets.push_back(acc);
+    for (uint32_t len : plan.exact_segment_lens) {
+        acc += len;
+        plan.exact_segment_offsets.push_back(acc);
+    }
+    plan.exact_total_bytes = acc;
+    LOGINF("QobuzApi: track " << plan.track_id << " geometry measured: "
+           << count << " segments, exact size " << plan.exact_total_bytes
+           << " bytes (probed " << (count * kGeometryProbeBytes / 1024)
+           << "KB)\n");
+    return true;
+}
 
 bool fetchAndDecryptSegment(const SegmentedTrackPlan& plan,
                             size_t seg_1based,

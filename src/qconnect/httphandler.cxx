@@ -421,7 +421,21 @@ static MHD_Result sendSegmentedStreamResponse(
     }
 
     uint64_t total = 0;
-    bool exact = segmentedTrackExactSize(download, total);
+    // The measured size is a property of the PLAN, known as soon as the
+    // geometry probe ran — do not wait for the scheduler to start this
+    // track's download before publishing it, or the first response (the only
+    // one MusicPD reads it from) goes out without a Content-Length.
+    bool exact = false;
+    if (plan->hasExactGeometry()) {
+        total = plan->exact_total_bytes;
+        exact = true;
+    } else {
+        exact = segmentedTrackExactSize(download, total);
+    }
+    // With measured geometry the exact size is available immediately, so a
+    // Range never has to wait for the download.  Without it (geometry probe
+    // failed) the only way to answer a Range is to finish reconstructing and
+    // measure, which is slow — the reason the probe exists.
     if (has_range && !exact) {
         std::string error;
         if (!waitForSegmentedTrack(download, total, 30000, &error)) {
@@ -471,8 +485,11 @@ static MHD_Result sendSegmentedStreamResponse(
         MHD_add_response_header(resp, "Content-Length",
                                 std::to_string(body_len).c_str());
     }
-    // MusicPD decides seekability from the first response and cannot learn it
-    // later when the growing cache becomes complete.
+    // MusicPD takes both of these from the FIRST response and cannot learn
+    // them later: Accept-Ranges sets InputStream::seekable, Content-Length
+    // sets its size, and libFLAC refuses to seek unless KnownSize() is true
+    // (FlacInput::Length -> LENGTH_STATUS_UNSUPPORTED).  Measured geometry is
+    // what allows Content-Length to be correct this early.
     MHD_add_response_header(resp, "Accept-Ranges", "bytes");
     if (partial) {
         std::string cr = "bytes " + std::to_string(start) + "-" +
@@ -522,6 +539,52 @@ MHD_Result HttpHandler::handleRequest(struct MHD_Connection* conn,
         const std::string path = "/tmp/qconnect2mpd-segmented/" + token;
         return sendFileResponse(conn, path, "audio/flac",
                                 strcmp(method, "HEAD") == 0);
+    }
+
+    // ---- GET /qobuz-direct/<token> ----------------------------------------
+    //
+    // MusicPD's queue holds this permanent token, never a signed Qobuz URL.
+    // Qobuz's CDN URLs carry an `etsp` expiry of one hour, so a URL resolved
+    // when the queue was loaded is dead (HTTP 410) by the time MusicPD
+    // reaches a track late in a long album, or any track after a long pause.
+    // Resolving here means the URL is always seconds old when it is used.
+    //
+    // The response is a 302 rather than a proxy: MusicPD follows it
+    // (CURLOPT_FOLLOWLOCATION) and then talks to the CDN directly, so no
+    // audio passes through this process and seeking uses the CDN's own
+    // Content-Length and byte ranges. A seek re-opens the queue URI, so it
+    // lands back here and re-resolves — which is what makes seeking work
+    // after an hour-long pause.
+    //
+    // This mirrors upmpdcli, which puts "<prefix>/track/version/1/trackId/N"
+    // in MusicPD's queue and resolves it per GET in translateurl().
+    {
+        const std::string direct_prefix = "/qobuz-direct/";
+        const std::string url_s(url);
+        if ((strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) &&
+            url_s.rfind(direct_prefix, 0) == 0) {
+            // The token itself ends in ".flac" (tokenForTrack), so it is
+            // used verbatim; nothing to strip.
+            const std::string token = url_s.substr(direct_prefix.size());
+            std::string signed_url;
+            if (token.empty() || !m_direct_resolver ||
+                !m_direct_resolver(token, signed_url) || signed_url.empty()) {
+                LOGERR("HttpHandler: cannot resolve direct token\n");
+                return sendResponse(conn, MHD_HTTP_NOT_FOUND,
+                                    R"({"error":"unknown track"})");
+            }
+            struct MHD_Response* resp = MHD_create_response_from_buffer(
+                0, nullptr, MHD_RESPMEM_PERSISTENT);
+            if (!resp)
+                return sendResponse(conn, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                    R"({"error":"redirect failed"})");
+            MHD_add_response_header(resp, "Location", signed_url.c_str());
+            MHD_add_response_header(resp, "Cache-Control", "no-store");
+            MHD_Result ret = MHD_queue_response(
+                conn, MHD_HTTP_FOUND, resp);
+            MHD_destroy_response(resp);
+            return ret;
+        }
     }
 
     // ---- OPTIONS (CORS pre-flight) ----------------------------------------

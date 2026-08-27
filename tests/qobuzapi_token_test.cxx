@@ -294,7 +294,10 @@ bool testSecureTokenFiles() {
     return true;
 }
 
-bool testSegmentedApiPrecedesClassicFallback() {
+// The direct endpoint must be tried first and must not open a CMAF stream
+// session at all: only direct CDN URLs carry the Content-Length and byte
+// ranges that MusicPD's FLAC decoder needs in order to seek.
+bool testDirectApiPrecedesSegmentedFallback() {
     namespace fs = std::filesystem;
     std::vector<char> pattern{
         '/', 't', 'm', 'p', '/', 'q', 'c', 'o', 'n', 'n', 'e', 'c', 't',
@@ -319,15 +322,12 @@ bool testSegmentedApiPrecedesClassicFallback() {
     CHECK(api.getStreamUrl(12345, 6, info));
     server.stop();
 
-    CHECK(server.targets().size() == 5);
-    CHECK(server.targets()[0] == "/session/start");
-    CHECK(server.targets()[1].rfind("/file/url?", 0) == 0);
-    CHECK(server.targets()[2].rfind("/track/getFileUrl?", 0) == 0);
-    CHECK(queryValue(server.targets()[2], "format_id") == "6");
-    CHECK(server.targets()[3].rfind("/file/url?", 0) == 0);
-    CHECK(queryValue(server.targets()[3], "format_id") == "5");
-    CHECK(server.targets()[4].rfind("/track/getFileUrl?", 0) == 0);
-    CHECK(queryValue(server.targets()[4], "format_id") == "5");
+    // Default mode is Direct: no /session/start, no /file/url.
+    CHECK(server.targets().size() == 2);
+    CHECK(server.targets()[0].rfind("/track/getFileUrl?", 0) == 0);
+    CHECK(queryValue(server.targets()[0], "format_id") == "6");
+    CHECK(server.targets()[1].rfind("/track/getFileUrl?", 0) == 0);
+    CHECK(queryValue(server.targets()[1], "format_id") == "5");
     CHECK(server.authenticated());
     CHECK(server.validClassicSignature());
     CHECK(info.stream_url == "https://cdn.example/track.mp3");
@@ -344,9 +344,67 @@ bool testSegmentedApiPrecedesClassicFallback() {
     return true;
 }
 
+// 'auto' keeps the CMAF path reachable, but still only after the direct
+// endpoint has been given the same format.
+bool testAutoModeFallsBackToSegmented() {
+    namespace fs = std::filesystem;
+    std::vector<char> pattern{
+        '/', 't', 'm', 'p', '/', 'q', 'c', 'o', 'n', 'n', 'e', 'c', 't',
+        '-', 'a', 'u', 't', 'o', '-', 't', 'e', 's', 't', '.', 'X', 'X',
+        'X', 'X', 'X', 'X', '\0'};
+    char* made = ::mkdtemp(pattern.data());
+    CHECK(made != nullptr);
+    const fs::path directory(made);
+    const fs::path token = directory / "token";
+    CHECK(writeFile(token.string(), "test-oauth-token\n", 0600));
+
+    MockQobuzServer server;
+    CHECK(server.start());
+    QConnect::QobuzApi api(
+        "http://127.0.0.1:" + std::to_string(server.port()),
+        "test-app", "classic-secret");
+    api.setStreamMode(QConnect::StreamMode::Auto);
+    CHECK(api.loadToken(token.string()));
+    QConnect::TrackStreamInfo info;
+    CHECK(api.getStreamUrl(12345, 6, info));
+    server.stop();
+
+    CHECK(server.targets().size() == 4);
+    CHECK(server.targets()[0] == "/session/start");
+    CHECK(server.targets()[1].rfind("/track/getFileUrl?", 0) == 0);
+    CHECK(queryValue(server.targets()[1], "format_id") == "6");
+    CHECK(server.targets()[2].rfind("/file/url?", 0) == 0);
+    CHECK(queryValue(server.targets()[2], "format_id") == "6");
+    CHECK(server.targets()[3].rfind("/track/getFileUrl?", 0) == 0);
+    CHECK(queryValue(server.targets()[3], "format_id") == "5");
+    CHECK(info.stream_url == "https://cdn.example/track.mp3");
+
+    std::error_code error;
+    fs::remove_all(directory, error);
+    CHECK(!error);
+    return true;
+}
+
+// A default-constructed client must never reach for a stream session, so a
+// Qobuz-side CMAF change cannot silently reintroduce unseekable playback.
+bool testStreamModeParsing() {
+    CHECK(QConnect::streamModeFromString("direct") == QConnect::StreamMode::Direct);
+    CHECK(QConnect::streamModeFromString("auto") == QConnect::StreamMode::Auto);
+    CHECK(QConnect::streamModeFromString("segmented") == QConnect::StreamMode::Segmented);
+    CHECK(QConnect::streamModeFromString("") == QConnect::StreamMode::Direct);
+    CHECK(QConnect::streamModeFromString("nonsense") == QConnect::StreamMode::Direct);
+    CHECK(std::string(QConnect::streamModeName(QConnect::StreamMode::Direct)) == "direct");
+    CHECK(std::string(QConnect::streamModeName(QConnect::StreamMode::Auto)) == "auto");
+    CHECK(std::string(QConnect::streamModeName(QConnect::StreamMode::Segmented)) == "segmented");
+    return true;
+}
+
 } // namespace
 
 int main() {
-    return testSecureTokenFiles() && testSegmentedApiPrecedesClassicFallback()
+    return testSecureTokenFiles() &&
+           testStreamModeParsing() &&
+           testDirectApiPrecedesSegmentedFallback() &&
+           testAutoModeFallsBackToSegmented()
         ? EXIT_SUCCESS : EXIT_FAILURE;
 }
