@@ -2444,6 +2444,26 @@ bool QcManager::applyPlaybackCommandLocked(
     else if (effective == PlayingState::STOPPED)
         final_state = MpdState::Status::STOP;
 
+    // Seeking to where playback already is costs a decoder reopen for
+    // nothing. Two things ask for exactly that: the controller restates its
+    // position on every queue snapshot, and a queue reload re-applies
+    // MusicPD's own current position to preserve it across the reload. On the
+    // segmented path that no-op used to mean waiting for the whole track to
+    // download, which is most of why a queue update could stall playback for
+    // minutes without anyone having touched the seek bar.
+    if (has_position && target_position == before.queue_pos &&
+        before.status != MpdState::Status::STOP) {
+        constexpr uint32_t ALREADY_THERE_MS = 1500;
+        const uint32_t delta = before.position_ms > position_ms
+            ? before.position_ms - position_ms
+            : position_ms - before.position_ms;
+        if (delta <= ALREADY_THERE_MS) {
+            LOGDEB("QcManager: already within " << delta
+                   << "ms of the requested position; not seeking\n");
+            has_position = false;
+        }
+    }
+
     if (has_position)
         m_force_buffering.store(true, std::memory_order_relaxed);
     bool restart_track = false;
