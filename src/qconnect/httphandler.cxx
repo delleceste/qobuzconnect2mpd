@@ -421,7 +421,21 @@ static MHD_Result sendSegmentedStreamResponse(
     }
 
     uint64_t total = 0;
-    bool exact = segmentedTrackExactSize(download, total);
+    // The measured size is a property of the PLAN, known as soon as the
+    // geometry probe ran — do not wait for the scheduler to start this
+    // track's download before publishing it, or the first response (the only
+    // one MusicPD reads it from) goes out without a Content-Length.
+    bool exact = false;
+    if (plan->hasExactGeometry()) {
+        total = plan->exact_total_bytes;
+        exact = true;
+    } else {
+        exact = segmentedTrackExactSize(download, total);
+    }
+    // With measured geometry the exact size is available immediately, so a
+    // Range never has to wait for the download.  Without it (geometry probe
+    // failed) the only way to answer a Range is to finish reconstructing and
+    // measure, which is slow — the reason the probe exists.
     if (has_range && !exact) {
         std::string error;
         if (!waitForSegmentedTrack(download, total, 30000, &error)) {
@@ -471,8 +485,11 @@ static MHD_Result sendSegmentedStreamResponse(
         MHD_add_response_header(resp, "Content-Length",
                                 std::to_string(body_len).c_str());
     }
-    // MusicPD decides seekability from the first response and cannot learn it
-    // later when the growing cache becomes complete.
+    // MusicPD takes both of these from the FIRST response and cannot learn
+    // them later: Accept-Ranges sets InputStream::seekable, Content-Length
+    // sets its size, and libFLAC refuses to seek unless KnownSize() is true
+    // (FlacInput::Length -> LENGTH_STATUS_UNSUPPORTED).  Measured geometry is
+    // what allows Content-Length to be correct this early.
     MHD_add_response_header(resp, "Accept-Ranges", "bytes");
     if (partial) {
         std::string cr = "bytes " + std::to_string(start) + "-" +

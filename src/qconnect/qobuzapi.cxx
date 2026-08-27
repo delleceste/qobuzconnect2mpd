@@ -412,6 +412,17 @@ bool QobuzApi::planSegmentedTrack(const Json::Value& root, uint32_t track_id,
         return false;
     }
 
+    // Measure the exact reconstructed length before serving anything: this
+    // costs ~64KB per segment and is what lets the proxy publish a real
+    // Content-Length, without which MusicPD's FLAC decoder cannot seek.
+    // Failure is not fatal — playback still works, just unseekable.
+    std::string geom_err;
+    if (!probeSegmentedTrackGeometry(*plan, &geom_err)) {
+        LOGERR("QobuzApi: track " << track_id
+               << ": exact geometry unavailable (" << geom_err
+               << "); this track will not be seekable\n");
+    }
+
     std::string token = SegmentedTrackRegistry::tokenForTrack(
         track_id, effective_format_id);
     m_seg_registry->registerPlan(token, plan);

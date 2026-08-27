@@ -52,8 +52,26 @@ struct SegmentedTrackPlan {
     // header).  Size == n_audio_segments + 1.
     std::vector<uint64_t> segment_offsets;
     // Estimated total retained for diagnostics only.  HTTP responses must use
-    // segmentedTrackExactSize(), which becomes available after reconstruction.
+    // exact_total_bytes when it is set, else segmentedTrackExactSize().
     uint64_t total_bytes{0};
+
+    // Exact geometry, measured from each segment's own box headers by
+    // probeSegmentedTrackGeometry() without downloading any audio.  When
+    // exact_total_bytes is non-zero these are authoritative: the proxy can
+    // publish a real Content-Length up front (so MusicPD can seek), and the
+    // cache can be written out of order because every segment's byte offset
+    // is known in advance.
+    std::vector<uint32_t> exact_segment_lens;
+    // Cumulative offsets into the FULL stream, including flac_header.
+    // Size == n_audio_segments + 1; front() == flac_header.size().
+    std::vector<uint64_t> exact_segment_offsets;
+    uint64_t exact_total_bytes{0};
+
+    bool hasExactGeometry() const { return exact_total_bytes != 0; }
+
+    // 1-based index of the segment holding a byte offset, or 0 if out of
+    // range or geometry is unknown.
+    size_t segmentForOffset(uint64_t offset) const;
 
     int      sampling_rate{44100};
     int      bit_depth{-1};
@@ -177,6 +195,24 @@ bool buildSegmentedTrackPlan(
     int sampling_rate, int bit_depth, uint32_t duration_ms,
     SegmentedTrackPlan& out_plan,
     std::string* err_out = nullptr);
+
+// Measure every segment's exact reconstructed length by fetching only a short
+// prefix of each (box headers, no audio), in parallel.  Fills the plan's
+// exact_* fields.  Costs roughly 64KB per segment — under 1% of a hi-res
+// track — and is what makes a segmented track seekable, so it is worth doing
+// before the first byte is served.  Returns false and leaves the plan's
+// exact_* fields empty if any segment could not be measured; playback then
+// falls back to the unseekable growing-cache behaviour.
+bool probeSegmentedTrackGeometry(SegmentedTrackPlan& plan,
+                                 std::string* err_out = nullptr);
+
+// Measure one segment's exact reconstructed length from a prefix of its
+// bytes, using only box headers.  full_size is the segment's total size (0 if
+// unknown).  Returns false when the prefix stops short of the mdat header, in
+// which case the caller should retry with more bytes.  Exposed for testing;
+// probeSegmentedTrackGeometry() is the normal entry point.
+bool segmentGeometryFromPrefix(const uint8_t* prefix, size_t prefix_len,
+                               uint64_t full_size, uint64_t& out_len);
 
 // Fetch and decrypt one audio segment (1-based index).  On success out_data
 // contains the complete decrypted bytes.  Its measured size may differ from

@@ -33,9 +33,12 @@ qconnectformatid = 27
 #              seek bar, and the only one verified bit-perfect.
 #   segmented  /session/start + /file/url. Qobuz returns encrypted CMAF
 #              fragments which this daemon decrypts and reassembles into FLAC
-#              behind its local HTTP proxy. The reconstructed stream has no
-#              length until it is complete, so MusicPD cannot seek a track
-#              until it has fully downloaded.
+#              behind its local HTTP proxy. Before serving anything it probes
+#              ~64KB of each fragment to measure the exact reconstructed
+#              length, so it can publish a real Content-Length and MusicPD can
+#              seek; a seek then downloads only the fragment holding the
+#              target. If that probe fails the track still plays, but is not
+#              seekable until it has fully downloaded.
 #   auto       try direct, fall back to segmented.
 #
 # Use 'auto' or 'segmented' only if Qobuz retires the direct endpoint.

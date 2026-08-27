@@ -305,8 +305,8 @@ bool QcManager::start() {
     if (m_cfg.stream_mode != StreamMode::Direct) {
         LOGINF("QcManager: stream mode '"
                << streamModeName(m_cfg.stream_mode)
-               << "' — segmented tracks cannot be seeked until they finish"
-                  " downloading\n");
+               << "' — segmented tracks are seekable only when their exact"
+                  " geometry can be measured\n");
     }
 
     // Both values are required to sign stream URL requests. Fetch a complete
@@ -2402,6 +2402,19 @@ bool QcManager::prepareSegmentedSeek(int mpd_position,
 
     auto plan = m_seg_registry.get(token);
     if (!plan) return false;
+
+    // Measured geometry means the proxy already published a real
+    // Content-Length on the first response, so MusicPD's decoder is seekable
+    // as it stands: no reopen, and no waiting for the download.  The Range
+    // request the seek produces blocks only for the one segment that holds
+    // the target offset.
+    if (plan->hasExactGeometry()) {
+        auto pin = acquireSegmentedTrackDownload(
+            plan, SegmentedDownloadPriority::Playback);
+        if (pin) seek_pin = std::move(pin);
+        return true;
+    }
+
     auto download = acquireSegmentedTrackDownload(
         plan, SegmentedDownloadPriority::Playback);
     if (!download) return false;
