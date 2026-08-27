@@ -17,6 +17,7 @@
 #pragma once
 
 #include <deque>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -266,6 +267,15 @@ private:
     std::vector<std::string>  m_track_local_paths;  // local materialized FLAC paths
     std::vector<std::string>  m_track_titles;        // "Artist - Title", parallel to m_queue_item_ids
     std::vector<std::string>  m_track_segment_tokens; // empty for direct URLs
+
+    // Direct-mode tokens handed to MusicPD in place of signed Qobuz URLs.
+    // token -> (track_id, format_id); resolved to a fresh CDN URL on every
+    // GET so an expiring URL is never parked in MusicPD's queue.
+    std::mutex                                        m_direct_mutex;
+    std::map<std::string, std::pair<uint32_t, int>>   m_direct_tokens;
+    std::string registerDirectToken(uint32_t track_id, int format_id);
+    bool        resolveDirectToken(const std::string& token,
+                                   std::string& url_out);
     // Full ordered Qobuz queue (all items, including tracks not yet loaded into MPD).
     // Set immediately when onQueueLoad fires so skip can find direction even
     // before URL resolution completes.

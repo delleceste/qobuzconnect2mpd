@@ -367,6 +367,10 @@ bool QcManager::start() {
         m_api->appId(),
         [this](ConnectCredentials c) { onConnect(std::move(c)); });
     m_http->setSegmentedRegistry(&m_seg_registry);
+    m_http->setDirectResolver(
+        [this](const std::string& token, std::string& url_out) {
+            return resolveDirectToken(token, url_out);
+        });
 
     const bool needs_oauth = m_api->userToken().empty();
     std::string oauth_path;
@@ -1627,6 +1631,53 @@ void QcManager::onMpdState(const MpdState& st) {
     }
 }
 
+// ---- Direct-stream tokens ---------------------------------------------------
+//
+// Qobuz's signed CDN URLs expire after an hour (the `etsp` query parameter).
+// Putting them straight into MusicPD's queue means a long album's later
+// tracks, or any track after a long pause, is fetched with a dead URL and
+// comes back HTTP 410. Both reference implementations avoid this the same
+// way and neither has any URL-refresh machinery: upmpdcli parks a permanent
+// "<prefix>/track/version/1/trackId/N" path in MusicPD's queue and resolves
+// it per GET (translateurl -> trackuri -> getFileUrl -> 302), and qbz stores
+// no URL at all, resolving in start_track_stream when the controller says
+// play. This does the same: MusicPD gets a token, the URL is minted seconds
+// before the bytes are read.
+std::string QcManager::registerDirectToken(uint32_t track_id, int format_id) {
+    std::string token = SegmentedTrackRegistry::tokenForTrack(track_id,
+                                                              format_id);
+    std::lock_guard<std::mutex> lk(m_direct_mutex);
+    m_direct_tokens[token] = {track_id, format_id};
+    return token;
+}
+
+bool QcManager::resolveDirectToken(const std::string& token,
+                                   std::string& url_out) {
+    uint32_t track_id = 0;
+    int format_id = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_direct_mutex);
+        auto it = m_direct_tokens.find(token);
+        if (it == m_direct_tokens.end()) return false;
+        track_id = it->second.first;
+        format_id = it->second.second;
+    }
+    if (!m_api) return false;
+    TrackStreamInfo info;
+    if (!m_api->getStreamUrl(track_id, format_id, info) ||
+        info.stream_url.empty()) {
+        LOGERR("QcManager: could not resolve stream URL for track "
+               << track_id << "\n");
+        return false;
+    }
+    // Report the quality actually being served, which is only known now.
+    if (info.sampling_rate > 0) {
+        if (auto ws = currentWSession()) ws->reportFileQuality(info.sampling_rate);
+    }
+    url_out = info.stream_url;
+    return true;
+}
+
 // ---- Stream URL resolution --------------------------------------------------
 
 std::vector<std::string> QcManager::resolveStreamUrls(
@@ -1660,7 +1711,21 @@ std::vector<std::string> QcManager::resolveStreamUrls(
                 removeMaterializedFile(info.local_path);
                 break;
             }
-            urls.push_back(info.stream_url);
+            // A direct response carries a signed CDN URL that expires in an
+            // hour. Keep its metadata, discard the URL, and hand MusicPD a
+            // token that this daemon re-resolves on every GET; see
+            // registerDirectToken().
+            if (info.segment_token.empty()) {
+                // tokenForTrack() already ends in ".flac" — MusicPD uses the
+                // extension as a decoder hint, so do not append a second one.
+                urls.push_back("http://127.0.0.1:" +
+                               std::to_string(m_cfg.http_port) +
+                               "/qobuz-direct/" +
+                               registerDirectToken(t.track_id,
+                                                   info.format_id));
+            } else {
+                urls.push_back(info.stream_url);
+            }
             out_item_ids.push_back(t.queue_item_id);
             out_sample_rates.push_back(info.sampling_rate);
             out_local_paths.push_back(info.local_path);

@@ -541,6 +541,52 @@ MHD_Result HttpHandler::handleRequest(struct MHD_Connection* conn,
                                 strcmp(method, "HEAD") == 0);
     }
 
+    // ---- GET /qobuz-direct/<token> ----------------------------------------
+    //
+    // MusicPD's queue holds this permanent token, never a signed Qobuz URL.
+    // Qobuz's CDN URLs carry an `etsp` expiry of one hour, so a URL resolved
+    // when the queue was loaded is dead (HTTP 410) by the time MusicPD
+    // reaches a track late in a long album, or any track after a long pause.
+    // Resolving here means the URL is always seconds old when it is used.
+    //
+    // The response is a 302 rather than a proxy: MusicPD follows it
+    // (CURLOPT_FOLLOWLOCATION) and then talks to the CDN directly, so no
+    // audio passes through this process and seeking uses the CDN's own
+    // Content-Length and byte ranges. A seek re-opens the queue URI, so it
+    // lands back here and re-resolves — which is what makes seeking work
+    // after an hour-long pause.
+    //
+    // This mirrors upmpdcli, which puts "<prefix>/track/version/1/trackId/N"
+    // in MusicPD's queue and resolves it per GET in translateurl().
+    {
+        const std::string direct_prefix = "/qobuz-direct/";
+        const std::string url_s(url);
+        if ((strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) &&
+            url_s.rfind(direct_prefix, 0) == 0) {
+            // The token itself ends in ".flac" (tokenForTrack), so it is
+            // used verbatim; nothing to strip.
+            const std::string token = url_s.substr(direct_prefix.size());
+            std::string signed_url;
+            if (token.empty() || !m_direct_resolver ||
+                !m_direct_resolver(token, signed_url) || signed_url.empty()) {
+                LOGERR("HttpHandler: cannot resolve direct token\n");
+                return sendResponse(conn, MHD_HTTP_NOT_FOUND,
+                                    R"({"error":"unknown track"})");
+            }
+            struct MHD_Response* resp = MHD_create_response_from_buffer(
+                0, nullptr, MHD_RESPMEM_PERSISTENT);
+            if (!resp)
+                return sendResponse(conn, MHD_HTTP_INTERNAL_SERVER_ERROR,
+                                    R"({"error":"redirect failed"})");
+            MHD_add_response_header(resp, "Location", signed_url.c_str());
+            MHD_add_response_header(resp, "Cache-Control", "no-store");
+            MHD_Result ret = MHD_queue_response(
+                conn, MHD_HTTP_FOUND, resp);
+            MHD_destroy_response(resp);
+            return ret;
+        }
+    }
+
     // ---- OPTIONS (CORS pre-flight) ----------------------------------------
     if (strcmp(method, "OPTIONS") == 0) {
         struct MHD_Response* resp = MHD_create_response_from_buffer(

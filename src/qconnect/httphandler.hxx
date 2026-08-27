@@ -91,6 +91,13 @@ public:
     // requesting tracks.  Not owned.
     void setSegmentedRegistry(SegmentedTrackRegistry* r);
 
+    // Resolve an opaque direct-stream token into a freshly signed Qobuz CDN
+    // URL, called once per GET so MusicPD never holds an expiring URL.
+    // Returns false when the token is unknown or Qobuz refuses.
+    using DirectResolver =
+        std::function<bool(const std::string& token, std::string& url_out)>;
+    void setDirectResolver(DirectResolver r) { m_direct_resolver = std::move(r); }
+
 private:
     static MHD_Result requestCallback(void* cls,
                                        struct MHD_Connection* conn,
@@ -129,6 +136,7 @@ private:
     std::chrono::steady_clock::time_point m_oauth_expires_at{};
     bool             m_oauth_in_progress{false};
     SegmentedTrackRegistry* m_seg_registry{nullptr}; // not owned
+    DirectResolver          m_direct_resolver;
     struct MHD_Daemon* m_daemon{nullptr};
 };
 
