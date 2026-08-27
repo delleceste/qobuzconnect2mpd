@@ -544,7 +544,16 @@ bool MpdCtl::applyPlayback(int queue_pos, bool select_track,
     PlaybackSnapshot before;
     if (!capturePlaybackLocked(before)) return false;
 
-    auto fail = [&]() {
+    auto connectionError = [this]() {
+        if (!m_conn) return std::string("not connected");
+        const char* message = mpd_connection_get_error_message(m_conn);
+        return message && *message ? std::string(message)
+                                   : std::string("unknown error");
+    };
+    auto fail = [&](const char* command, std::string detail = {}) {
+        if (detail.empty()) detail = connectionError();
+        LOGERR("MpdCtl::applyPlayback: " << command << " failed: "
+               << detail << "\n");
         m_last_seek_ms.store(0, std::memory_order_relaxed);
         return rollbackPlaybackLocked("applyPlayback", before);
     };
@@ -559,20 +568,61 @@ bool MpdCtl::applyPlayback(int queue_pos, bool select_track,
     if (restart_track &&
         before.state != static_cast<int>(MPD_STATE_STOP) &&
         !mpd_run_stop(m_conn))
-        return fail();
-    if ((select_track || resume_from_stop || restart_track) &&
-        (effective_pos < 0 ||
-         !mpd_run_play_pos(m_conn, static_cast<unsigned>(effective_pos))))
-        return fail();
+        return fail("stop before decoder reopen");
+    if (select_track || resume_from_stop || restart_track) {
+        if (effective_pos < 0)
+            return fail("select track", "no current queue position");
+        if (!mpd_run_play_pos(m_conn, static_cast<unsigned>(effective_pos)))
+            return fail("select track");
+    }
 
     if (has_position) {
         uint64_t now_ms = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
         m_last_seek_ms.store(now_ms, std::memory_order_relaxed);
-        if (!mpd_run_seek_current(
-                m_conn, static_cast<float>(position_ms) / 1000.0f, false))
-            return fail();
+        constexpr int SEGMENTED_SEEK_ATTEMPTS = 3;
+        const int attempts = restart_track ? SEGMENTED_SEEK_ATTEMPTS : 1;
+        bool seeked = false;
+        std::string seek_error;
+        for (int attempt = 0; attempt < attempts; ++attempt) {
+            if (mpd_run_seek_current(
+                    m_conn, static_cast<float>(position_ms) / 1000.0f,
+                    false)) {
+                seeked = true;
+                break;
+            }
+            seek_error = connectionError();
+            if (attempt + 1 >= attempts) break;
+
+            LOGINF("MpdCtl::applyPlayback: seek failed (attempt "
+                   << attempt + 1 << "/" << attempts << "): "
+                   << seek_error << "; reopening decoder\n");
+
+            // A server ACK leaves libmpdclient's connection in an error
+            // state. Reconnect, then reopen the now-complete segmented URL
+            // before retrying so libFLAC receives a fresh seekable stream.
+            if (m_conn) {
+                mpd_connection_free(m_conn);
+                m_conn = nullptr;
+            }
+            if (!ensureConnected())
+                return fail("reconnect for seek retry");
+            if (!mpd_run_stop(m_conn))
+                return fail("stop for seek retry");
+            if (effective_pos < 0)
+                return fail("select track for seek retry",
+                            "no current queue position");
+            if (!mpd_run_play_pos(
+                    m_conn, static_cast<unsigned>(effective_pos)))
+                return fail("select track for seek retry");
+
+            // MPD normally postpones seeks while the decoder starts, but the
+            // HTTP/libFLAC path can still reject a seek at this boundary.
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(100 * (attempt + 1)));
+        }
+        if (!seeked) return fail("seek", std::move(seek_error));
     }
 
     bool ok = true;
@@ -589,7 +639,7 @@ bool MpdCtl::applyPlayback(int queue_pos, bool select_track,
     case MpdState::Status::UNKNOWN:
         break;
     }
-    return ok ? true : fail();
+    return ok ? true : fail("set final playback state");
 }
 
 bool MpdCtl::next() {

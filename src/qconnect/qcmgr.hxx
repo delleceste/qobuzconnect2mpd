@@ -212,7 +212,8 @@ private:
     bool applyPlaybackCommandLocked(PlayingState state, bool has_target,
                                     uint64_t target_qid, bool has_position,
                                     uint32_t position_ms);
-    bool prepareSegmentedSeek(int mpd_position, bool& restart_track);
+    bool prepareSegmentedSeek(int mpd_position, bool& restart_track,
+                              SegmentedDownloadHandle& seek_pin);
     std::shared_ptr<WSession> currentWSession() const;
     void completeSetState(uint64_t command_id);
     void commitQueueVersion(const QueueVersion& version);

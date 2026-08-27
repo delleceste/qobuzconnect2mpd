@@ -40,7 +40,7 @@ static uint64_t nowMs() {
         duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
 }
 
-static int nextBatchId(std::atomic<int32_t>& counter) {
+static int nextBatchId(int32_t& counter) {
     return ++counter;
 }
 
@@ -148,7 +148,10 @@ bool WSession::connect(const ConnectCredentials& creds) {
     // Subscribe — the server will not send AddRenderer (83) until it knows
     // the device exists. session_uuid is omitted; server assigns one via
     // SessionState (81).
-    Bytes join = buildCtrlJoinSession(nowMs(), m_msg_id++, m_devinfo);
+    const uint32_t join_msg_id = m_msg_id++;
+    const int32_t join_batch_id = nextBatchId(m_batch_id);
+    Bytes join = buildCtrlJoinSession(nowMs(), join_msg_id, join_batch_id,
+                                      m_devinfo);
     if (!sendDirectFrame(join, CURLWS_BINARY)) {
         LOGERR("WSession: failed to send CtrlJoinSession\n");
         curl_easy_cleanup(m_curl); m_curl = nullptr;
@@ -246,6 +249,29 @@ void WSession::disconnect() {
 bool WSession::sendRaw(const Bytes& data) {
     if (data.empty()) return false;
     return enqueueFrame(data, CURLWS_BINARY);
+}
+
+bool WSession::enqueueQConnectFrame(
+    const std::function<Bytes(uint32_t, int32_t)>& build) {
+    if (!m_connected.load(std::memory_order_acquire) ||
+        !m_event_started.load(std::memory_order_acquire) ||
+        m_stop.load(std::memory_order_relaxed)) return false;
+
+    {
+        std::lock_guard<std::mutex> lk(m_outbound_mutex);
+        if (!m_connected.load(std::memory_order_relaxed) || m_stop.load())
+            return false;
+
+        // Building under the queue lock is intentional. Assigning an ID
+        // before taking this lock allowed another thread to enqueue a later
+        // ID first, which the cloud rejects as a message-counter gap.
+        Bytes data = build(m_msg_id++, nextBatchId(m_batch_id));
+        if (data.empty()) return false;
+        m_outbound.push_back(OutboundFrame{
+            std::move(data), 0, CURLWS_BINARY});
+    }
+    wakeEventLoop();
+    return true;
 }
 
 bool WSession::sendDirectFrame(const Bytes& data, unsigned int flags) {
@@ -439,46 +465,59 @@ void WSession::reportState(const QueueRendererState& state) {
     LOGTRC("WSession: reportState pos_ms=" << s.state.current_position_ms
            << " buf=" << static_cast<int>(s.state.buffer_state)
            << " qver=" << s.queue_version.major << "." << s.queue_version.minor << "\n");
-    int bid = nextBatchId(m_batch_id);
     s.state.position_timestamp_ms = alignTimestampMs(s.state.position_timestamp_ms);
     // Keep the state mutex through enqueue so a SetState acknowledgement can
     // never be queued before this older sample and then overwritten by it.
-    sendRaw(buildStateUpdated(nowAlignedMs(), bid, s));
+    enqueueQConnectFrame([this, &s](uint32_t msg_id, int32_t batch_id) {
+        return buildStateUpdated(nowAlignedMs(), msg_id, batch_id, s);
+    });
 }
 
 void WSession::reportVolume(uint32_t volume) {
     if (!m_connected) return;
     if (!m_renderer_join_sent.load(std::memory_order_acquire)) return;
-    int bid = nextBatchId(m_batch_id);
-    sendRaw(buildVolumeChanged(nowAlignedMs(), bid, volume));
+    enqueueQConnectFrame([this, volume](uint32_t msg_id, int32_t batch_id) {
+        return buildVolumeChanged(nowAlignedMs(), msg_id, batch_id, volume);
+    });
 }
 
 void WSession::reportMuted(bool muted) {
     if (!m_connected) return;
     if (!m_renderer_join_sent.load(std::memory_order_acquire)) return;
-    sendRaw(buildVolumeMuted(nowAlignedMs(), nextBatchId(m_batch_id), muted));
+    enqueueQConnectFrame([this, muted](uint32_t msg_id, int32_t batch_id) {
+        return buildVolumeMuted(nowAlignedMs(), msg_id, batch_id, muted);
+    });
 }
 
 void WSession::reportMaxQuality(int32_t quality_fmt_id) {
     if (!m_connected) return;
     if (!m_renderer_join_sent.load(std::memory_order_acquire)) return;
-    int bid = nextBatchId(m_batch_id);
-    sendRaw(buildMaxQualityChanged(nowAlignedMs(), bid, quality_fmt_id));
+    enqueueQConnectFrame(
+        [this, quality_fmt_id](uint32_t msg_id, int32_t batch_id) {
+            return buildMaxQualityChanged(
+                nowAlignedMs(), msg_id, batch_id, quality_fmt_id);
+        });
 }
 
 void WSession::reportFileQuality(int32_t sample_rate_hz) {
     if (!m_connected) return;
     if (!m_renderer_join_sent.load(std::memory_order_acquire)) return;
-    int bid = nextBatchId(m_batch_id);
-    sendRaw(buildFileAudioQualityChanged(nowAlignedMs(), bid, sample_rate_hz));
+    enqueueQConnectFrame(
+        [this, sample_rate_hz](uint32_t msg_id, int32_t batch_id) {
+            return buildFileAudioQualityChanged(
+                nowAlignedMs(), msg_id, batch_id, sample_rate_hz);
+        });
 }
 
 void WSession::setActiveRenderer(uint64_t renderer_id) {
     if (!m_connected) return;
     m_renderer_id = renderer_id;
-    int bid = nextBatchId(m_batch_id);
-    sendRaw(buildSetActiveRenderer(nowAlignedMs(), bid,
-                                    static_cast<int32_t>(renderer_id)));
+    enqueueQConnectFrame(
+        [this, renderer_id](uint32_t msg_id, int32_t batch_id) {
+            return buildSetActiveRenderer(
+                nowAlignedMs(), msg_id, batch_id,
+                static_cast<int32_t>(renderer_id));
+        });
 }
 
 bool WSession::requestQueueState() {
@@ -488,8 +527,12 @@ bool WSession::requestQueueState() {
         session_uuid = m_session_uuid;
     }
     if (!m_connected || session_uuid.empty()) return false;
-    return sendRaw(buildAskQueueState(nowAlignedMs(), nextBatchId(m_batch_id),
-                                      session_uuid));
+    return enqueueQConnectFrame(
+        [this, session_uuid = std::move(session_uuid)](
+            uint32_t msg_id, int32_t batch_id) {
+            return buildAskQueueState(
+                nowAlignedMs(), msg_id, batch_id, session_uuid);
+        });
 }
 
 QueueRendererState WSession::stateSnapshot() const {
@@ -529,7 +572,10 @@ bool WSession::sendHeartbeat() {
     }
     state.state.position_timestamp_ms = now;
     // Keep queue-version publication ordered with the state frame enqueue.
-    return sendRaw(buildStateUpdated(now, nextBatchId(m_batch_id), state));
+    return enqueueQConnectFrame(
+        [now, &state](uint32_t msg_id, int32_t batch_id) {
+            return buildStateUpdated(now, msg_id, batch_id, state);
+        });
 }
 
 bool WSession::sendTransportPing() {
@@ -827,10 +873,14 @@ void WSession::dispatchMessage(const Message& msg) {
                 initial_state.state.position_timestamp_ms);
 
             const int32_t reason = m_reconnecting ? 2 : 1;
-            m_renderer_join_sent = sendRaw(buildJoinSession(
-                nowAlignedMs(), nextBatchId(m_batch_id),
-                msg.session_state.session_uuid, m_devinfo, reason,
-                m_join_as_active, initial_state));
+            m_renderer_join_sent = enqueueQConnectFrame(
+                [this, reason, initial_state,
+                 session_uuid = msg.session_state.session_uuid](
+                    uint32_t msg_id, int32_t batch_id) {
+                    return buildJoinSession(
+                        nowAlignedMs(), msg_id, batch_id, session_uuid,
+                        m_devinfo, reason, m_join_as_active, initial_state);
+                });
             if (m_renderer_join_sent) {
                 LOGINF("WSession: renderer role joined (reason=" << reason
                        << ", active=" << m_join_as_active << ")\n");
@@ -839,8 +889,11 @@ void WSession::dispatchMessage(const Message& msg) {
             }
         }
         // Ask server to send current renderer state
-        sendRaw(buildAskRendererState(nowAlignedMs(), nextBatchId(m_batch_id),
-                                       m_session_id));
+        enqueueQConnectFrame(
+            [this](uint32_t msg_id, int32_t batch_id) {
+                return buildAskRendererState(
+                    nowAlignedMs(), msg_id, batch_id, m_session_id);
+            });
         if (m_cbs.on_session_state) {
             auto callback = m_cbs.on_session_state;
             MsgSessionState state = msg.session_state;
@@ -887,7 +940,11 @@ void WSession::dispatchMessage(const Message& msg) {
             // 2. MaxAudioQualityChanged — field 28, value is quality level 1-4
             // QcManager publishes actual MPD volume, or fixed 100 for a
             // mixerless bit-perfect output, immediately after activation.
-            sendRaw(buildVolumeMuted(nowAlignedMs(), nextBatchId(m_batch_id), false));
+            enqueueQConnectFrame(
+                [this](uint32_t msg_id, int32_t batch_id) {
+                    return buildVolumeMuted(
+                        nowAlignedMs(), msg_id, batch_id, false);
+                });
             // Convert format_id to quality level: 27->4, 7->3, 6->2, 5->1
             int32_t ql = 4;
             if (m_devinfo.max_quality == 7) ql = 3;
@@ -1062,7 +1119,11 @@ void WSession::dispatchMessage(const Message& msg) {
             QueueRendererState wire_ack = ack;
             wire_ack.state.position_timestamp_ms =
                 alignTimestampMs(wire_ack.state.position_timestamp_ms);
-            sendRaw(buildStateUpdated(nowAlignedMs(), nextBatchId(m_batch_id), wire_ack));
+            enqueueQConnectFrame(
+                [this, &wire_ack](uint32_t msg_id, int32_t batch_id) {
+                    return buildStateUpdated(
+                        nowAlignedMs(), msg_id, batch_id, wire_ack);
+                });
 
             if (m_cbs.on_set_state) {
                 auto callback = m_cbs.on_set_state;

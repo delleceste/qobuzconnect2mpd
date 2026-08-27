@@ -3,11 +3,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
-#include <mutex>
-#include <set>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 using namespace QConnect;
@@ -293,7 +290,7 @@ void testOutboundPresence() {
     state.state.has_current_queue_item_id = true;
     state.state.has_next_queue_item_id = true;
 
-    Bytes frame = buildStateUpdated(1000, 1, state);
+    Bytes frame = buildStateUpdated(1000, 17, 1, state);
     Span payload = envelopePayload(frame);
     Span batch, qconnect_message, state_updated, renderer_state, position;
     check(findLengthField(payload, 7, batch), "missing batch");
@@ -324,7 +321,7 @@ void testRendererReconnectJoin() {
     device.uuid = Bytes(16, 1);
     QueueRendererState state;
     state.state.playing_state = PlayingState::PLAYING;
-    Bytes frame = buildJoinSession(1000, 1, Bytes(16, 2), device,
+    Bytes frame = buildJoinSession(1000, 18, 1, Bytes(16, 2), device,
                                    2, true, state);
     Span payload = envelopePayload(frame);
     Span batch, qconnect_message, join;
@@ -539,25 +536,12 @@ uint64_t payloadMessageId(const Bytes& frame) {
     return id;
 }
 
-void testConcurrentMessageIds() {
-    constexpr int THREADS = 8;
-    constexpr int PER_THREAD = 250;
-    std::mutex ids_mutex;
-    std::set<uint64_t> ids;
-    std::vector<std::thread> workers;
-    for (int thread = 0; thread < THREADS; ++thread) {
-        workers.emplace_back([&] {
-            QueueRendererState state;
-            for (int i = 0; i < PER_THREAD; ++i) {
-                uint64_t id = payloadMessageId(buildStateUpdated(1000, i, state));
-                std::lock_guard<std::mutex> lock(ids_mutex);
-                ids.insert(id);
-            }
-        });
-    }
-    for (auto& worker : workers) worker.join();
-    check(ids.size() == static_cast<size_t>(THREADS * PER_THREAD),
-          "concurrent payload message IDs collided");
+void testCallerSuppliedMessageId() {
+    QueueRendererState state;
+    check(payloadMessageId(buildStateUpdated(1000, 9187, 41, state)) == 9187,
+          "payload message ID was not supplied by the connection");
+    check(payloadMessageId(buildStateUpdated(1000, 1, 42, state)) == 1,
+          "payload message ID retained process-global state");
 }
 
 } // namespace
@@ -569,7 +553,7 @@ int main() {
         testRendererReconnectJoin();
         testQwsErrorFrame();
         testPlaybackErrorAndAutoplayQueue();
-        testConcurrentMessageIds();
+        testCallerSuppliedMessageId();
         std::cout << "qconnect protocol fixtures passed\n";
         return 0;
     } catch (const std::exception& error) {

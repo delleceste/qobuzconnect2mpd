@@ -17,7 +17,6 @@
 
 #include "proto.hxx"
 
-#include <atomic>
 #include <chrono>
 #include <cstring>
 
@@ -1230,7 +1229,8 @@ Bytes encodeDeviceInfo(const DeviceInfo& d) {
 // Wrap an inner QConnect message in QConnectBatch + Payload envelope.
 // force_content: if true, always write the inner message field even if empty
 // (needed for messages like VolumeMuted(false) that must be present but have no fields).
-Bytes wrapInPayload(uint64_t time_ms, int32_t batch_id,
+Bytes wrapInPayload(uint64_t time_ms, uint32_t payload_msg_id,
+                     int32_t batch_id,
                      int inner_msg_field_number,
                      const Bytes& inner_msg,
                      bool force_content = false) {
@@ -1251,11 +1251,8 @@ Bytes wrapInPayload(uint64_t time_ms, int32_t batch_id,
     writeMessageField(batch, 3, qcm);
 
     // Payload { msg_id=1, msg_date=2, proto=3, payload=7 }
-    static std::atomic<uint32_t> s_payload_msg_id{0};
     Bytes payload;
-    writeUint32Field(
-        payload, 1,
-        s_payload_msg_id.fetch_add(1, std::memory_order_relaxed) + 1);
+    writeUint32Field(payload, 1, payload_msg_id);
     writeUint64Field(payload, 2, time_ms);
     writeInt32Field(payload, 3, static_cast<int32_t>(QCloudProto::QCONNECT));
     writeBytesField(payload, 7, batch);
@@ -1295,7 +1292,8 @@ Bytes buildSubscribe(uint64_t msg_id, uint64_t msg_date_ms, QCloudProto proto) {
     return buildEnvelope(EnvType::SUBSCRIBE, sub);
 }
 
-Bytes buildJoinSession(uint64_t time_ms, int32_t batch_id,
+Bytes buildJoinSession(uint64_t time_ms, uint32_t payload_msg_id,
+                        int32_t batch_id,
                         const Bytes& session_uuid,
                         const DeviceInfo& dev, int32_t reason, bool is_active,
                         const QueueRendererState& state) {
@@ -1308,7 +1306,7 @@ Bytes buildJoinSession(uint64_t time_ms, int32_t batch_id,
     writeMessageField(msg, 4, encodeQueueRendererState(state));
     writeBoolField(msg, 5, is_active);
 
-    Bytes payload = wrapInPayload(time_ms, batch_id,
+    Bytes payload = wrapInPayload(time_ms, payload_msg_id, batch_id,
                                    static_cast<int>(MsgType::RNDR_JOIN_SESSION), msg);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
@@ -1317,90 +1315,99 @@ Bytes buildJoinSession(uint64_t time_ms, int32_t batch_id,
 // the device with the cloud session manager.  session_uuid is omitted on
 // the first call (we don't have one yet); the server will assign one and
 // deliver it via SessionState (81).
-Bytes buildCtrlJoinSession(uint64_t time_ms, int32_t batch_id,
-                             const DeviceInfo& dev) {
+Bytes buildCtrlJoinSession(uint64_t time_ms, uint32_t payload_msg_id,
+                           int32_t batch_id, const DeviceInfo& dev) {
     // CtrlSrvrJoinSession { session_uuid=1 (omit), device_info=2 }
     Bytes msg;
     writeMessageField(msg, 2, encodeDeviceInfo(dev));
-    Bytes payload = wrapInPayload(time_ms, batch_id,
+    Bytes payload = wrapInPayload(time_ms, payload_msg_id, batch_id,
                                    static_cast<int>(MsgType::CTRL_JOIN_SESSION), msg);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
 
-Bytes buildStateUpdated(uint64_t time_ms, int32_t batch_id,
+Bytes buildStateUpdated(uint64_t time_ms, uint32_t payload_msg_id,
+                         int32_t batch_id,
                          const QueueRendererState& state) {
     // RndrSrvrStateUpdated { state=1 }
     Bytes msg;
     writeMessageField(msg, 1, encodeQueueRendererState(state));
-    Bytes payload = wrapInPayload(time_ms, batch_id,
+    Bytes payload = wrapInPayload(time_ms, payload_msg_id, batch_id,
                                    static_cast<int>(MsgType::RNDR_STATE_UPDATED), msg);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
 
-Bytes buildVolumeChanged(uint64_t time_ms, int32_t batch_id, uint32_t volume) {
+Bytes buildVolumeChanged(uint64_t time_ms, uint32_t payload_msg_id,
+                         int32_t batch_id, uint32_t volume) {
     Bytes msg;
     writeUint32Field(msg, 1, volume);
-    Bytes payload = wrapInPayload(time_ms, batch_id,
+    Bytes payload = wrapInPayload(time_ms, payload_msg_id, batch_id,
                                    static_cast<int>(MsgType::RNDR_VOLUME_CHANGED), msg);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
 
-Bytes buildMaxQualityChanged(uint64_t time_ms, int32_t batch_id, int32_t quality) {
+Bytes buildMaxQualityChanged(uint64_t time_ms, uint32_t payload_msg_id,
+                             int32_t batch_id, int32_t quality) {
     Bytes msg;
     writeInt32Field(msg, 1, quality);
-    Bytes payload = wrapInPayload(time_ms, batch_id,
+    Bytes payload = wrapInPayload(time_ms, payload_msg_id, batch_id,
                                    static_cast<int>(MsgType::RNDR_MAX_QUALITY), msg);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
 
-Bytes buildSetActiveRenderer(uint64_t time_ms, int32_t batch_id,
+Bytes buildSetActiveRenderer(uint64_t time_ms, uint32_t payload_msg_id,
+                              int32_t batch_id,
                               int32_t renderer_id) {
     // CtrlSrvrSetActiveRenderer { renderer_id=1 }
     Bytes msg;
     writeInt32Field(msg, 1, renderer_id);
-    Bytes payload = wrapInPayload(time_ms, batch_id,
+    Bytes payload = wrapInPayload(time_ms, payload_msg_id, batch_id,
                                    static_cast<int>(MsgType::CTRL_SET_ACTIVE_RENDERER), msg);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
 
-Bytes buildAskRendererState(uint64_t time_ms, int32_t batch_id,
+Bytes buildAskRendererState(uint64_t time_ms, uint32_t payload_msg_id,
+                             int32_t batch_id,
                              uint64_t session_id) {
     // CtrlSrvrAskForRendererState { session_id=1 }
     Bytes msg;
     writeUint64Field(msg, 1, session_id);
-    Bytes payload = wrapInPayload(time_ms, batch_id,
+    Bytes payload = wrapInPayload(time_ms, payload_msg_id, batch_id,
                                    static_cast<int>(MsgType::CTRL_ASK_RENDERER_STATE), msg);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
 
-Bytes buildVolumeMuted(uint64_t time_ms, int32_t batch_id, bool muted) {
+Bytes buildVolumeMuted(uint64_t time_ms, uint32_t payload_msg_id,
+                        int32_t batch_id, bool muted) {
     // RndrSrvrVolumeMuted { value=1 (bool, optional) }
     // Protocol convention: None (no field) = not muted, Some(true) = muted.
     // Must always send the message even when not muted (empty body).
     Bytes msg;
     if (muted) writeBoolField(msg, 1, true);
-    Bytes payload = wrapInPayload(time_ms, batch_id,
+    Bytes payload = wrapInPayload(time_ms, payload_msg_id, batch_id,
                                    static_cast<int>(MsgType::RNDR_VOLUME_MUTED), msg,
                                    /*force_content=*/true);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
 
-Bytes buildFileAudioQualityChanged(uint64_t time_ms, int32_t batch_id,
+Bytes buildFileAudioQualityChanged(uint64_t time_ms,
+                                    uint32_t payload_msg_id,
+                                    int32_t batch_id,
                                     int32_t sample_rate_hz) {
     // RndrSrvrFileAudioQualityChanged { value=1 (int32) }
     Bytes msg;
     writeInt32Field(msg, 1, sample_rate_hz);
-    Bytes payload = wrapInPayload(time_ms, batch_id,
+    Bytes payload = wrapInPayload(time_ms, payload_msg_id, batch_id,
                                    static_cast<int>(MsgType::RNDR_FILE_QUALITY), msg);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }
 
-Bytes buildAskQueueState(uint64_t time_ms, int32_t batch_id,
+Bytes buildAskQueueState(uint64_t time_ms, uint32_t payload_msg_id,
+                          int32_t batch_id,
                           const Bytes& queue_uuid) {
     // CtrlSrvrAskForQueueState { queue_version=1 (omit), queue_uuid=2 (bytes) }
     Bytes msg;
     writeBytesField(msg, 2, queue_uuid);
-    Bytes payload = wrapInPayload(time_ms, batch_id,
+    Bytes payload = wrapInPayload(time_ms, payload_msg_id, batch_id,
                                    static_cast<int>(MsgType::CTRL_ASK_QUEUE_STATE), msg);
     return buildEnvelope(EnvType::PAYLOAD, payload);
 }

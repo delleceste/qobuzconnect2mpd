@@ -438,44 +438,55 @@ Bytes buildAuthenticate(uint64_t msg_id, uint64_t msg_date_ms,
 Bytes buildSubscribe(uint64_t msg_id, uint64_t msg_date_ms,
                      QCloudProto proto = QCloudProto::QCONNECT);
 
-// QConnect batch messages (all wrapped in PAYLOAD envelope):
+// QConnect batch messages (all wrapped in PAYLOAD envelope). The connection
+// supplies payload_msg_id so IDs can be assigned in actual wire order.
 // Send immediately after SUBSCRIBE to register the device with the cloud.
 // The server responds with SessionState (81) and AddRenderer (83).
-Bytes buildCtrlJoinSession(uint64_t time_ms, int32_t batch_id,
-                             const DeviceInfo& dev);
+Bytes buildCtrlJoinSession(uint64_t time_ms, uint32_t payload_msg_id,
+                           int32_t batch_id, const DeviceInfo& dev);
 
-Bytes buildJoinSession(uint64_t time_ms, int32_t batch_id,
+Bytes buildJoinSession(uint64_t time_ms, uint32_t payload_msg_id,
+                       int32_t batch_id,
                        const Bytes& session_uuid,
                        const DeviceInfo& dev, int32_t reason, bool is_active,
                        const QueueRendererState& state);
 
-Bytes buildStateUpdated(uint64_t time_ms, int32_t batch_id,
+Bytes buildStateUpdated(uint64_t time_ms, uint32_t payload_msg_id,
+                        int32_t batch_id,
                         const QueueRendererState& state);
 
-Bytes buildVolumeChanged(uint64_t time_ms, int32_t batch_id,
+Bytes buildVolumeChanged(uint64_t time_ms, uint32_t payload_msg_id,
+                         int32_t batch_id,
                          uint32_t volume);
 
-Bytes buildMaxQualityChanged(uint64_t time_ms, int32_t batch_id,
-                              int32_t quality);
+Bytes buildMaxQualityChanged(uint64_t time_ms, uint32_t payload_msg_id,
+                             int32_t batch_id,
+                             int32_t quality);
 
 // Tell server we want renderer_id to be the active renderer:
-Bytes buildSetActiveRenderer(uint64_t time_ms, int32_t batch_id,
-                              int32_t renderer_id);
+Bytes buildSetActiveRenderer(uint64_t time_ms, uint32_t payload_msg_id,
+                             int32_t batch_id,
+                             int32_t renderer_id);
 
 // Ask server to send current renderer state:
-Bytes buildAskRendererState(uint64_t time_ms, int32_t batch_id,
-                             uint64_t session_id);
+Bytes buildAskRendererState(uint64_t time_ms, uint32_t payload_msg_id,
+                            int32_t batch_id,
+                            uint64_t session_id);
 
 // Report that this renderer is muted (or not):
-Bytes buildVolumeMuted(uint64_t time_ms, int32_t batch_id, bool muted);
+Bytes buildVolumeMuted(uint64_t time_ms, uint32_t payload_msg_id,
+                       int32_t batch_id, bool muted);
 
 // Report actual file audio quality (sample rate in Hz):
-Bytes buildFileAudioQualityChanged(uint64_t time_ms, int32_t batch_id,
+Bytes buildFileAudioQualityChanged(uint64_t time_ms,
+                                    uint32_t payload_msg_id,
+                                    int32_t batch_id,
                                     int32_t sample_rate_hz);
 
 // Ask server to send current queue state (sent after activation):
-Bytes buildAskQueueState(uint64_t time_ms, int32_t batch_id,
-                          const Bytes& queue_uuid);
+Bytes buildAskQueueState(uint64_t time_ms, uint32_t payload_msg_id,
+                         int32_t batch_id,
+                         const Bytes& queue_uuid);
 
 // ---- Decoder API ------------------------------------------------------------
 

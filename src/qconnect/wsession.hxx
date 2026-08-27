@@ -142,6 +142,8 @@ private:
     uint64_t alignTimestampMs(uint64_t ts_ms) const;
     void eventLoop();
     bool sendRaw(const Bytes& data);
+    bool enqueueQConnectFrame(
+        const std::function<Bytes(uint32_t, int32_t)>& build);
     bool sendDirectFrame(const Bytes& data, unsigned int flags);
     bool flushOutbound();
     bool hasOutbound();
@@ -212,9 +214,10 @@ private:
     // Estimated cloud-time offset (cloud_epoch_ms - local_epoch_ms).
     std::atomic<int64_t> m_cloud_time_offset_ms{0};
 
-    // Rolling counters for message IDs
-    std::atomic<int32_t> m_batch_id{0};
-    uint64_t             m_msg_id{1};
+    // Per-connection counters. Payload IDs are allocated while holding
+    // m_outbound_mutex so their numeric order is also their wire order.
+    int32_t  m_batch_id{0};
+    uint32_t m_msg_id{1};
 
     static constexpr int TRANSPORT_PING_INTERVAL_S = 20;
     static constexpr int HEARTBEAT_INTERVAL_S      = 10;

@@ -2304,11 +2304,12 @@ bool QcManager::applyPlaybackCommandLocked(
                                      : before.queue_pos;
     if (has_target && target_position < 0) return false;
 
-    // Position zero never needs a measured Content-Length. Selecting another
-    // item already starts it at the beginning; re-selecting the current item
-    // below restarts it without asking MPD to seek a growing HTTP stream.
+    // A near-zero position is the controller's interpolated form of "start".
+    // Selecting another item already starts it at the beginning; re-selecting
+    // the current item below restarts it without asking MPD to seek HTTP.
     const bool track_switch_at_start =
-        has_position && position_ms == 0 && has_target &&
+        has_position && !positionNeedsExactLength(has_position, position_ms) &&
+        has_target &&
         target_position != before.queue_pos;
 
     // Qobuz encodes Previous as a zero-position seek without a queue target.
@@ -2348,8 +2349,9 @@ bool QcManager::applyPlaybackCommandLocked(
     if (has_position)
         m_force_buffering.store(true, std::memory_order_relaxed);
     bool restart_track = false;
+    SegmentedDownloadHandle seek_pin;
     if (has_position && target_position >= 0 &&
-        !prepareSegmentedSeek(target_position, restart_track)) {
+        !prepareSegmentedSeek(target_position, restart_track, seek_pin)) {
         m_force_buffering.store(false, std::memory_order_relaxed);
         LOGERR("QcManager: segmented track was not ready for seeking\n");
         activityPhase(ActivityPhase::Error,
@@ -2365,6 +2367,10 @@ bool QcManager::applyPlaybackCommandLocked(
     bool ok = m_mpd->applyPlayback(target_position, select_track,
                                    has_position, position_ms, final_state,
                                    restart_track);
+    // Keep the completed cache pinned until MPD has reopened the URL and
+    // finished seeking. Otherwise LRU trimming can remove it in the small
+    // gap between preparation and the new HTTP request.
+    releaseSegmentedTrackDownload(seek_pin);
     if (!ok)
         m_force_buffering.store(false, std::memory_order_relaxed);
     if (!ok)
@@ -2373,8 +2379,10 @@ bool QcManager::applyPlaybackCommandLocked(
 }
 
 bool QcManager::prepareSegmentedSeek(int mpd_position,
-                                     bool& restart_track) {
+                                     bool& restart_track,
+                                     SegmentedDownloadHandle& seek_pin) {
     restart_track = false;
+    seek_pin.reset();
     std::string token;
     {
         std::lock_guard<std::mutex> lk(m_qmap_mutex);
@@ -2410,8 +2418,8 @@ bool QcManager::prepareSegmentedSeek(int mpd_position,
         }
         if (segmentedTrackFailed(download, &error)) break;
     }
-    releaseSegmentedTrackDownload(download);
     if (!ready || exact_size == 0) {
+        releaseSegmentedTrackDownload(download);
         LOGERR("QcManager: segmented seek preparation failed: "
                << (error.empty() ? "empty reconstructed stream" : error)
                << "\n");
@@ -2423,6 +2431,7 @@ bool QcManager::prepareSegmentedSeek(int mpd_position,
     }
 
     restart_track = true;
+    seek_pin = std::move(download);
     return true;
 }
 
