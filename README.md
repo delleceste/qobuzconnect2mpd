@@ -308,11 +308,13 @@ URL.
 or it could not fetch the Qobuz app ID (visible in the log). Delete the token
 file to force a new login.
 
-For playback, the daemon prefers the current `/session/start` plus `/file/url`
-flow. A segmented response is decrypted and reconstructed into FLAC behind the
-loopback HTTP proxy. A direct URL returned by that API can be passed through,
-and the classic `track/getFileUrl` API remains a compatibility fallback. No
-username/password login path is used.
+For playback, the daemon uses the classic `track/getFileUrl` API: Qobuz returns
+a signed CDN URL and MusicPD fetches it directly. That response carries a
+`Content-Length` and honours byte ranges, which is what libFLAC needs in order
+to seek. The CMAF `/session/start` plus `/file/url` flow — decrypted and
+reconstructed into FLAC behind the loopback proxy — is retained but disabled;
+enable it with `qconnectstreammode` if Qobuz ever retires the direct endpoint.
+No username/password login path is used.
 
 The printed callback path contains a random nonce, accepts only one exchange,
 and expires after five minutes. Restart the daemon to generate a new URL if it
@@ -326,19 +328,25 @@ item; remaining tracks are added incrementally. Remove, insert, reorder,
 shuffle, clear, and explicit queue-version updates are acknowledged only after
 the corresponding local state has committed.
 
-MusicPD's FLAC decoder needs an exact HTTP length before it can seek. Playback
-can begin from the growing cache without that length, but the first seek on an
-incomplete segmented track waits for its prioritized reconstruction, reopens
-the same queue item with the measured length, and then applies the requested
-millisecond position. The renderer reports buffering during this preparation.
-Segment proxy URLs use opaque per-process tokens rather than predictable track
-IDs because the discovery HTTP listener is reachable on the LAN.
+MusicPD's FLAC decoder needs an exact HTTP length before it can seek. Direct
+CDN URLs supply one, so seeks are immediate and are simply passed through to
+MusicPD.
+
+Under `qconnectstreammode = segmented` or `auto` this does not hold: a
+reconstructed CMAF stream has no length until it is complete, so the first seek
+on an incomplete track waits for its prioritized reconstruction, reopens the
+queue item with the measured length, and only then applies the requested
+position. The renderer reports buffering throughout, and on a long hi-res track
+that wait is minutes. This is the reason `direct` is the default. Segment proxy
+URLs use opaque per-process tokens rather than predictable track IDs because the
+discovery HTTP listener is reachable on the LAN.
 
 ## Bit-perfect audio chain
 
-`qobuzconnect2mpd` does not transcode or apply DSP. The preferred segmented
-path decrypts Qobuz's CMAF fragments and reconstructs a FLAC stream for MPD;
-the direct-URL compatibility path passes the original stream to MPD. Actual
+`qobuzconnect2mpd` does not transcode or apply DSP. The default direct-URL path
+passes Qobuz's original stream to MPD untouched; the optional segmented path
+decrypts Qobuz's CMAF fragments and reconstructs an equivalent FLAC stream.
+Actual
 DAC output still depends on the selected MusicPD output, mixer, resampler, and
 hardware. See [BIT-PERFECT-PARITY-WITH-UPMPDCLI.md](BIT-PERFECT-PARITY-WITH-UPMPDCLI.md)
 for the current verification scope and a decoded-PCM comparison procedure.

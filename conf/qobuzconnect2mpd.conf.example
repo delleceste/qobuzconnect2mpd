@@ -24,6 +24,23 @@ qconnectport = 9093
 # Defaults to qobuzformatid if set, otherwise 27.
 qconnectformatid = 27
 
+# Which Qobuz streaming API supplies playback URLs.
+#
+#   direct     (default) classic /track/getFileUrl. Qobuz returns a signed CDN
+#              URL and MusicPD fetches it itself. The response carries a
+#              Content-Length and honours byte ranges, which is what libFLAC
+#              needs in order to seek — this is the only mode with a working
+#              seek bar, and the only one verified bit-perfect.
+#   segmented  /session/start + /file/url. Qobuz returns encrypted CMAF
+#              fragments which this daemon decrypts and reassembles into FLAC
+#              behind its local HTTP proxy. The reconstructed stream has no
+#              length until it is complete, so MusicPD cannot seek a track
+#              until it has fully downloaded.
+#   auto       try direct, fall back to segmented.
+#
+# Use 'auto' or 'segmented' only if Qobuz retires the direct endpoint.
+#qconnectstreammode = direct
+
 # Network interface for mDNS announcements (empty = auto-detect first
 # non-loopback interface).
 #qconnectiface =

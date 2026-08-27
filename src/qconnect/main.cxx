@@ -25,6 +25,7 @@
 //   qconnectdevicetype     Device type integer 1=Speaker (default: 1)
 //   qconnectport           HTTP port for device endpoints (default: 9093)
 //   qconnectformatid       Stream format: 5=MP3, 6=FLAC, 7=HiRes96, 27=HiRes192
+//   qconnectstreammode     direct (default) | auto | segmented
 //                          (default: value of 'qobuzformatid', else 27)
 //   qconnectiface          Network interface to bind mDNS to (default: auto)
 //   qconnectsockpath       Unix socket for IPC with upmpdcli
@@ -244,6 +245,10 @@ int main(int argc, char* argv[]) {
     // Audio quality
     int base_fmt = cfgGetInt(cfg, "qobuzformatid", 27);
     qcfg.format_id = cfgGetInt(cfg, "qconnectformatid", base_fmt);
+
+    // 'direct' (default) is the only mode MPD can seek. See qobuzapi.hxx.
+    qcfg.stream_mode =
+        streamModeFromString(cfgGet(cfg, "qconnectstreammode", "direct"));
 
     // HTTP port
     qcfg.http_port = cfgGetInt(cfg, "qconnectport", 9093);

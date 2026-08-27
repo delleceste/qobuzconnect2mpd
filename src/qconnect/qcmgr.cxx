@@ -301,6 +301,13 @@ bool QcManager::start() {
                                         m_cfg.app_id,
                                         m_cfg.app_secret);
     m_api->setSegmentedRegistry(&m_seg_registry);
+    m_api->setStreamMode(m_cfg.stream_mode);
+    if (m_cfg.stream_mode != StreamMode::Direct) {
+        LOGINF("QcManager: stream mode '"
+               << streamModeName(m_cfg.stream_mode)
+               << "' — segmented tracks cannot be seeked until they finish"
+                  " downloading\n");
+    }
 
     // Both values are required to sign stream URL requests. Fetch a complete
     // pair when either half of the configured pair is missing.

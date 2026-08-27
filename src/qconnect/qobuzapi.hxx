@@ -33,6 +33,22 @@ class SegmentedTrackRegistry;
 // also provide a session-scoped API JWT during connect-to-qconnect, but it is
 // retained only as protocol metadata and is not used for REST authentication.
 
+// Which Qobuz streaming API to use for playback URLs.
+//
+// Direct: classic /track/getFileUrl. Returns a signed CDN URL that MPD can
+//   fetch itself. The response carries Content-Length and honours byte
+//   ranges, which is what libFLAC needs in order to seek.
+// Segmented: /session/start + /file/url. Returns encrypted CMAF fragments
+//   that must be decrypted and reassembled into FLAC behind the local proxy.
+//   The reconstructed stream has no length until it is complete, so MPD
+//   cannot seek it.
+// Auto: try Direct, fall back to Segmented.
+enum class StreamMode { Direct, Auto, Segmented };
+
+// Parse a 'qconnectstreammode' config value. Unknown values yield Direct.
+StreamMode streamModeFromString(const std::string& v);
+const char* streamModeName(StreamMode m);
+
 struct TrackStreamInfo {
     std::string stream_url;  // signed HTTPS URL, valid for ~10 min
     std::string local_path;  // legacy materialized streams only
@@ -128,6 +144,13 @@ public:
         m_seg_registry = r;
     }
 
+    // Selects which streaming API getStreamUrl() uses. Defaults to Direct
+    // because only direct CDN URLs are seekable; see StreamMode.
+    void setStreamMode(StreamMode m) {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        m_stream_mode = m;
+    }
+
 private:
     bool ensureStreamSession();
     bool startStreamSession();
@@ -165,6 +188,7 @@ private:
     std::string m_stream_session_infos;    // from /session/start
     std::string m_local_proxy_base_url;
     SegmentedTrackRegistry* m_seg_registry{nullptr}; // not owned
+    StreamMode  m_stream_mode{StreamMode::Direct};
 };
 
 } // namespace QConnect

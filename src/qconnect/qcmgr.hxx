@@ -29,6 +29,7 @@
 #include "proto.hxx"
 #include "mpdctl.hxx"
 #include "segstream.hxx"
+#include "qobuzapi.hxx"
 
 namespace QConnect {
 
@@ -46,6 +47,9 @@ struct QcConfig {
     std::string friendly_name;  // shown in Qobuz app
     int         device_type{1}; // 1=SPEAKER
     int         format_id{27};  // audio quality: 5/6/7/27
+    // Which Qobuz streaming API to use ('qconnectstreammode'). Direct CDN
+    // URLs are the only seekable option; see QobuzApi::StreamMode.
+    StreamMode  stream_mode{StreamMode::Direct};
 
     // HTTP endpoint server
     int         http_port{9093};
