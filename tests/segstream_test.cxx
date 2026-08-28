@@ -302,6 +302,57 @@ bool testVisibleCacheLifecycle() {
     return true;
 }
 
+// hintSegmentedTrackTarget() is called from the queue loader and from the
+// seek path, at moments when the download state may not exist yet and with an
+// offset derived from a duration ratio that can land anywhere — including past
+// the end of the stream.  None of those may crash or corrupt state.
+bool testSeekHintIsSafe() {
+    using namespace QConnect;
+
+    // No download state yet: the queue loader hints before anything has been
+    // acquired, which must be a silent no-op rather than a null dereference.
+    auto plan = std::make_shared<SegmentedTrackPlan>();
+    plan->track_id = 400;
+    plan->format_id = 6;
+    plan->flac_header.assign(496, 0);
+    plan->segment_byte_lens = {100, 200, 300};
+    plan->exact_segment_lens = {100, 200, 300};
+    plan->exact_segment_offsets = {496, 596, 796, 1096};
+    plan->exact_total_bytes = 1096;
+    CHECK(plan->hasExactGeometry());
+    hintSegmentedTrackTarget(plan, 596);
+
+    // Offsets at and beyond the end, and a null plan.
+    hintSegmentedTrackTarget(plan, 0);
+    hintSegmentedTrackTarget(plan, 1095);
+    hintSegmentedTrackTarget(plan, 1096);
+    hintSegmentedTrackTarget(plan, ~uint64_t{0});
+    hintSegmentedTrackTarget(nullptr, 0);
+
+    // A plan without exact geometry has no segment map to point at.
+    auto bare = std::make_shared<SegmentedTrackPlan>();
+    bare->track_id = 401;
+    bare->segment_byte_lens = {1};
+    CHECK(!bare->hasExactGeometry());
+    hintSegmentedTrackTarget(bare, 42);
+
+    // With a live download state the hint must still be safe, and must not
+    // disturb a track that has already completed.
+    auto immediate = makeImmediatePlan(402, "fLaC-hint");
+    auto handle = acquireSegmentedTrackDownload(immediate);
+    CHECK(handle != nullptr);
+    uint64_t size = 0;
+    CHECK(waitForSegmentedTrack(handle, size, 2000));
+    hintSegmentedTrackTarget(immediate, 0);
+    hintSegmentedTrackTarget(immediate, size);
+    uint64_t after = 0;
+    CHECK(segmentedTrackExactSize(handle, after));
+    CHECK(after == size);
+    releaseSegmentedTrackDownload(handle);
+    cancelSegmentedTrackDownload(immediate);
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -312,7 +363,8 @@ int main() {
         !testRetryableFailure() ||
         !testCompletedCacheLru() ||
         !testRegistryRetention() ||
-        !testVisibleCacheLifecycle())
+        !testVisibleCacheLifecycle() ||
+        !testSeekHintIsSafe())
         return EXIT_FAILURE;
     return EXIT_SUCCESS;
 }

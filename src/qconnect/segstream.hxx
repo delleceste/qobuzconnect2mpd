@@ -62,6 +62,12 @@ struct SegmentedTrackPlan {
     // cache can be written out of order because every segment's byte offset
     // is known in advance.
     std::vector<uint32_t> exact_segment_lens;
+    // Encrypted (on-the-wire) size of each audio segment, as reported by the
+    // Content-Range of the geometry probe.  Only used to split a segment's
+    // download across several connections; 0 means unknown, which falls back
+    // to a single whole-object GET.  Never use these for stream offsets --
+    // the decrypted lengths in exact_segment_lens are the authoritative ones.
+    std::vector<uint64_t> encrypted_segment_sizes;
     // Cumulative offsets into the FULL stream, including flac_header.
     // Size == n_audio_segments + 1; front() == flac_header.size().
     std::vector<uint64_t> exact_segment_offsets;
@@ -97,6 +103,8 @@ private:
         bool pin_reader);
     friend void cancelSegmentedTrackDownload(
         const std::shared_ptr<SegmentedTrackPlan>& plan);
+    friend void hintSegmentedTrackTarget(
+        const std::shared_ptr<SegmentedTrackPlan>& plan, uint64_t offset);
     friend bool segmentedTrackExactSize(const SegmentedDownloadHandle& handle,
                                          uint64_t& size_out);
     friend bool segmentedTrackFailed(const SegmentedDownloadHandle& handle,
@@ -133,6 +141,14 @@ void releaseSegmentedTrackDownload(const SegmentedDownloadHandle& handle);
 // idempotent. Used when a plan is replaced or removed from the active queue.
 void cancelSegmentedTrackDownload(
     const std::shared_ptr<SegmentedTrackPlan>& plan);
+
+// Point an in-flight reconstruction at the byte offset playback is about to
+// jump to, before MusicPD asks for it.  On a seek MusicPD only requests the
+// target offset once its decoder has started, and the decoder cannot start
+// until the head of the stream has downloaded — so without this hint a deep
+// seek waits for the fill to walk there from wherever the reader is.
+void hintSegmentedTrackTarget(const std::shared_ptr<SegmentedTrackPlan>& plan,
+                              uint64_t offset);
 
 // Return the measured stream size when reconstruction has completed.
 bool segmentedTrackExactSize(const SegmentedDownloadHandle& handle,

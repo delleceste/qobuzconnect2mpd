@@ -59,10 +59,23 @@ struct SegmentedDownloadState {
     // Per-segment presence, sized n_audio_segments when the plan has exact
     // geometry.  Empty for the legacy sequential path.
     std::vector<uint8_t> segment_present;
+    // Segments a worker is fetching right now.  Two workers can serve the
+    // same track, and since both now fill from the read cursor they would
+    // otherwise pick the same gap and download it twice.
+    std::vector<uint8_t> segment_inflight;
     size_t segments_done{0};
     // A reader blocked on a byte offset publishes the segment it needs here
     // so the downloader fetches that one next.  0 = no request.
     size_t wanted_segment{0};
+    // 1-based segment the decoder last read from.  The gap fill starts here
+    // rather than at byte zero: after a seek everything before the cursor is
+    // audio this session will never play.  0 = nothing read yet.
+    size_t read_segment{0};
+    // Contiguous segments present from read_segment onwards, and whether this
+    // download has stopped needing bandwidth.  Atomics: the scheduler polls
+    // them while holding its own lock, and must not take state->mutex there.
+    std::atomic<size_t> lead_segments{0};
+    std::atomic<bool> done{false};
     bool header_written{false};
     bool complete{false};
     bool failed{false};
@@ -84,6 +97,17 @@ struct SegmentedDownloadState {
 namespace {
 
 constexpr int kSegmentMaxAttempts = 3;
+// Qobuz's CDN throttles a single connection to well under what a 24/192
+// stream consumes in real time, so one segment is fetched over several
+// connections at once and reassembled before decryption.  The geometry probe
+// already demonstrates that the CDN is happy with this much concurrency.
+constexpr size_t kSegmentFetchConnections = 6;
+// Prefetch of later tracks is held back until the track being listened to has
+// this many segments buffered ahead of the decoder.  On a link that is barely
+// faster than one 24/192 stream, speculative downloads are taken straight out
+// of the playing track's budget and guarantee an underrun.
+constexpr size_t kPrefetchLeadSegments = 20;
+constexpr uint64_t kSegmentFetchChunkBytes = uint64_t{1} * 1024 * 1024;
 constexpr size_t kMaxConcurrentTrackDownloads = 2;
 constexpr size_t kMaxAutomaticTrackDownloads = 4;
 constexpr size_t kMaxPendingTrackDownloads = 16;
@@ -621,6 +645,141 @@ static bool decryptSegment(const std::vector<uint8_t>& seg,
     return !out.empty();
 }
 
+// Fetch one encrypted segment's bytes, splitting the transfer across
+// kSegmentFetchConnections range requests.  A single connection is throttled
+// by the CDN to well under real time for a 24/192 stream, and a segment is
+// several megabytes.
+//
+// The on-the-wire size is not known in advance: the init fragment's table
+// gives decrypted lengths, and encrypted_segment_sizes is only populated on
+// the probe path.  So the first chunk is fetched as a range request, whose
+// Content-Range reveals the total, and the remainder is then fetched in
+// parallel.  The caller's fetcher runs the first chunk so its connection
+// stays warm; the rest get their own handles, as in
+// probeSegmentedTrackGeometry().
+static bool fetchSegmentBytes(const SegmentedTrackPlan& plan,
+                              size_t seg_1based, const std::string& url,
+                              std::vector<uint8_t>& raw, std::string& error,
+                              CurlFetcher& fetcher,
+                              const std::atomic<bool>* cancelled) {
+    uint64_t total = 0;
+    if (seg_1based >= 1 && seg_1based <= plan.encrypted_segment_sizes.size())
+        total = plan.encrypted_segment_sizes[seg_1based - 1];
+
+    size_t have_chunks = 0;
+    std::vector<uint8_t> first;
+    if (total == 0) {
+        const std::string range =
+            "0-" + std::to_string(kSegmentFetchChunkBytes - 1);
+        if (!fetcher.fetch(url, plan.http_headers, first, &error, cancelled,
+                           range.c_str(), &total))
+            return false;
+        // Whole object delivered (small segment, or a server that ignored the
+        // range), or a total we could not parse: what we hold is all there is.
+        if (total == 0 || first.size() >= total) {
+            raw = std::move(first);
+            return true;
+        }
+        have_chunks = 1;
+    }
+
+    if (total <= kSegmentFetchChunkBytes)
+        return fetcher.fetch(url, plan.http_headers, raw, &error, cancelled);
+
+    const size_t nchunks = static_cast<size_t>(
+        (total + kSegmentFetchChunkBytes - 1) / kSegmentFetchChunkBytes);
+    raw.assign(static_cast<size_t>(total), 0);
+    if (have_chunks == 1)
+        std::memcpy(raw.data(), first.data(), first.size());
+
+    std::atomic<size_t> next_chunk{have_chunks};
+    std::atomic<bool> whole_object{false};
+    std::mutex err_mu;
+    std::string first_error;
+    // A server that ignores Range hands one worker the entire object while
+    // the others are still copying their own ranges into `raw`.  Park it in
+    // its own buffer instead of writing over them: overlapping concurrent
+    // writes to `raw` would be a data race whatever the flag says.
+    std::mutex whole_mu;
+    std::vector<uint8_t> whole;
+
+    auto worker = [&](CurlFetcher* shared) {
+        CurlFetcher own;
+        CurlFetcher& handle = shared ? *shared : own;
+        std::vector<uint8_t> part;
+        for (;;) {
+            const size_t i = next_chunk.fetch_add(1, std::memory_order_relaxed);
+            if (i >= nchunks || whole_object.load(std::memory_order_relaxed))
+                return;
+            if (cancelled && cancelled->load(std::memory_order_relaxed)) return;
+            {
+                std::lock_guard<std::mutex> lk(err_mu);
+                if (!first_error.empty()) return;
+            }
+            const uint64_t begin = uint64_t{i} * kSegmentFetchChunkBytes;
+            const uint64_t end =
+                std::min<uint64_t>(begin + kSegmentFetchChunkBytes, total);
+            const std::string range = std::to_string(begin) + "-" +
+                                      std::to_string(end - 1);
+            std::string chunk_error;
+            const bool ok = handle.fetch(url, plan.http_headers, part,
+                                         &chunk_error, cancelled,
+                                         range.c_str());
+            if (ok && part.size() == static_cast<size_t>(total)) {
+                // Range ignored: the server sent the whole segment, which is
+                // everything we wanted anyway.  Published after the join.
+                {
+                    std::lock_guard<std::mutex> lk(whole_mu);
+                    if (whole.empty()) whole = std::move(part);
+                }
+                whole_object.store(true, std::memory_order_relaxed);
+                return;
+            }
+            if (!ok || part.size() != static_cast<size_t>(end - begin)) {
+                if (whole_object.load(std::memory_order_relaxed)) return;
+                if (chunk_error.empty()) chunk_error = "short range response";
+                std::lock_guard<std::mutex> lk(err_mu);
+                if (first_error.empty())
+                    first_error = "bytes " + range + ": " + chunk_error;
+                return;
+            }
+            std::memcpy(raw.data() + begin, part.data(), part.size());
+        }
+    };
+
+    const size_t outstanding = nchunks - have_chunks;
+    const size_t nthreads = std::min<size_t>(kSegmentFetchConnections,
+                                             outstanding);
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads - 1);
+    for (size_t i = 1; i < nthreads; ++i) threads.emplace_back(worker, nullptr);
+    worker(&fetcher);
+    for (auto& t : threads) t.join();
+
+    if (whole_object.load(std::memory_order_relaxed)) {
+        // Every worker has joined, so this is the only writer now.
+        std::lock_guard<std::mutex> lk(whole_mu);
+        if (whole.size() == static_cast<size_t>(total)) {
+            raw = std::move(whole);
+            return true;
+        }
+        error = "range-ignoring server returned an inconsistent object";
+        raw.clear();
+        return false;
+    }
+    if (!first_error.empty()) {
+        error = std::move(first_error);
+        raw.clear();
+        return false;
+    }
+    if (cancelled && cancelled->load(std::memory_order_relaxed)) {
+        error = "cancelled";
+        raw.clear();
+        return false;
+    }
+    return true;
+}
+
 static bool fetchAndDecryptSegmentOnce(
     const SegmentedTrackPlan& plan, size_t seg_1based,
     std::vector<uint8_t>& out_data, std::string& error,
@@ -630,7 +789,8 @@ static bool fetchAndDecryptSegmentOnce(
                                          std::regex("\\$SEGMENT\\$"),
                                          std::to_string(seg_1based));
     std::vector<uint8_t> raw;
-    if (!fetcher.fetch(url, plan.http_headers, raw, &error, cancelled))
+    if (!fetchSegmentBytes(plan, seg_1based, url, raw, error, fetcher,
+                           cancelled))
         return false;
     if (!decryptSegment(raw, plan.content_key, out_data)) {
         error = "truncated or invalid encrypted segment";
@@ -688,6 +848,7 @@ static bool openDownloadCache(
         }
         std::lock_guard<std::mutex> lock(state->mutex);
         state->segment_present.assign(plan.n_audio_segments(), 0);
+        state->segment_inflight.assign(plan.n_audio_segments(), 0);
         state->exact_size = plan.exact_total_bytes;
     }
 
@@ -766,6 +927,25 @@ static void refreshContiguousLocked(
     state->available = end;
 }
 
+// Recount how far ahead of the decoder the cache reaches.  Must be called
+// with state->mutex held.  A download with no per-segment map (the legacy
+// sequential path) reports an unbounded lead so it is never gated.
+static void refreshLeadLocked(
+    const std::shared_ptr<SegmentedDownloadState>& state) {
+    const size_t count = state->segment_present.size();
+    if (count == 0) {
+        state->lead_segments.store(std::numeric_limits<size_t>::max(),
+                                   std::memory_order_relaxed);
+        return;
+    }
+    const size_t start = (state->read_segment >= 1 &&
+                          state->read_segment <= count)
+                             ? state->read_segment - 1 : 0;
+    size_t lead = 0;
+    while (start + lead < count && state->segment_present[start + lead]) ++lead;
+    state->lead_segments.store(lead, std::memory_order_relaxed);
+}
+
 static void failDownload(const std::shared_ptr<SegmentedDownloadState>& state,
                          std::string error) {
     bool announce = false;
@@ -774,6 +954,7 @@ static void failDownload(const std::shared_ptr<SegmentedDownloadState>& state,
         std::lock_guard<std::mutex> lock(state->mutex);
         if (!state->complete && !state->failed) {
             state->failed = true;
+            state->done.store(true, std::memory_order_relaxed);
             state->error = std::move(error);
             reported = state->error;
             // A cancelled download is the normal consequence of the queue
@@ -824,23 +1005,63 @@ static ReconstructionStep reconstructTrackStep(
     }
 
     // Pick the next segment: honour a reader that is blocked on a seek
-    // target, otherwise fill the lowest gap so sequential playback stays
-    // ahead of the decoder.
+    // target, otherwise fill forward from the read cursor so sequential
+    // playback stays ahead of the decoder.
     size_t segment = 0;
     if (exact) {
-        std::lock_guard<std::mutex> lock(state->mutex);
+        std::unique_lock<std::mutex> lock(state->mutex);
+        const size_t count = state->segment_present.size();
+        auto needed = [&state](size_t i) {
+            return !state->segment_present[i] && !state->segment_inflight[i];
+        };
         const size_t wanted = state->wanted_segment;
-        if (wanted >= 1 && wanted <= state->segment_present.size() &&
-            !state->segment_present[wanted - 1]) {
+        if (wanted >= 1 && wanted <= count && needed(wanted - 1)) {
             segment = wanted;
         } else {
-            for (size_t i = 0; i < state->segment_present.size(); ++i) {
-                if (!state->segment_present[i]) { segment = i + 1; break; }
+            // Fill from where the decoder is actually reading, not from byte
+            // zero.  After a seek the segments before the read cursor are
+            // audio this session will never play, and fetching them starves
+            // the cursor on a link with no bandwidth to spare.  Wrap round
+            // only once everything ahead is present: a backward seek still
+            // needs them, and gets them through wanted_segment anyway.
+            const size_t start = (state->read_segment >= 1 &&
+                                  state->read_segment <= count)
+                                     ? state->read_segment - 1 : 0;
+            for (size_t n = 0; n < count; ++n) {
+                const size_t i = (start + n) % count;
+                if (needed(i)) { segment = i + 1; break; }
             }
+        }
+        if (segment != 0) {
+            state->segment_inflight[segment - 1] = 1;
+        } else if (state->segments_done < count) {
+            // Every gap is already in flight on the other worker.  Wait for
+            // it to make progress instead of spinning through the scheduler.
+            state->changed.wait_for(
+                lock, std::chrono::milliseconds(250), [&state] {
+                    return state->failed ||
+                           state->cancelled.load(std::memory_order_relaxed);
+                });
         }
     } else if (state->next_segment <= plan->n_audio_segments()) {
         segment = state->next_segment;
     }
+
+    // Release the claim however this step ends, including every early return
+    // in the fetch path below.
+    struct InflightGuard {
+        const std::shared_ptr<SegmentedDownloadState>* state;
+        size_t segment;
+        ~InflightGuard() {
+            if (!state || segment == 0) return;
+            {
+                std::lock_guard<std::mutex> lock((*state)->mutex);
+                if (segment <= (*state)->segment_inflight.size())
+                    (*state)->segment_inflight[segment - 1] = 0;
+            }
+            (*state)->changed.notify_all();
+        }
+    } inflight{exact ? &state : nullptr, exact ? segment : 0};
 
     if (segment != 0) {
         std::vector<uint8_t> data;
@@ -899,6 +1120,7 @@ static ReconstructionStep reconstructTrackStep(
                 }
                 if (state->wanted_segment == segment) state->wanted_segment = 0;
                 refreshContiguousLocked(plan, state);
+                refreshLeadLocked(state);
             }
             state->changed.notify_all();
         } else {
@@ -935,6 +1157,7 @@ static ReconstructionStep reconstructTrackStep(
             return ReconstructionStep::Finished;
         state->exact_size = state->available;
         state->complete = true;
+        state->done.store(true, std::memory_order_relaxed);
         completed_size = state->exact_size;
     }
     state->changed.notify_all();
@@ -1083,28 +1306,84 @@ private:
         uint64_t last_access{0};
     };
 
+    static bool isPlaybackJob(const Job& job) {
+        return job.state->requested_priority.load(std::memory_order_relaxed) ==
+               static_cast<int>(SegmentedDownloadPriority::Playback);
+    }
+
+    // True while a Playback download still needs bandwidth and has less than
+    // kPrefetchLeadSegments buffered ahead of the decoder.  Reads only
+    // atomics: taking state->mutex under m_mutex would invert the lock order
+    // used by the download and reader paths.
+    bool playbackStarvedLocked() const {
+        auto starved = [](const std::shared_ptr<SegmentedDownloadState>& st) {
+            if (!st) return false;
+            if (st->done.load(std::memory_order_relaxed)) return false;
+            if (st->cancelled.load(std::memory_order_relaxed)) return false;
+            if (st->requested_priority.load(std::memory_order_relaxed) !=
+                static_cast<int>(SegmentedDownloadPriority::Playback))
+                return false;
+            return st->lead_segments.load(std::memory_order_relaxed) <
+                   kPrefetchLeadSegments;
+        };
+        for (const auto& job : m_pending)
+            if (starved(job.state)) return true;
+        for (const auto& state : m_running)
+            if (starved(state)) return true;
+        return false;
+    }
+
     void workerLoop() {
         CurlFetcher fetcher;
         for (;;) {
             Job job;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
-                m_changed.wait(lock, [this] {
-                    return m_stopping || !m_pending.empty();
-                });
-                if (m_stopping && m_pending.empty()) return;
-
-                auto selected = std::max_element(
-                    m_pending.begin(), m_pending.end(),
-                    [](const Job& lhs, const Job& rhs) {
-                        if (lhs.priority != rhs.priority)
-                            return static_cast<int>(lhs.priority) <
-                                   static_cast<int>(rhs.priority);
-                        return lhs.sequence > rhs.sequence;
+                for (;;) {
+                    m_changed.wait(lock, [this] {
+                        return m_stopping || !m_pending.empty();
                     });
-                job = std::move(*selected);
-                m_pending.erase(selected);
-                m_running.push_back(job.state);
+                    if (m_stopping && m_pending.empty()) return;
+
+                    // While the track being listened to is short of buffer,
+                    // every connection belongs to it.  Prefetch jobs stay
+                    // pending rather than taking a worker for a whole segment.
+                    const bool hold_prefetch = playbackStarvedLocked();
+                    auto selected = m_pending.end();
+                    for (auto it = m_pending.begin(); it != m_pending.end();
+                         ++it) {
+                        if (hold_prefetch && !isPlaybackJob(*it)) continue;
+                        if (selected == m_pending.end()) { selected = it; continue; }
+                        if (it->priority != selected->priority) {
+                            if (static_cast<int>(it->priority) >
+                                static_cast<int>(selected->priority))
+                                selected = it;
+                        } else if (it->sequence < selected->sequence) {
+                            selected = it;
+                        }
+                    }
+                    if (selected == m_pending.end()) {
+                        // Only prefetch work is available and playback needs
+                        // the bandwidth: idle until that changes.
+                        if (!m_prefetch_held) {
+                            m_prefetch_held = true;
+                            LOGDEB("QobuzApi: holding prefetch while the "
+                                   "playing track buffers\n");
+                        }
+                        m_changed.wait_for(lock,
+                                           std::chrono::milliseconds(200));
+                        continue;
+                    }
+                    if (m_prefetch_held && !hold_prefetch) {
+                        m_prefetch_held = false;
+                        LOGDEB("QobuzApi: playing track buffered; prefetch "
+                               "resumed\n");
+                    }
+                    job = std::move(*selected);
+                    m_pending.erase(selected);
+                    m_running.push_back(job.state);
+                    break;
+                }
             }
 
             ReconstructionStep step = ReconstructionStep::Finished;
@@ -1213,6 +1492,7 @@ private:
     std::vector<std::shared_ptr<SegmentedDownloadState>> m_running;
     std::vector<CacheEntry> m_cache;
     std::vector<std::thread> m_workers;
+    bool m_prefetch_held{false};
 };
 
 static SegmentedDownloadScheduler& downloadScheduler() {
@@ -1336,6 +1616,33 @@ void cancelSegmentedTrackDownload(
     downloadScheduler().cancel(state);
 }
 
+void hintSegmentedTrackTarget(const std::shared_ptr<SegmentedTrackPlan>& plan,
+                              uint64_t offset) {
+    if (!plan || !plan->hasExactGeometry()) return;
+    std::shared_ptr<SegmentedDownloadState> state;
+    {
+        std::lock_guard<std::mutex> lk(plan->m_download_mu);
+        state = plan->m_download_state;
+    }
+    if (!state) return;
+    const size_t segment = plan->segmentForOffset(offset);
+    if (segment == 0) return;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (segment > state->segment_present.size()) return;
+        if (state->segment_present[segment - 1]) return;
+        // Both: wanted_segment makes it the next fetch, read_segment makes the
+        // gap fill continue forward from there rather than from the head.
+        state->wanted_segment = segment;
+        state->read_segment = segment;
+        refreshLeadLocked(state);
+    }
+    state->changed.notify_all();
+    LOGDEB("QobuzApi: seek hint: track " << plan->track_id << " offset "
+           << offset << " -> segment " << segment << "/"
+           << plan->n_audio_segments() << "\n");
+}
+
 bool segmentedTrackExactSize(const SegmentedDownloadHandle& state,
                              uint64_t& size_out) {
     if (!state) return false;
@@ -1427,6 +1734,10 @@ int readSegmentedTrack(const SegmentedDownloadHandle& state,
                 }
                 readable_end = plan->flac_header.size();
             } else {
+                // Tell the downloader where playback actually is, so its gap
+                // fill starts here rather than at the head of the track.
+                state->read_segment = segment;
+                refreshLeadLocked(state);
                 if (!state->segment_present[segment - 1]) {
                     state->wanted_segment = segment;
                     state->changed.notify_all();
@@ -1799,6 +2110,10 @@ bool probeSegmentedTrackGeometry(SegmentedTrackPlan& plan,
     }
 
     std::vector<uint32_t> lens(count, 0);
+    // The probe already learns each segment's encrypted size from
+    // Content-Range; keeping it lets the download split the segment across
+    // connections without an extra round trip.
+    std::vector<uint64_t> encrypted(count, 0);
     std::atomic<size_t> next_index{0};
     std::mutex err_mu;
     std::string first_error;
@@ -1834,6 +2149,7 @@ bool probeSegmentedTrackGeometry(SegmentedTrackPlan& plan,
                         break;
                     }
                     lens[i] = static_cast<uint32_t>(len);
+                    encrypted[i] = full_size;
                     measured = true;
                     break;
                 }
@@ -1866,6 +2182,7 @@ bool probeSegmentedTrackGeometry(SegmentedTrackPlan& plan,
     }
 
     plan.exact_segment_lens = std::move(lens);
+    plan.encrypted_segment_sizes = std::move(encrypted);
     plan.exact_segment_offsets.clear();
     plan.exact_segment_offsets.reserve(count + 1);
     uint64_t acc = plan.flac_header.size();
