@@ -162,17 +162,26 @@ bool QobuzApi::getStreamUrl(uint32_t track_id, int format_id,
 
     bool refreshed_credentials = false;
 retry_after_refresh:
-    // The CMAF flow needs a stream session; the direct endpoint does not, so
-    // do not pay for one (or log about it) unless segmented is reachable.
+    // The CMAF flow needs a stream session; the direct endpoint does not.  The
+    // session is established lazily, at the first segmented attempt, so a
+    // successful direct resolution — the normal path, including in 'auto' —
+    // never pays for a /session/start it will not use.  That round trip is
+    // cached until expiry, but it would otherwise land on the first track
+    // after startup, which is exactly when the listener is waiting for audio.
     bool have_stream_session = false;
-    if (want_segmented) {
-        have_stream_session = ensureStreamSession();
-        if (!have_stream_session && want_direct) {
-            LOGINF("QobuzApi: no stream session for /file/url; direct endpoint only\n");
-        } else if (!have_stream_session) {
-            LOGERR("QobuzApi: unable to establish stream session for /file/url\n");
+    bool session_attempted = false;
+    auto streamSessionReady = [&]() {
+        if (!session_attempted) {
+            session_attempted = true;
+            have_stream_session = ensureStreamSession();
+            if (!have_stream_session && want_direct) {
+                LOGINF("QobuzApi: no stream session for /file/url; direct endpoint only\n");
+            } else if (!have_stream_session) {
+                LOGERR("QobuzApi: unable to establish stream session for /file/url\n");
+            }
         }
-    }
+        return have_stream_session;
+    };
 
     // Try the requested format, then fall back to lower qualities.
     //
@@ -202,7 +211,7 @@ retry_after_refresh:
             }
         }
 
-        if (have_stream_session) {
+        if (want_segmented && streamSessionReady()) {
             long file_code = 0;
             if (tryFileUrl(track_id, fmt, out, &file_code))
                 return true;

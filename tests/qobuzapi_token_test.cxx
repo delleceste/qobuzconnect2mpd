@@ -344,8 +344,52 @@ bool testDirectApiPrecedesSegmentedFallback() {
     return true;
 }
 
+// A successful direct resolution must not cost a CMAF stream session, even in
+// 'auto'.  The session is CMAF-only machinery, and establishing it up front
+// put a /session/start round trip in front of the first track after startup —
+// exactly when the listener is waiting for audio.
+bool testAutoModeSkipsSessionWhenDirectSucceeds() {
+    namespace fs = std::filesystem;
+    std::vector<char> pattern{
+        '/', 't', 'm', 'p', '/', 'q', 'c', 'o', 'n', 'n', 'e', 'c', 't',
+        '-', 'l', 'a', 'z', 'y', '-', 't', 'e', 's', 't', '.', 'X', 'X',
+        'X', 'X', 'X', 'X', '\0'};
+    char* made = ::mkdtemp(pattern.data());
+    CHECK(made != nullptr);
+    const fs::path directory(made);
+    const fs::path token = directory / "token";
+    CHECK(writeFile(token.string(), "test-oauth-token\n", 0600));
+
+    MockQobuzServer server;
+    CHECK(server.start());
+    QConnect::QobuzApi api(
+        "http://127.0.0.1:" + std::to_string(server.port()),
+        "test-app", "classic-secret");
+    api.setStreamMode(QConnect::StreamMode::Auto);
+    CHECK(api.loadToken(token.string()));
+    QConnect::TrackStreamInfo info;
+    // Format 5 is the one the mock serves directly, so direct succeeds first
+    // time and the segmented branch is never reached.
+    CHECK(api.getStreamUrl(12345, 5, info));
+    server.stop();
+
+    CHECK(server.targets().size() == 1);
+    CHECK(server.targets()[0].rfind("/track/getFileUrl?", 0) == 0);
+    CHECK(queryValue(server.targets()[0], "format_id") == "5");
+    for (const auto& target : server.targets())
+        CHECK(target != "/session/start");
+    CHECK(info.stream_url == "https://cdn.example/track.mp3");
+
+    std::error_code error;
+    fs::remove_all(directory, error);
+    CHECK(!error);
+    return true;
+}
+
 // 'auto' keeps the CMAF path reachable, but still only after the direct
-// endpoint has been given the same format.
+// endpoint has been given the same format.  The stream session is established
+// lazily, at the first segmented attempt, so it appears after the direct call
+// that failed rather than before it.
 bool testAutoModeFallsBackToSegmented() {
     namespace fs = std::filesystem;
     std::vector<char> pattern{
@@ -370,9 +414,9 @@ bool testAutoModeFallsBackToSegmented() {
     server.stop();
 
     CHECK(server.targets().size() == 4);
-    CHECK(server.targets()[0] == "/session/start");
-    CHECK(server.targets()[1].rfind("/track/getFileUrl?", 0) == 0);
-    CHECK(queryValue(server.targets()[1], "format_id") == "6");
+    CHECK(server.targets()[0].rfind("/track/getFileUrl?", 0) == 0);
+    CHECK(queryValue(server.targets()[0], "format_id") == "6");
+    CHECK(server.targets()[1] == "/session/start");
     CHECK(server.targets()[2].rfind("/file/url?", 0) == 0);
     CHECK(queryValue(server.targets()[2], "format_id") == "6");
     CHECK(server.targets()[3].rfind("/track/getFileUrl?", 0) == 0);
@@ -405,6 +449,7 @@ int main() {
     return testSecureTokenFiles() &&
            testStreamModeParsing() &&
            testDirectApiPrecedesSegmentedFallback() &&
+           testAutoModeSkipsSessionWhenDirectSucceeds() &&
            testAutoModeFallsBackToSegmented()
         ? EXIT_SUCCESS : EXIT_FAILURE;
 }
