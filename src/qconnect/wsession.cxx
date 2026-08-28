@@ -1032,6 +1032,12 @@ void WSession::dispatchMessage(const Message& msg) {
                << " has_pos=" << msg.set_state.has_position
                << " qitem=" << msg.set_state.current_queue_item.queue_item_id
                << " has_qitem=" << msg.set_state.current_queue_item.has_queue_item_id
+               // The ref names the track too.  After a handover from another
+               // device the item id and the track id can disagree; logging
+               // both is what tells them apart.
+               << " qtrack=" << msg.set_state.current_queue_item.track_id
+               << " next_qitem=" << msg.set_state.next_queue_item.queue_item_id
+               << " next_qtrack=" << msg.set_state.next_queue_item.track_id
                << " qver=" << msg.set_state.queue_version.major
                << "." << msg.set_state.queue_version.minor
                << "\n");

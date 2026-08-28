@@ -1205,6 +1205,17 @@ void QcManager::enqueueQueueLoad(const std::vector<QueueTrack>& tracks,
     if (start_idx >= tracks.size()) start_idx = 0;
     LOGINF("QcManager: queueing " << tracks.size()
            << " tracks, initial item " << start_idx << "\n");
+    // Queue item IDs are assigned by the controller and are only meaningful
+    // within one queue snapshot.  A SetState that arrives before its queue —
+    // notably when playback is handed over from another Qobuz Connect device —
+    // names its target by an ID from the session it came from, so log the
+    // mapping to make such a mismatch visible rather than a silent track skip.
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        LOGTRC("QcManager: queue item[" << i << "] id="
+               << tracks[i].queue_item_id
+               << " track=" << tracks[i].track_id
+               << (i == start_idx ? "  <- initial" : "") << "\n");
+    }
     if (play_when_ready) {
         activityPhase(ActivityPhase::QueueReceived,
                       "queue received: " + std::to_string(tracks.size()) +
@@ -2190,6 +2201,37 @@ void QcManager::queueLoadLoop() {
         std::vector<std::string> paths, titles, tokens;
         auto urls = resolveStreamUrls({track}, ids, rates, paths, titles,
                                       tokens, op.generation);
+
+        // Aim the downloader at a deferred seek target as soon as this track's
+        // plan exists.  The deferred command itself is not applied until the
+        // whole queue load has finished resolving every track, which is far
+        // too late: MusicPD opens the stream and starts reading at byte 0, so
+        // the fill walks from the head while the seek waits for a segment near
+        // the end.  Hinting here makes the first fetch the one that is needed.
+        if (!tokens.empty() && !tokens.front().empty()) {
+            uint32_t pending_pos = 0;
+            bool want_hint = false;
+            {
+                std::lock_guard<std::mutex> lk(m_pending_mutex);
+                want_hint = m_pending_playback.active &&
+                            m_pending_playback.has_position &&
+                            m_pending_playback.has_target &&
+                            m_pending_playback.target_qid == track.queue_item_id;
+                pending_pos = m_pending_playback.position_ms;
+            }
+            if (want_hint) {
+                if (auto plan = m_seg_registry.get(tokens.front())) {
+                    if (plan->hasExactGeometry() && plan->duration_ms > 0) {
+                        const uint64_t header = plan->flac_header.size();
+                        const uint64_t audio =
+                            plan->exact_total_bytes - header;
+                        hintSegmentedTrackTarget(
+                            plan,
+                            header + audio * pending_pos / plan->duration_ms);
+                    }
+                }
+            }
+        }
         if (queueLoadAborted(op.generation)) {
             cleanupMaterializedFiles(paths);
             for (const auto& token : tokens)
@@ -2427,6 +2469,7 @@ bool QcManager::applyPlaybackCommandLocked(
         has_position = false;
     }
 
+
     PlayingState effective = state;
     if (effective == PlayingState::UNKNOWN) {
         if (before.status == MpdState::Status::PLAY)
@@ -2461,6 +2504,36 @@ bool QcManager::applyPlaybackCommandLocked(
             LOGDEB("QcManager: already within " << delta
                    << "ms of the requested position; not seeking\n");
             has_position = false;
+        }
+    }
+
+    // Point the downloader at where playback is about to land, before
+    // MusicPD's decoder asks for it.  MusicPD only requests the target offset
+    // once the decoder has started, and the decoder starts by reading the head
+    // of the stream, so without this the fill walks towards the target from
+    // wherever the reader is and the seek times out waiting.
+    //
+    // This must stay below the no-op suppression above: the controller
+    // restates its position on every queue snapshot, and redirecting the
+    // downloader for a seek that is never issued would pull it away from the
+    // segment the decoder is actually reading.
+    if (has_position && target_position >= 0) {
+        std::string token;
+        {
+            std::lock_guard<std::mutex> lk(m_qmap_mutex);
+            if (static_cast<size_t>(target_position) <
+                m_track_segment_tokens.size())
+                token = m_track_segment_tokens[target_position];
+        }
+        if (!token.empty()) {
+            if (auto plan = m_seg_registry.get(token)) {
+                if (plan->hasExactGeometry() && plan->duration_ms > 0) {
+                    const uint64_t header = plan->flac_header.size();
+                    const uint64_t audio = plan->exact_total_bytes - header;
+                    hintSegmentedTrackTarget(
+                        plan, header + audio * position_ms / plan->duration_ms);
+                }
+            }
         }
     }
 

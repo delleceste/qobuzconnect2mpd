@@ -31,6 +31,12 @@ MpdCtl::MpdCtl(const std::string& host, int port, const std::string& password)
     : m_host(host), m_port(port), m_password(password)
 {}
 
+// Seek budget for a segmented track, and libmpdclient's default to restore
+// afterwards.  File scope because the restore guard is a local class, which
+// cannot reach function-local constants.
+static constexpr unsigned kSeekTimeoutMs = 120000;
+static constexpr unsigned kDefaultTimeoutMs = 30000;
+
 MpdCtl::~MpdCtl() { disconnect(); }
 
 bool MpdCtl::openConnection() {
@@ -581,6 +587,25 @@ bool MpdCtl::applyPlayback(int queue_pos, bool select_track,
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
         m_last_seek_ms.store(now_ms, std::memory_order_relaxed);
+        // A seek into a segmented track makes libFLAC probe several byte
+        // offsets, and each one MusicPD has not got yet has to be downloaded
+        // before the seek can complete. libmpdclient's 30s default expires
+        // long before that on a slow link — measured: the target segment
+        // arriving 9s after the deadline — so give the seek room and put the
+        // default back afterwards.
+        //
+        // The guard must resolve m_conn at destruction rather than capture it:
+        // a failed seek frees the connection and reconnects below, so a
+        // captured pointer would be restored after free.
+        mpd_connection_set_timeout(m_conn, kSeekTimeoutMs);
+        struct TimeoutRestore {
+            MpdCtl* self;
+            ~TimeoutRestore() {
+                if (self->m_conn)
+                    mpd_connection_set_timeout(self->m_conn,
+                                               kDefaultTimeoutMs);
+            }
+        } timeout_restore{this};
         constexpr int SEGMENTED_SEEK_ATTEMPTS = 3;
         const int attempts = restart_track ? SEGMENTED_SEEK_ATTEMPTS : 1;
         bool seeked = false;
@@ -608,6 +633,9 @@ bool MpdCtl::applyPlayback(int queue_pos, bool select_track,
             }
             if (!ensureConnected())
                 return fail("reconnect for seek retry");
+            // The reconnect produced a fresh connection with the default
+            // timeout; the remaining attempts need the seek budget too.
+            mpd_connection_set_timeout(m_conn, kSeekTimeoutMs);
             if (!mpd_run_stop(m_conn))
                 return fail("stop for seek retry");
             if (effective_pos < 0)
