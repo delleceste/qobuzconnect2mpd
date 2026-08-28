@@ -89,8 +89,10 @@ int           g_qc_log_level = QConnect::QC_LOG_ERROR;
 // We re-use it by forward-including its header.
 #include "../conftree.h"
 
+// Records WHICH signal asked us to stop, so the shutdown line can say so.
+// "service qobuzconnect2mpd stop" arrives here as SIGTERM.
 static volatile sig_atomic_t g_quit = 0;
-static void sigHandler(int) { g_quit = 1; }
+static void sigHandler(int signum) { g_quit = signum; }
 
 static std::string cfgGet(ConfSimple& cfg,
                             const std::string& key,
@@ -378,7 +380,17 @@ int main(int argc, char* argv[]) {
         mgr.stop();
         return 1;
     }
-    LOGINF("qconnect2mpd: shutting down\n");
+    // LOGSTD, not LOGINF: an orderly shutdown must be visible at the default
+    // log level. It was not, and a "service stop" from an unrelated script
+    // then looked exactly like a silent crash -- no error line, no core, no
+    // kernel signal message -- which cost a long and wrong investigation.
+    if (g_quit)
+        LOGSTD("qconnect2mpd: shutting down on signal " << int(g_quit)
+               << (g_quit == SIGTERM ? " (SIGTERM — service stop or system"
+                                       " shutdown)"
+                  : g_quit == SIGINT ? " (SIGINT)" : "") << "\n");
+    else
+        LOGSTD("qconnect2mpd: shutting down\n");
     mgr.stop();
     return 0;
 }

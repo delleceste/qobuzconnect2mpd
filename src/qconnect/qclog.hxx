@@ -43,7 +43,9 @@ extern std::mutex    g_qc_log_mutex;
 // include all lower ones. Set from qconnectloglevel, -v/-vv, QC_DEBUG, or
 // the QC_LOGLEVEL environment variable.
 //   0 = errors only (LOGERR)         — the default, minimal output
-//   1 = + info/normal (LOGINF/LOGSTD)
+//   1 = + info (LOGINF)
+// LOGSTD is NOT gated: normal operational output the user must see (startup
+// banner, shutdown, now-playing) is emitted at every level.
 //   2 = + debug diagnostics (LOGDEB)
 //   3 = + high-frequency trace (LOGTRC)
 extern int g_qc_log_level;
@@ -89,7 +91,9 @@ inline std::string qcTimestamp() {
      } while(0)
 #  endif
 
-// LOGSTD — stdout + log file (normal operational output shown to the user)
+// LOGSTD — stdout + log file (normal operational output shown to the user).
+// Deliberately ungated by log level: these lines are how an operator sees
+// that the daemon started and stopped.
 #  ifndef LOGSTD
 #    define LOGSTD(X) do { \
          std::ostringstream _s; _s << X; \
