@@ -76,6 +76,18 @@ public:
 
     // ---- Queue management --------------------------------------------------
 
+    // Display metadata for one queue entry. QConnect's queue holds permanent
+    // redirect tokens (/qobuz-direct/<token>.flac), and a URI like that tells
+    // a MusicPD client nothing: no artist, no album, no title. Everything
+    // reading the queue rather than this daemon's status file -- the control
+    // panel, a phone's MPD client, MusicPD's own state file -- sees whatever
+    // is published here and nothing else.
+    struct TrackTags {
+        std::string artist;
+        std::string album;
+        std::string title;
+    };
+
     // Replace the entire MPD queue with the given stream URLs (in order),
     // then start playing from start_pos.
     // On first call, saves the existing queue so it can be restored later.
@@ -101,6 +113,14 @@ public:
     bool addTracks(const std::vector<std::string>& stream_urls);
 
     // Remove queue entries by MPD song id.
+    // Publish display metadata on the queue entry at `queue_pos`, with
+    // addtagid -- the same command and the same tags upmpdcli sends for its
+    // own queue entries (upmpdcli src/mpdcli.cxx, send_tag_data). Empty
+    // fields are skipped, and a tag that is set replaces whatever was there,
+    // so republishing after a metadata refresh does not accumulate values.
+    // Requires MusicPD 0.19 or later.
+    bool publishTrackTags(int queue_pos, const TrackTags& tags);
+
     bool removeTracks(const std::vector<int>& mpd_song_ids);
 
     // Remove queue entries by MPD queue position. Caller must pass positions

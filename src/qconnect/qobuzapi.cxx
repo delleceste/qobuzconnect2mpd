@@ -93,6 +93,17 @@ static std::string urlEncode(const std::string& value) {
     return result;
 }
 
+// Qobuz's catalogue routinely carries leading and trailing spaces in titles
+// and album names ("Yet Another Movie "). Those go straight into MusicPD's
+// tags and into every display built from them, so they are cut here, once,
+// where the catalogue is parsed.
+static std::string trimmed(const std::string& value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return std::string();
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
 static std::string endpointOnly(const std::string& path) {
     const auto query = path.find('?');
     return path.substr(0, query);
@@ -582,14 +593,14 @@ bool QobuzApi::getTrackMeta(uint32_t track_id, TrackMeta& out) {
     }
 
     out.track_id   = track_id;
-    out.title      = root.get("title", "").asString();
+    out.title      = trimmed(root.get("title", "").asString());
     out.duration_s = root.get("duration", 0).asUInt();
 
     if (root.isMember("performer"))
-        out.artist = root["performer"].get("name", "").asString();
+        out.artist = trimmed(root["performer"].get("name", "").asString());
 
     if (root.isMember("album"))
-        out.album = root["album"].get("title", "").asString();
+        out.album = trimmed(root["album"].get("title", "").asString());
 
     std::string label;
     if (!out.artist.empty()) label = out.artist;

@@ -1858,25 +1858,58 @@ void QcManager::queueLoadLoop() {
                     ? metadata.title
                     : metadata.artist + " - " + metadata.title;
             }
+            // The album goes on the same line: a panel reading the status
+            // file shows it verbatim, and the album is the one thing a
+            // listener cannot infer from "Artist - Title". The separator is
+            // U+00B7 MIDDLE DOT, written as its UTF-8 bytes so the meaning
+            // does not depend on the compiler's execution charset; the
+            // control panel already joins title and album this way for the
+            // upmpdcli renderer (app.py, _upmpdcli_qconnect_status).
+            if (!title.empty() && !metadata.album.empty())
+                title += " \xc2\xb7 " + metadata.album;
             if (title.empty()) continue;
 
             bool current_track = false;
             {
                 std::lock_guard<std::mutex> apply_lk(m_queue_apply_mutex);
                 if (queueLoadAborted(op.generation)) continue;
-                std::lock_guard<std::mutex> lk(m_qmap_mutex);
-                auto item = std::find(m_queue_item_ids.begin(),
-                                      m_queue_item_ids.end(),
-                                      track.queue_item_id);
-                if (item == m_queue_item_ids.end()) continue;
-                size_t position = static_cast<size_t>(
-                    item - m_queue_item_ids.begin());
-                if (position >= m_track_titles.size() ||
-                    !m_track_titles[position].empty())
-                    continue;
-                m_track_titles[position] = title;
-                current_track = static_cast<int>(position) ==
-                    m_last_mpd_queue_pos.load(std::memory_order_relaxed);
+                int tag_position = -1;
+                {
+                    std::lock_guard<std::mutex> lk(m_qmap_mutex);
+                    auto item = std::find(m_queue_item_ids.begin(),
+                                          m_queue_item_ids.end(),
+                                          track.queue_item_id);
+                    if (item == m_queue_item_ids.end()) continue;
+                    size_t position = static_cast<size_t>(
+                        item - m_queue_item_ids.begin());
+                    if (position >= m_track_titles.size() ||
+                        !m_track_titles[position].empty())
+                        continue;
+                    m_track_titles[position] = title;
+                    tag_position = static_cast<int>(position);
+                    current_track = static_cast<int>(position) ==
+                        m_last_mpd_queue_pos.load(std::memory_order_relaxed);
+                }
+                // This daemon's status file is not the only thing that shows
+                // what is playing. MusicPD's queue holds a permanent redirect
+                // token whose URI names nothing -- no artist, no album, no
+                // title -- so a phone's MPD client, MusicPD's own state file
+                // and anything reading `currentsong` see a bare URL unless
+                // the tags are published here. upmpdcli attaches the same
+                // ones to its queue entries (upmpdcli src/mpdcli.cxx,
+                // send_tag_data), so from the queue's side both renderers now
+                // look alike. Published under the queue-apply lock: the
+                // position must still mean this track when addtagid lands.
+                //
+                // The metadata is already in hand -- /track/get returns the
+                // album beside the title this backfill came for, and it runs
+                // for every track in both stream modes because the stream-URL
+                // response carries no title of its own.
+                if (tag_position >= 0 && m_mpd) {
+                    m_mpd->publishTrackTags(
+                        tag_position,
+                        {metadata.artist, metadata.album, metadata.title});
+                }
             }
             if (current_track) {
                 {

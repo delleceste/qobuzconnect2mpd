@@ -394,6 +394,48 @@ bool MpdCtl::addTracks(const std::vector<std::string>& stream_urls) {
     return true;
 }
 
+bool MpdCtl::publishTrackTags(int queue_pos, const TrackTags& tags) {
+    if (queue_pos < 0) return false;
+    std::lock_guard<std::mutex> lk(m_conn_mutex);
+    if (!ensureConnected()) return false;
+
+    // addtagid addresses a song id, not a position, and the id is the only
+    // handle that stays valid while the queue moves underneath. Read it back
+    // from MusicPD rather than remembering one: the queue this daemon loaded
+    // can be reordered by any other client at any time.
+    struct mpd_song* song = mpd_run_get_queue_song_pos(
+        m_conn, static_cast<unsigned>(queue_pos));
+    if (!song) {
+        LOGDEB("MpdCtl::publishTrackTags: no queue entry at position "
+               << queue_pos << "\n");
+        return false;
+    }
+    const unsigned id = mpd_song_get_id(song);
+    mpd_song_free(song);
+
+    const std::pair<enum mpd_tag_type, const std::string&> fields[] = {
+        {MPD_TAG_ARTIST, tags.artist},
+        {MPD_TAG_ALBUM,  tags.album},
+        {MPD_TAG_TITLE,  tags.title},
+    };
+    for (const auto& field : fields) {
+        if (field.second.empty()) continue;
+        if (!mpd_run_clear_tag_id(m_conn, id, field.first) ||
+            !mpd_run_add_tag_id(m_conn, id, field.first, field.second.c_str())) {
+            const char* message = mpd_connection_get_error_message(m_conn);
+            LOGERR("MpdCtl::publishTrackTags: addtagid failed for song " << id
+                   << ": " << (message ? message : "unknown error") << "\n");
+            if (mpd_connection_get_error(m_conn) != MPD_ERROR_SUCCESS &&
+                !mpd_connection_clear_error(m_conn)) {
+                mpd_connection_free(m_conn);
+                m_conn = nullptr;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 bool MpdCtl::removeTracks(const std::vector<int>& mpd_song_ids) {
     std::lock_guard<std::mutex> lk(m_conn_mutex);
     QueueSnapshot before;
