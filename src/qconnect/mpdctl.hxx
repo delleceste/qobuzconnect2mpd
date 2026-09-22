@@ -86,6 +86,10 @@ public:
         std::string artist;
         std::string album;
         std::string title;
+        // Edition, not audio: the imprint and the release date. A client can
+        // tell two masters of one record apart with these and little else.
+        std::string label;
+        std::string date;
     };
 
     // Replace the entire MPD queue with the given stream URLs (in order),

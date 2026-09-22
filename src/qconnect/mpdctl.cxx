@@ -417,6 +417,8 @@ bool MpdCtl::publishTrackTags(int queue_pos, const TrackTags& tags) {
         {MPD_TAG_ARTIST, tags.artist},
         {MPD_TAG_ALBUM,  tags.album},
         {MPD_TAG_TITLE,  tags.title},
+        {MPD_TAG_LABEL,  tags.label},
+        {MPD_TAG_DATE,   tags.date},
     };
     for (const auto& field : fields) {
         if (field.second.empty()) continue;

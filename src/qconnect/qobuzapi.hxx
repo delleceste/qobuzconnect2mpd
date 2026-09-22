@@ -67,6 +67,13 @@ struct TrackMeta {
     std::string title;
     std::string artist;
     std::string album;
+    // The two fields that name an edition rather than describe the audio:
+    // the imprint and the release date Qobuz licensed this issue under.
+    // MusicPD carries both (Label, Date), and a room correction panel can
+    // match them against a dynamic-range database to tell which pressing of
+    // a record is actually playing.
+    std::string label;
+    std::string release_date;
     uint32_t    duration_s{0};
 };
 

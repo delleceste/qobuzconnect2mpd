@@ -599,8 +599,19 @@ bool QobuzApi::getTrackMeta(uint32_t track_id, TrackMeta& out) {
     if (root.isMember("performer"))
         out.artist = trimmed(root["performer"].get("name", "").asString());
 
-    if (root.isMember("album"))
-        out.album = trimmed(root["album"].get("title", "").asString());
+    if (root.isMember("album")) {
+        const Json::Value& album = root["album"];
+        out.album = trimmed(album.get("title", "").asString());
+        if (album.isMember("label"))
+            out.label = trimmed(album["label"].get("name", "").asString());
+        // release_date_original is the issue this recording belongs to;
+        // release_date_stream is when Qobuz started carrying it, which says
+        // nothing about the pressing.
+        out.release_date = trimmed(
+            album.get("release_date_original", "").asString());
+        if (out.release_date.empty())
+            out.release_date = trimmed(album.get("release_date", "").asString());
+    }
 
     std::string label;
     if (!out.artist.empty()) label = out.artist;

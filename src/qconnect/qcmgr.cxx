@@ -1908,7 +1908,8 @@ void QcManager::queueLoadLoop() {
                 if (tag_position >= 0 && m_mpd) {
                     m_mpd->publishTrackTags(
                         tag_position,
-                        {metadata.artist, metadata.album, metadata.title});
+                        {metadata.artist, metadata.album, metadata.title,
+                         metadata.label, metadata.release_date});
                 }
             }
             if (current_track) {
