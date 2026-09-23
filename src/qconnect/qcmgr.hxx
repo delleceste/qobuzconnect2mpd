@@ -267,6 +267,10 @@ private:
     std::vector<std::string>  m_track_local_paths;  // local materialized FLAC paths
     std::vector<std::string>  m_track_titles;        // "Artist - Title", parallel to m_queue_item_ids
     std::vector<std::string>  m_track_segment_tokens; // empty for direct URLs
+    // Cover URL per Qobuz queue item, filled by the metadata backfill. Keyed
+    // by item id rather than kept parallel to the vectors above, so inserts,
+    // removals and reorders cannot shift one track's cover onto another.
+    std::map<uint64_t, std::string> m_track_art;
 
     // Direct-mode tokens handed to MusicPD in place of signed Qobuz URLs.
     // token -> (track_id, format_id); resolved to a fresh CDN URL on every
@@ -327,6 +331,7 @@ private:
 
     // Status file
     std::string           m_status_title;
+    std::string           m_status_art;
     std::string           m_status_format_info;
     std::atomic<uint32_t> m_status_pos_ms{0};
     std::atomic<uint32_t> m_status_dur_ms{0};

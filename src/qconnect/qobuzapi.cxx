@@ -611,6 +611,15 @@ bool QobuzApi::getTrackMeta(uint32_t track_id, TrackMeta& out) {
             album.get("release_date_original", "").asString());
         if (out.release_date.empty())
             out.release_date = trimmed(album.get("release_date", "").asString());
+        // large is 600px: enough for any panel, small enough to fetch per
+        // track. The smaller sizes are the fallback when it is missing.
+        if (album.isMember("image") && album["image"].isObject()) {
+            const Json::Value& image = album["image"];
+            for (const char* size : {"large", "small", "thumbnail"}) {
+                out.art_url = trimmed(image.get(size, "").asString());
+                if (!out.art_url.empty()) break;
+            }
+        }
     }
 
     std::string label;

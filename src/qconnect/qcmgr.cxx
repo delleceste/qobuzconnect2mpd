@@ -105,11 +105,12 @@ void QcManager::printNowPlaying(const std::string& title,
 
 void QcManager::writeStatusFile() {
     if (m_cfg.status_file.empty()) return;
-    std::string title, fmt_info;
+    std::string title, fmt_info, art;
     {
         std::lock_guard<std::mutex> lk(m_status_mutex);
         title    = m_status_title;
         fmt_info = m_status_format_info;
+        art      = m_status_art;
     }
     int play_state = m_status_play_state.load();
     const char* state_tag = (play_state == 2) ? "[playing] "
@@ -139,6 +140,11 @@ void QcManager::writeStatusFile() {
         activity.state != activityPhaseLabel(ActivityPhase::Error))
         activity.state = activityPhaseLabel(ActivityPhase::Playing);
     f << "state=" << activity.state << "\n";
+    // Tagged like state=, so a reader can pick it out and never shows it: it
+    // is a URL for fetching the cover, not something to display. A reader
+    // that predates it would take it for an activity line -- update the
+    // panel together with this daemon.
+    if (!art.empty() && !title.empty()) f << "art=" << art << "\n";
     for (const auto& event : activity.events) f << event << "\n";
     f.close();
     std::rename(tmp.c_str(), m_cfg.status_file.c_str());
@@ -547,6 +553,7 @@ void QcManager::stop() {
         m_track_sample_rates.clear();
         m_track_titles.clear();
         m_track_segment_tokens.clear();
+        m_track_art.clear();
         m_all_queue_item_ids.clear();
         m_autoplay_item_ids.clear();
     }
@@ -742,6 +749,7 @@ void QcManager::deactivateRenderer() {
             m_track_sample_rates.clear();
             m_track_titles.clear();
             m_track_segment_tokens.clear();
+            m_track_art.clear();
         }
     }
     if (restored) {
@@ -1167,6 +1175,7 @@ void QcManager::onQueueCleared(const MsgQueueCleared& update) {
         std::lock_guard<std::mutex> lk(m_status_mutex);
         m_status_title.clear();
         m_status_format_info.clear();
+        m_status_art.clear();
     }
     cancelQueueOperations();
 
@@ -1185,6 +1194,7 @@ void QcManager::onQueueCleared(const MsgQueueCleared& update) {
         m_track_sample_rates.clear();
         m_track_titles.clear();
         m_track_segment_tokens.clear();
+        m_track_art.clear();
     }
     cleanupMaterializedFiles(stale_paths);
     m_seg_registry.clear();
@@ -1224,6 +1234,7 @@ void QcManager::enqueueQueueLoad(const std::vector<QueueTrack>& tracks,
         std::lock_guard<std::mutex> lk(m_status_mutex);
         m_status_title.clear();
         m_status_format_info.clear();
+        m_status_art.clear();
     }
 
     uint64_t generation =
@@ -1520,6 +1531,15 @@ void QcManager::onMpdState(const MpdState& st) {
         if (began_playing) {
             if (static_cast<size_t>(st.queue_pos) < m_track_titles.size())
                 track_title = m_track_titles[st.queue_pos];
+            std::string art;
+            if (static_cast<size_t>(st.queue_pos) < m_queue_item_ids.size()) {
+                auto found = m_track_art.find(m_queue_item_ids[st.queue_pos]);
+                if (found != m_track_art.end()) art = found->second;
+            }
+            // Replace, never keep: the previous track's cover under this
+            // track's name is worse than no cover.
+            std::lock_guard<std::mutex> status_lk(m_status_mutex);
+            m_status_art = art;
             if (static_cast<size_t>(st.queue_pos) < m_track_local_paths.size())
                 track_local_path = m_track_local_paths[st.queue_pos];
             if (static_cast<size_t>(st.queue_pos) < m_track_segment_tokens.size())
@@ -1886,6 +1906,8 @@ void QcManager::queueLoadLoop() {
                         !m_track_titles[position].empty())
                         continue;
                     m_track_titles[position] = title;
+                    if (!metadata.art_url.empty())
+                        m_track_art[track.queue_item_id] = metadata.art_url;
                     tag_position = static_cast<int>(position);
                     current_track = static_cast<int>(position) ==
                         m_last_mpd_queue_pos.load(std::memory_order_relaxed);
@@ -1916,6 +1938,7 @@ void QcManager::queueLoadLoop() {
                 {
                     std::lock_guard<std::mutex> lk(m_status_mutex);
                     m_status_title = title;
+                    m_status_art = metadata.art_url;
                 }
                 writeStatusFile();
             }

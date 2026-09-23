@@ -74,6 +74,9 @@ struct TrackMeta {
     // a record is actually playing.
     std::string label;
     std::string release_date;
+    // The album cover, as Qobuz serves it. Handed to status readers so they
+    // can show it; never meant to be displayed as text.
+    std::string art_url;
     uint32_t    duration_s{0};
 };
 
