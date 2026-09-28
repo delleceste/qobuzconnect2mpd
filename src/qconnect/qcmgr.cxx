@@ -554,6 +554,7 @@ void QcManager::stop() {
         m_track_titles.clear();
         m_track_segment_tokens.clear();
         m_track_art.clear();
+        m_item_direct_tokens.clear();
         m_all_queue_item_ids.clear();
         m_autoplay_item_ids.clear();
     }
@@ -750,6 +751,7 @@ void QcManager::deactivateRenderer() {
             m_track_titles.clear();
             m_track_segment_tokens.clear();
             m_track_art.clear();
+            m_item_direct_tokens.clear();
         }
     }
     if (restored) {
@@ -1195,6 +1197,7 @@ void QcManager::onQueueCleared(const MsgQueueCleared& update) {
         m_track_titles.clear();
         m_track_segment_tokens.clear();
         m_track_art.clear();
+        m_item_direct_tokens.clear();
     }
     cleanupMaterializedFiles(stale_paths);
     m_seg_registry.clear();
@@ -1697,6 +1700,15 @@ bool QcManager::resolveDirectToken(const std::string& token,
         format_id = it->second.second;
     }
     if (!m_api) return false;
+    DirectFallback fallback;
+    if (cachedDirectFallback(token, fallback)) {
+        if (fallback.sampling_rate > 0) {
+            if (auto ws = currentWSession())
+                ws->reportFileQuality(fallback.sampling_rate);
+        }
+        url_out = fallback.url;
+        return true;
+    }
     TrackStreamInfo info;
     if (!m_api->getStreamUrl(track_id, format_id, info) ||
         info.stream_url.empty()) {
@@ -1704,12 +1716,101 @@ bool QcManager::resolveDirectToken(const std::string& token,
                << track_id << "\n");
         return false;
     }
+    rememberDirectFallback(token, info);
     // Report the quality actually being served, which is only known now.
     if (info.sampling_rate > 0) {
         if (auto ws = currentWSession()) ws->reportFileQuality(info.sampling_rate);
     }
     url_out = info.stream_url;
     return true;
+}
+
+bool QcManager::cachedDirectFallback(const std::string& token,
+                                     DirectFallback& out) {
+    std::lock_guard<std::mutex> lk(m_direct_mutex);
+    auto it = m_direct_fallbacks.find(token);
+    if (it == m_direct_fallbacks.end()) return false;
+    // A queue load keeps only the plans its own tracks use, so the plan may
+    // be gone; the token is then resolved afresh.
+    if (!m_seg_registry.get(it->second.segment_token)) {
+        m_direct_fallbacks.erase(it);
+        return false;
+    }
+    out = it->second;
+    return true;
+}
+
+void QcManager::rememberDirectFallback(const std::string& token,
+                                       const TrackStreamInfo& info) {
+    if (info.segment_token.empty()) return;
+    std::lock_guard<std::mutex> lk(m_direct_mutex);
+    m_direct_fallbacks[token] = {info.stream_url, info.segment_token,
+                                 info.sampling_rate};
+}
+
+// Direct mode resolves a track only when MusicPD opens it. If its CDN file is
+// broken, the switch to the segmented copy costs 1-2.5 s: hidden behind
+// MusicPD's buffer on a gapless transition, but heard when the listener skips
+// to the track. Checking the next track as soon as MusicPD names it moves that
+// cost off the critical path and starts the download early.
+void QcManager::precheckNextDirectTrack(const MpdState& state) {
+    if (m_cfg.stream_mode != StreamMode::Direct) return;
+    std::string token;
+    {
+        std::lock_guard<std::mutex> lk(m_qmap_mutex);
+        if (state.next_queue_pos < 0 ||
+            static_cast<size_t>(state.next_queue_pos) >= m_queue_item_ids.size())
+            return;
+        auto it = m_item_direct_tokens.find(
+            m_queue_item_ids[state.next_queue_pos]);
+        if (it == m_item_direct_tokens.end()) return;
+        token = it->second;
+    }
+    const uint64_t generation =
+        m_queue_load_generation.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(m_direct_mutex);
+        if (token == m_prechecked_direct_token &&
+            generation == m_prechecked_generation)
+            return;
+        m_prechecked_direct_token = token;
+        m_prechecked_generation = generation;
+    }
+    QueueOp op;
+    op.type = QueueOp::Type::DirectPrecheck;
+    op.generation = generation;
+    op.direct_token = token;
+    {
+        std::lock_guard<std::mutex> lk(m_queue_load_mutex);
+        if (queueLoadAborted(generation)) return;
+        m_async_tasks.push_back(std::move(op));
+    }
+    m_queue_load_cv.notify_one();
+}
+
+void QcManager::runDirectPrecheck(const std::string& token) {
+    DirectFallback fallback;
+    if (!m_api || cachedDirectFallback(token, fallback)) return;
+    uint32_t track_id = 0;
+    int format_id = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_direct_mutex);
+        auto it = m_direct_tokens.find(token);
+        if (it == m_direct_tokens.end()) return;
+        track_id = it->second.first;
+        format_id = it->second.second;
+    }
+    // A healthy direct URL is not kept: it expires, and resolving it again
+    // when MusicPD opens the track is cheap. Only the fallback is worth
+    // keeping, and its download starts now.
+    TrackStreamInfo info;
+    if (!m_api->getStreamUrl(track_id, format_id, info) ||
+        info.segment_token.empty())
+        return;
+    rememberDirectFallback(token, info);
+    m_seg_registry.prioritize(info.segment_token);
+    LOGINF("QcManager: next track " << track_id
+           << " will play from its segmented copy; downloading ahead\n");
 }
 
 // ---- Stream URL resolution --------------------------------------------------
@@ -1749,9 +1850,15 @@ std::vector<std::string> QcManager::resolveStreamUrls(
         // and moves the 27->7->6->5 format ladder to play time, where it sees
         // current availability rather than availability an hour ago.
         if (m_cfg.stream_mode == StreamMode::Direct) {
+            const std::string token =
+                registerDirectToken(t.track_id, m_cfg.format_id);
+            {
+                std::lock_guard<std::mutex> lk(m_qmap_mutex);
+                m_item_direct_tokens[t.queue_item_id] = token;
+            }
             urls.push_back("http://127.0.0.1:" +
                            std::to_string(m_cfg.http_port) + "/qobuz-direct/" +
-                           registerDirectToken(t.track_id, m_cfg.format_id));
+                           token);
             out_item_ids.push_back(t.queue_item_id);
             out_sample_rates.push_back(0);   // learned when the URL is minted
             out_local_paths.push_back(std::string());
@@ -1851,6 +1958,11 @@ void QcManager::queueLoadLoop() {
         }
 
         if (queueLoadAborted(op.generation)) continue;
+
+        if (op.type == QueueOp::Type::DirectPrecheck) {
+            runDirectPrecheck(op.direct_token);
+            continue;
+        }
 
         if (op.type == QueueOp::Type::TitleBackfill) {
             if (op.tracks.empty() || !m_api) continue;
@@ -2790,6 +2902,7 @@ void QcManager::prioritizeDownloads(const MpdState& state) {
         add(state.next_queue_pos);
     }
     for (const auto& token : tokens) m_seg_registry.prioritize(token);
+    precheckNextDirectTrack(state);
 }
 
 int QcManager::posInFullQueue(uint64_t queue_item_id) const {

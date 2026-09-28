@@ -271,6 +271,9 @@ private:
     // by item id rather than kept parallel to the vectors above, so inserts,
     // removals and reorders cannot shift one track's cover onto another.
     std::map<uint64_t, std::string> m_track_art;
+    // Direct-mode token per Qobuz queue item, keyed like m_track_art, so the
+    // track MusicPD will play next can be checked before it is reached.
+    std::map<uint64_t, std::string> m_item_direct_tokens;
 
     // Direct-mode tokens handed to MusicPD in place of signed Qobuz URLs.
     // token -> (track_id, format_id); resolved to a fresh CDN URL on every
@@ -280,6 +283,25 @@ private:
     std::string registerDirectToken(uint32_t track_id, int format_id);
     bool        resolveDirectToken(const std::string& token,
                                    std::string& url_out);
+    // A direct token whose CDN file is broken resolves to a segmented plan
+    // (see QobuzApi::getStreamUrl). The answer is kept per token, so playing
+    // a track that was checked in advance, and every seek in it, reuse the
+    // plan and its download instead of resolving and refetching again.
+    struct DirectFallback {
+        std::string url;            // local /qobuz-segmented/ proxy URL
+        std::string segment_token;  // its SegmentedTrackRegistry key
+        int         sampling_rate{0};
+    };
+    std::map<std::string, DirectFallback> m_direct_fallbacks; // m_direct_mutex
+    // The last token handed to the precheck, with its queue generation, so
+    // every MusicPD event does not queue the same check again.
+    std::string m_prechecked_direct_token;                    // m_direct_mutex
+    uint64_t    m_prechecked_generation{0};                   // m_direct_mutex
+    bool cachedDirectFallback(const std::string& token, DirectFallback& out);
+    void rememberDirectFallback(const std::string& token,
+                                const TrackStreamInfo& info);
+    void precheckNextDirectTrack(const MpdState& state);
+    void runDirectPrecheck(const std::string& token);
     // Full ordered Qobuz queue (all items, including tracks not yet loaded into MPD).
     // Set immediately when onQueueLoad fires so skip can find direction even
     // before URL resolution completes.
@@ -292,7 +314,8 @@ private:
     // lookups for the old queue). Every op carries the generation at dispatch
     // time so the worker can detect when a new Load has superseded it.
     struct QueueOp {
-        enum class Type { Load, Insert, Add, Remove, Reorder, TitleBackfill };
+        enum class Type { Load, Insert, Add, Remove, Reorder, TitleBackfill,
+                          DirectPrecheck };
         Type                    type{Type::Load};
         uint64_t                generation{0};
         QueueVersion            queue_version;
@@ -305,6 +328,7 @@ private:
         bool                    has_reorder_after{false};
         std::deque<size_t>      remaining_indices;        // Load continuation
         bool                    load_started{false};
+        std::string             direct_token;             // DirectPrecheck only
     };
     // Cloud WebSocket reconnection worker. The reconnect must not run on the
     // WSession callback thread that reports the loss: re-establishing the
