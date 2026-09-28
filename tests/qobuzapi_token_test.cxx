@@ -124,6 +124,10 @@ public:
     }
 
     int port() const { return m_port; }
+    // Serve format 6 from a CDN file that is broken the way Qobuz's can be:
+    // the full length announced, one byte sent, the connection dropped.  The
+    // CMAF endpoint then offers a copy that works.
+    void setBrokenDirect(bool broken) { m_broken_direct = broken; }
     const std::vector<std::string>& targets() const { return m_targets; }
     bool authenticated() const { return m_authenticated; }
     bool validClassicSignature() const { return m_valid_classic_signature; }
@@ -158,13 +162,16 @@ private:
         return request;
     }
 
-    static void sendResponse(int client, int status, const std::string& body) {
+    static void sendResponse(int client, int status, const std::string& body,
+                             size_t announced = std::string::npos) {
         const char* reason = status == 200 ? "OK" :
                              status == 400 ? "Bad Request" : "Not Found";
         std::ostringstream response;
         response << "HTTP/1.1 " << status << ' ' << reason << "\r\n"
                  << "Content-Type: application/json\r\n"
-                 << "Content-Length: " << body.size() << "\r\n"
+                 << "Content-Length: "
+                 << (announced == std::string::npos ? body.size() : announced)
+                 << "\r\n"
                  << "Connection: close\r\n\r\n" << body;
         const std::string bytes = response.str();
         size_t sent = 0;
@@ -191,20 +198,39 @@ private:
                 ? std::string() : request.substr(first_space + 1,
                                                   second_space - first_space - 1);
             m_targets.push_back(target);
-            if (request.find("\r\nX-User-Auth-Token: test-oauth-token\r\n") ==
-                std::string::npos)
+            // API calls must carry the user token; CDN fetches must not, so
+            // it cannot leak to a third-party host.
+            const bool has_token =
+                request.find("\r\nX-User-Auth-Token: test-oauth-token\r\n") !=
+                std::string::npos;
+            if (target.rfind("/cdn/", 0) == 0 ? has_token : !has_token)
                 m_authenticated = false;
 
+            const std::string cdn = "http://127.0.0.1:" +
+                                    std::to_string(m_port) + "/cdn/";
             int status = 404;
             std::string body = R"({"error":"unexpected request"})";
-            if (target == "/session/start") {
+            size_t announced = std::string::npos;
+            if (target == "/cdn/broken.flac") {
+                status = 200;
+                body = "f";
+                announced = 92444157;
+            } else if (target == "/cdn/good.flac") {
+                status = 200;
+                body = "fLaC";
+            } else if (target == "/cdn/track.mp3") {
+                status = 200;
+                body = "ID3\x04";
+            } else if (target == "/session/start") {
                 status = 200;
                 body = R"({"session_id":"test-session","expires_at":4102444800,"infos":"unused"})";
             } else if (target.rfind("/file/url?", 0) == 0) {
                 // A valid but unusable /file/url response must fall back to the
                 // classic endpoint only after the preferred endpoint was tried.
                 status = 200;
-                body = "{}";
+                body = m_broken_direct
+                    ? R"({"url":")" + cdn + R"(good.flac","mime_type":"audio/flac","format_id":6,"duration":635,"sampling_rate":44.1,"bit_depth":16})"
+                    : "{}";
             } else if (target.rfind("/track/getFileUrl?", 0) == 0) {
                 const std::string timestamp = queryValue(target, "request_ts");
                 const std::string format = queryValue(target, "format_id");
@@ -218,6 +244,9 @@ private:
                 if (!valid_signature) {
                     status = 400;
                     body = R"({"error":"bad signature"})";
+                } else if (format == "6" && m_broken_direct) {
+                    status = 200;
+                    body = R"({"url":")" + cdn + R"(broken.flac","mime_type":"audio/flac","format_id":6,"duration":635,"sampling_rate":44.1,"bit_depth":16})";
                 } else if (format == "6") {
                     // An accepted signature can still return 404 for a format.
                     // The client should cache that secret and try format 5.
@@ -225,13 +254,14 @@ private:
                     body = R"({"error":"format unavailable"})";
                 } else {
                     status = 200;
-                    body = R"({"url":"https://cdn.example/track.mp3","mime_type":"audio/mpeg","format_id":5,"duration":123,"sampling_rate":44.1,"bit_depth":16})";
+                    body = R"({"url":")" + cdn + R"(track.mp3","mime_type":"audio/mpeg","format_id":5,"duration":123,"sampling_rate":44.1,"bit_depth":16})";
                 }
             }
-            sendResponse(client, status, body);
+            sendResponse(client, status, body, announced);
             ::close(client);
-            if (target.rfind("/track/getFileUrl?", 0) == 0 &&
-                queryValue(target, "format_id") == "5")
+            // The last request of every scenario is the probe of a CDN file
+            // that works.
+            if (target == "/cdn/track.mp3" || target == "/cdn/good.flac")
                 return;
         }
     }
@@ -243,6 +273,7 @@ private:
     std::vector<std::string> m_targets;
     bool m_authenticated{true};
     bool m_valid_classic_signature{true};
+    bool m_broken_direct{false};
 };
 
 bool testSecureTokenFiles() {
@@ -322,15 +353,17 @@ bool testDirectApiPrecedesSegmentedFallback() {
     CHECK(api.getStreamUrl(12345, 6, info));
     server.stop();
 
-    // Default mode is Direct: no /session/start, no /file/url.
-    CHECK(server.targets().size() == 2);
+    // Default mode is Direct: no /session/start, no /file/url.  The URL is
+    // handed over only after its first bytes arrived.
+    CHECK(server.targets().size() == 3);
     CHECK(server.targets()[0].rfind("/track/getFileUrl?", 0) == 0);
     CHECK(queryValue(server.targets()[0], "format_id") == "6");
     CHECK(server.targets()[1].rfind("/track/getFileUrl?", 0) == 0);
     CHECK(queryValue(server.targets()[1], "format_id") == "5");
+    CHECK(server.targets()[2] == "/cdn/track.mp3");
     CHECK(server.authenticated());
     CHECK(server.validClassicSignature());
-    CHECK(info.stream_url == "https://cdn.example/track.mp3");
+    CHECK(info.stream_url == "http://127.0.0.1:" + std::to_string(server.port()) + "/cdn/track.mp3");
     CHECK(info.local_path.empty());
     CHECK(info.segment_token.empty());
     CHECK(info.duration_ms == 123000);
@@ -373,12 +406,13 @@ bool testAutoModeSkipsSessionWhenDirectSucceeds() {
     CHECK(api.getStreamUrl(12345, 5, info));
     server.stop();
 
-    CHECK(server.targets().size() == 1);
+    CHECK(server.targets().size() == 2);
     CHECK(server.targets()[0].rfind("/track/getFileUrl?", 0) == 0);
     CHECK(queryValue(server.targets()[0], "format_id") == "5");
+    CHECK(server.targets()[1] == "/cdn/track.mp3");
     for (const auto& target : server.targets())
         CHECK(target != "/session/start");
-    CHECK(info.stream_url == "https://cdn.example/track.mp3");
+    CHECK(info.stream_url == "http://127.0.0.1:" + std::to_string(server.port()) + "/cdn/track.mp3");
 
     std::error_code error;
     fs::remove_all(directory, error);
@@ -413,7 +447,7 @@ bool testAutoModeFallsBackToSegmented() {
     CHECK(api.getStreamUrl(12345, 6, info));
     server.stop();
 
-    CHECK(server.targets().size() == 4);
+    CHECK(server.targets().size() == 5);
     CHECK(server.targets()[0].rfind("/track/getFileUrl?", 0) == 0);
     CHECK(queryValue(server.targets()[0], "format_id") == "6");
     CHECK(server.targets()[1] == "/session/start");
@@ -421,7 +455,54 @@ bool testAutoModeFallsBackToSegmented() {
     CHECK(queryValue(server.targets()[2], "format_id") == "6");
     CHECK(server.targets()[3].rfind("/track/getFileUrl?", 0) == 0);
     CHECK(queryValue(server.targets()[3], "format_id") == "5");
-    CHECK(info.stream_url == "https://cdn.example/track.mp3");
+    CHECK(server.targets()[4] == "/cdn/track.mp3");
+    CHECK(info.stream_url == "http://127.0.0.1:" + std::to_string(server.port()) + "/cdn/track.mp3");
+
+    std::error_code error;
+    fs::remove_all(directory, error);
+    CHECK(!error);
+    return true;
+}
+
+// A direct URL whose CDN file is broken must not reach MusicPD, which would
+// skip the track.  Qobuz signs such URLs: Mahler 2 (Halle/Wong), movement II
+// at 24/48 announced 92 MB, sent one byte and closed.  The same format is
+// taken from the CMAF endpoint instead, even in 'direct' mode, and before any
+// lower quality is tried.
+bool testBrokenDirectFileFallsBackToSegmented() {
+    namespace fs = std::filesystem;
+    std::vector<char> pattern{
+        '/', 't', 'm', 'p', '/', 'q', 'c', 'o', 'n', 'n', 'e', 'c', 't',
+        '-', 'c', 'd', 'n', '-', 't', 'e', 's', 't', '.', 'X', 'X', 'X',
+        'X', 'X', 'X', '\0'};
+    char* made = ::mkdtemp(pattern.data());
+    CHECK(made != nullptr);
+    const fs::path directory(made);
+    const fs::path token = directory / "token";
+    CHECK(writeFile(token.string(), "test-oauth-token\n", 0600));
+
+    MockQobuzServer server;
+    server.setBrokenDirect(true);
+    CHECK(server.start());
+    QConnect::QobuzApi api(
+        "http://127.0.0.1:" + std::to_string(server.port()),
+        "test-app", "classic-secret");
+    CHECK(api.loadToken(token.string()));
+    QConnect::TrackStreamInfo info;
+    CHECK(api.getStreamUrl(12345, 6, info));
+    server.stop();
+
+    CHECK(server.targets().size() == 5);
+    CHECK(server.targets()[0].rfind("/track/getFileUrl?", 0) == 0);
+    CHECK(queryValue(server.targets()[0], "format_id") == "6");
+    CHECK(server.targets()[1] == "/cdn/broken.flac");
+    CHECK(server.targets()[2] == "/session/start");
+    CHECK(server.targets()[3].rfind("/file/url?", 0) == 0);
+    CHECK(queryValue(server.targets()[3], "format_id") == "6");
+    CHECK(server.targets()[4] == "/cdn/good.flac");
+    CHECK(info.stream_url == "http://127.0.0.1:" +
+                             std::to_string(server.port()) + "/cdn/good.flac");
+    CHECK(info.format_id == 6);
 
     std::error_code error;
     fs::remove_all(directory, error);
@@ -450,6 +531,7 @@ int main() {
            testStreamModeParsing() &&
            testDirectApiPrecedesSegmentedFallback() &&
            testAutoModeSkipsSessionWhenDirectSucceeds() &&
-           testAutoModeFallsBackToSegmented()
+           testAutoModeFallsBackToSegmented() &&
+           testBrokenDirectFileFallsBackToSegmented()
         ? EXIT_SUCCESS : EXIT_FAILURE;
 }

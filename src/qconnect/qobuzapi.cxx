@@ -202,14 +202,29 @@ retry_after_refresh:
     // stream of unknown length that MPD cannot seek until it is complete, so
     // it is a fallback for the day Qobuz retires the direct endpoint rather
     // than the normal path. See 'qconnectstreammode'.
+    //
+    // A direct URL is only handed over once its first bytes have arrived.
+    // getFileUrl can sign a URL for a stored file that is broken — the CDN
+    // announces the full length, sends one byte and closes — and MusicPD,
+    // which follows the redirect itself, would just skip the track. Qobuz's
+    // own apps play such tracks from the CMAF copy, so that is the fallback
+    // for this format in every mode, 'direct' included, before any lower
+    // quality is tried.
     static const int fallback_fmts[] = {27, 7, 6, 5};
     for (int fmt : fallback_fmts) {
         if (fmt > format_id) continue;
 
+        bool direct_broken = false;
         if (want_direct) {
             long legacy_code = 0;
-            if (tryGetStreamUrl(track_id, fmt, out, &legacy_code))
-                return true;
+            if (tryGetStreamUrl(track_id, fmt, out, &legacy_code)) {
+                if (directUrlDelivers(out.stream_url, out.mime_type))
+                    return true;
+                LOGINF("QobuzApi: track " << track_id << " format "
+                       << out.format_id << ": the CDN file delivers no audio;"
+                          " trying the segmented stream\n");
+                direct_broken = true;
+            }
             if (legacy_code == 400 && !refreshed_credentials) {
                 LOGINF("QobuzApi: getFileUrl signature rejected; refreshing app credentials and retrying\n");
                 if (fetchAppCredentials()) {
@@ -222,9 +237,11 @@ retry_after_refresh:
             }
         }
 
-        if (want_segmented && streamSessionReady()) {
+        if ((want_segmented || direct_broken) && streamSessionReady()) {
             long file_code = 0;
-            if (tryFileUrl(track_id, fmt, out, &file_code))
+            if (tryFileUrl(track_id, fmt, out, &file_code) &&
+                (!out.segment_token.empty() ||
+                 directUrlDelivers(out.stream_url, out.mime_type)))
                 return true;
             if (file_code == 400 && !refreshed_credentials) {
                 LOGINF("QobuzApi: /file/url signature rejected; refreshing app credentials and retrying\n");
@@ -574,6 +591,47 @@ bool QobuzApi::tryGetStreamUrl(uint32_t track_id, int format_id,
         LOGINF("QobuzApi: classic getFileUrl secret confirmed\n");
     }
     return true;
+}
+
+// Keep the first four bytes, then stop the transfer: that is enough to tell a
+// file that is there from one the CDN truncates, and a server ignoring the
+// Range header must not make this download the whole track.
+static size_t probeWriteCb(char* ptr, size_t size, size_t nmemb,
+                           void* userdata) {
+    auto* s = static_cast<std::string*>(userdata);
+    const size_t bytes = size * nmemb;
+    const size_t want = 4 - std::min<size_t>(4, s->size());
+    s->append(ptr, std::min(bytes, want));
+    return s->size() >= 4 ? 0 : bytes;
+}
+
+bool QobuzApi::directUrlDelivers(const std::string& url,
+                                 const std::string& mime_type) const {
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+    std::string head;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_RANGE, "0-3");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, probeWriteCb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &head);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    CURLcode rc = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_cleanup(curl);
+
+    const bool is_flac = mime_type.find("flac") != std::string::npos;
+    const bool ok = (code == 200 || code == 206) && head.size() == 4 &&
+                    (!is_flac || head == "fLaC");
+    if (!ok) {
+        LOGINF("QobuzApi: direct CDN probe: HTTP " << code << ", "
+               << head.size() << " of 4 bytes (" << curl_easy_strerror(rc)
+               << ")\n");
+    }
+    return ok;
 }
 
 bool QobuzApi::getTrackMeta(uint32_t track_id, TrackMeta& out) {

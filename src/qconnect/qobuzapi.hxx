@@ -168,6 +168,11 @@ private:
                     long* http_code = nullptr);
     bool tryGetStreamUrl(uint32_t track_id, int format_id, TrackStreamInfo& out,
                          long* http_code = nullptr);
+    // Read the first bytes of a direct CDN URL and confirm they are audio.
+    // getFileUrl can sign a URL whose stored file is broken: the CDN answers
+    // with a full Content-Length, sends one byte and drops the connection.
+    bool directUrlDelivers(const std::string& url,
+                           const std::string& mime_type) const;
     // Build a SegmentedTrackPlan, register it, and populate `out` with the
     // proxy URL that MPD will request to stream the track on demand.
     bool planSegmentedTrack(const Json::Value& root, uint32_t track_id,
